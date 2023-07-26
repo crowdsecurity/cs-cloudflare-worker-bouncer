@@ -1,0 +1,23 @@
+{
+  "name": "worker",
+  "version": "1.0.0",
+  "description": "",
+  "source": "worker.js",
+  "main": "worker.js",
+  "devDependencies": {
+    "webpack": "5.88.1",
+    "webpack-cli": "5.1.4"
+  },
+  "scripts": {
+    "build": "webpack --config webpack.config.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@tsndr/cloudflare-worker-jwt": "2.2.1",
+    "cookie": "0.5.0",
+    "ipaddr.js": "2.1.0",
+    "jsonwebtoken": "9.0.0",
+    "node-polyfill-webpack-plugin": "2.0.1"
+  }
+}

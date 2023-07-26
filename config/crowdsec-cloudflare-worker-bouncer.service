@@ -1,0 +1,13 @@
+[Unit]
+Description=CrowdSec bouncer for Cloudflare
+After=syslog.target crowdsec.service
+
+[Service]
+Type=simple
+ExecStart=${BIN} -c ${CFG}/crowdsec-cloudflare-worker-bouncer.yaml
+ExecStartPre=${BIN} -c ${CFG}/crowdsec-cloudflare-worker-bouncer.yaml -t
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

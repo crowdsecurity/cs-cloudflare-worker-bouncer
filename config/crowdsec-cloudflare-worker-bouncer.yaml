@@ -1,0 +1,36 @@
+crowdsec_lapi_url: http://localhost:8080/
+crowdsec_lapi_key: ${API_KEY}
+crowdsec_update_frequency: 10s
+include_scenarios_containing: [] # ignore IPs banned for triggering scenarios not containing either of provided word
+exclude_scenarios_containing: [] # ignore IPs banned for triggering scenarios containing either of provided word
+only_include_decisions_from: [] # only include IPs banned due to decisions orginating from provided sources. eg value ["cscli", "crowdsec"]
+cloudflare_config:
+    accounts:
+        - id: <ACCOUNT_ID>
+          zones:
+            - zone_id: <ZONE_ID> # crowdflare.co.uk
+              actions: # Supported Actions [captcha, ban]
+                - captcha
+              default_action: captcha # Supported Actions [captcha, ban, none]
+              routes_to_protect:
+                - '*crowdflare.co.uk/*'
+              turnstile:
+                enabled: true
+                rotate_secret_key: true
+                rotate_secret_key_every: 168h0m0s 
+                mode: managed # Supported Modes "managed"|"invisible"|"non-interactive"
+          token: <CLOUDFLARE_ACCOUNT_TOKEN>
+          owner_email: owner@example.com
+
+log_level: info
+log_mode: "stdout"
+log_dir: "/var/log/"
+
+prometheus:
+    enabled: true
+    listen_addr: 127.0.0.1
+    listen_port: "2112"
+
+key_path: ""  # Used for TLS authentification with CrowdSec LAPI
+cert_path: "" # Used for TLS authentification with CrowdSec LAPI
+ca_cert_path: "" # Used for TLS authentification with CrowdSec LAPI
