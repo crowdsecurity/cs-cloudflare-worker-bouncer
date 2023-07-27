@@ -39,7 +39,7 @@ var TotalKeysByAccount = prometheus.NewGaugeVec(
 var workerScript string
 
 const (
-	ScriptName                = "crowdsec-cloudflare-worker-bouncer-worker"
+	ScriptName                = "crowdsec-cloudflare-worker-bouncer"
 	KVNsName                  = "CROWDSECCFBOUNCERNS"
 	WidgetName                = "crowdsec-cloudflare-worker-bouncer-widget"
 	TurnstileConfigKey        = "TURNSTILE_CONFIG"
@@ -80,8 +80,12 @@ type CloudflareAccountManager struct {
 	ActionByIPRange       map[string]string
 }
 
+// This function creates a new instance of the CloudflareAccountManager struct,
+// which is used to manage Cloudflare resources associated with a specific account.
+// It initializes the struct with the account configuration, Cloudflare API client,
+// and other necessary fields.
 func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig) (*CloudflareAccountManager, error) {
-	api, err := NewCloudflareAPI(ctx, accountCfg)
+	api, err := NewCloudflareAPI(accountCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +116,8 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig) (*C
 	}, nil
 }
 
+// The CloudflareManagerHTTPTransport struct implements the http.RoundTripper interface
+// and overrides the RoundTrip method to increment a Prometheus counter for each API call made by the account owner.
 type CloudflareManagerHTTPTransport struct {
 	http.Transport
 	accountOwnerEmail string
@@ -122,7 +128,10 @@ func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.R
 	return http.DefaultTransport.RoundTrip(req)
 }
 
-func NewCloudflareAPI(context context.Context, accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
+// The NewCloudflareAPI function creates a new instance of the cloudflareAPI interface, which is used to interact with the Cloudflare API.
+// It initializes the API client with the provided account configuration and HTTP client, and returns the client instance.
+// The function also uses a custom HTTP transport to track the number of Cloudflare API calls made by the account owner.
+func NewCloudflareAPI(accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
 	transport := CloudflareManagerHTTPTransport{accountOwnerEmail: accountCfg.OwnerEmail}
 	httpClient := http.Client{}
 	httpClient.Transport = &transport
@@ -133,11 +142,15 @@ func NewCloudflareAPI(context context.Context, accountCfg cfg.AccountConfig) (cl
 	return api, nil
 }
 
+// This is pushed to KV. It is used by workers to determine the action to take for a given IP address and zone.
 type ActionsForZone struct {
 	SupportedActions []string `json:"supported_actions"`
 	DefaultAction    string   `json:"default_action"`
 }
 
+// Creates a new Cloudflare Workers KV namespace, uploads a new worker script, and binds the worker to one or more routes for
+// each zone configuration in the account. The method also creates a JSON-encoded string of supported actions for each zone
+// and binds it to the worker.
 func (m *CloudflareAccountManager) DeployInfra() error {
 	// Create the worker
 	m.logger.Infof("Creating KVNS %s", KVNsName)
@@ -207,13 +220,16 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 }
 
 func (m *CloudflareAccountManager) updateMetrics() {
-	totalKVPairs := 1 // one for ActionsByDomain
+	totalKVPairs := 1 // one for ActionsByDomain KV pair
 	for _, zone := range m.AccountCfg.ZoneConfigs {
+		// We only create the turnstile KV pair if the account has at least one zone with turnstile enabled.
+		// This is the widgetTokenCfgByDomain KV pair found in HandleTurnstile function.
 		if zone.Turnstile.Enabled {
 			totalKVPairs += 1
 			break
 		}
 	}
+	// We only create the IP range KV pair if the account has at least one IP range decision.
 	if m.hasIPRangeKV {
 		totalKVPairs += 1
 	}
@@ -221,6 +237,8 @@ func (m *CloudflareAccountManager) updateMetrics() {
 	TotalKeysByAccount.WithLabelValues(m.AccountCfg.OwnerEmail).Set(float64(totalKVPairs))
 }
 
+// This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
+// It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
 func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 	m.logger.Infof("Cleaning up existing workers")
 
@@ -325,6 +343,7 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 	}
 	m.logger.Infof("Deleting %d decisions", len(keysToDelete))
 	deleterGrp := errgroup.Group{}
+	// Cloudflare API only allows deleting 10k keys at a time. So we need to batch the deletes.
 	for batch, i := 0, 0; i < len(keysToDelete); i += 10000 {
 		batch++
 		batch := batch
@@ -345,7 +364,7 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 	if err := deleterGrp.Wait(); err != nil {
 		return err
 	}
-	m.logger.Info("Done deleting keys")
+	m.logger.Infof("Deleted %d decisions", len(keysToDelete))
 	m.KVPairByDecisionValue = newKVPairByValue
 	m.updateMetrics()
 	return m.CommitIPRangesIfChanged()
@@ -416,6 +435,7 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 	} else {
 		writerErrGroup := errgroup.Group{}
 		m.logger.Infof("Adding %d decisions", len(keysToWrite))
+		// Cloudflare API only allows writing 10k keys at a time. So we need to batch the writes.
 		for batch, i := 0, 0; i < len(keysToWrite); i += 10000 {
 			batch++
 			batch := batch
@@ -437,12 +457,13 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 			return err
 		}
 		m.KVPairByDecisionValue = newKVPairByValue
-		m.logger.Info("Done adding decisions")
+		m.logger.Infof("Added %d decisions", len(keysToWrite))
 	}
 	m.updateMetrics()
 	return m.CommitIPRangesIfChanged()
 }
 
+// check if the ip ranges have changed and updates the KV pair if they have.
 func (m *CloudflareAccountManager) CommitIPRangesIfChanged() error {
 	m.hasIPRangeKV = true
 	c, err := json.Marshal(m.ActionByIPRange)
@@ -504,6 +525,8 @@ func (m *CloudflareAccountManager) CreateTurnstileWidgets() (map[string]WidgetTo
 	return widgetTokenCfgByDomain, nil
 }
 
+// Creates the turnstile widgets and writes the widget tokens to KV.
+// It runs infinitely, rotating the secret keys every configured interval.
 func (m *CloudflareAccountManager) HandleTurnstile() error {
 	widgetTokenCfgByDomainLock := sync.Mutex{}
 	// Create the tokens

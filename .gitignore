@@ -16,7 +16,7 @@ __pycache__/
 venv/
 
 crowdsec-cloudflare-worker-bouncer
-pkg/cf/worker/node_modules
+pkg/cloudflare/worker/node_modules
 
 # built by make
 /crowdsec-cloudflare-worker-bouncer

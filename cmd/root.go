@@ -3,7 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"crowdsec-cloudflare-worker-bouncer/pkg/cf"
+	cf "crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
 	"errors"
 	"fmt"
 	"net"

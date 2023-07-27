@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"context"
-	"crowdsec-cloudflare-worker-bouncer/pkg/cf"
+	cf "crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
 	"encoding/json"
 	"fmt"
 	"os"
