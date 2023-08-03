@@ -47,6 +47,7 @@ install_bouncer() {
     systemctl daemon-reload
     gen_apikey
     gen_config_file
+    set_local_lapi_url 'CROWDSEC_LAPI_URL'
 }
 
 # --------------------------------- #

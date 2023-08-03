@@ -135,19 +135,19 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	}
 
 	csLAPI := &csbouncer.StreamBouncer{
-		APIKey:         conf.CrowdSecLAPIKey,
-		APIUrl:         conf.CrowdSecLAPIUrl,
-		TickerInterval: conf.CrowdsecUpdateFrequencyYAML,
+		APIKey:         conf.CrowdSecConfig.CrowdSecLAPIKey,
+		APIUrl:         conf.CrowdSecConfig.CrowdSecLAPIUrl,
+		TickerInterval: conf.CrowdSecConfig.CrowdsecUpdateFrequencyYAML,
 		UserAgent:      fmt.Sprintf("%s/%s", name, version.String()),
 		Opts: apiclient.DecisionsStreamOpts{
 			Scopes:                 "ip,range,as,country",
-			ScenariosNotContaining: strings.Join(conf.ExcludeScenariosContaining, ","),
-			ScenariosContaining:    strings.Join(conf.IncludeScenariosContaining, ","),
-			Origins:                strings.Join(conf.OnlyIncludeDecisionsFrom, ","),
+			ScenariosNotContaining: strings.Join(conf.CrowdSecConfig.ExcludeScenariosContaining, ","),
+			ScenariosContaining:    strings.Join(conf.CrowdSecConfig.IncludeScenariosContaining, ","),
+			Origins:                strings.Join(conf.CrowdSecConfig.OnlyIncludeDecisionsFrom, ","),
 		},
-		CertPath: conf.CertPath,
-		KeyPath:  conf.KeyPath,
-		CAPath:   conf.CAPath,
+		CertPath: conf.CrowdSecConfig.CertPath,
+		KeyPath:  conf.CrowdSecConfig.KeyPath,
+		CAPath:   conf.CrowdSecConfig.CAPath,
 	}
 
 	if (testConfig != nil && *testConfig) || (setupOnly == nil || (setupOnly != nil && !*setupOnly)) || (deleteOnly == nil || (deleteOnly != nil && !*deleteOnly)) {

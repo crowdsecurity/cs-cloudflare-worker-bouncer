@@ -44,6 +44,18 @@ type CloudflareConfig struct {
 	Accounts []AccountConfig `yaml:"accounts"`
 }
 
+type CrowdSecConfig struct {
+	CrowdSecLAPIUrl             string   `yaml:"lapi_url"`
+	CrowdSecLAPIKey             string   `yaml:"lapi_key"`
+	CrowdsecUpdateFrequencyYAML string   `yaml:"update_frequency"`
+	IncludeScenariosContaining  []string `yaml:"include_scenarios_containing"`
+	ExcludeScenariosContaining  []string `yaml:"exclude_scenarios_containing"`
+	OnlyIncludeDecisionsFrom    []string `yaml:"only_include_decisions_from"`
+	KeyPath                     string   `yaml:"key_path"`
+	CertPath                    string   `yaml:"cert_path"`
+	CAPath                      string   `yaml:"ca_cert_path"`
+}
+
 type PrometheusConfig struct {
 	Enabled       bool   `yaml:"enabled"`
 	ListenAddress string `yaml:"listen_addr"`
@@ -51,19 +63,11 @@ type PrometheusConfig struct {
 }
 
 type BouncerConfig struct {
-	CrowdSecLAPIUrl             string           `yaml:"crowdsec_lapi_url"`
-	CrowdSecLAPIKey             string           `yaml:"crowdsec_lapi_key"`
-	CrowdsecUpdateFrequencyYAML string           `yaml:"crowdsec_update_frequency"`
-	IncludeScenariosContaining  []string         `yaml:"include_scenarios_containing"`
-	ExcludeScenariosContaining  []string         `yaml:"exclude_scenarios_containing"`
-	OnlyIncludeDecisionsFrom    []string         `yaml:"only_include_decisions_from"`
-	CloudflareConfig            CloudflareConfig `yaml:"cloudflare_config"`
-	Daemon                      bool             `yaml:"daemon"`
-	Logging                     LoggingConfig    `yaml:",inline"`
-	PrometheusConfig            PrometheusConfig `yaml:"prometheus"`
-	KeyPath                     string           `yaml:"key_path"`
-	CertPath                    string           `yaml:"cert_path"`
-	CAPath                      string           `yaml:"ca_cert_path"`
+	CloudflareConfig CloudflareConfig `yaml:"cloudflare_config"`
+	CrowdSecConfig   CrowdSecConfig   `yaml:"crowdsec_config"`
+	Daemon           bool             `yaml:"daemon"`
+	Logging          LoggingConfig    `yaml:",inline"`
+	PrometheusConfig PrometheusConfig `yaml:"prometheus"`
 }
 
 func MergedConfig(configPath string) ([]byte, error) {
@@ -266,23 +270,11 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 }
 
 func setDefaults(cfg *BouncerConfig) {
-	cfg.CrowdSecLAPIUrl = "http://localhost:8080/"
-	cfg.CrowdsecUpdateFrequencyYAML = "10s"
+	cfg.CrowdSecConfig.CrowdSecLAPIUrl = "http://localhost:8080/"
+	cfg.CrowdSecConfig.CrowdsecUpdateFrequencyYAML = "10s"
 	cfg.Logging.setDefaults()
 
 	cfg.Daemon = true
-	// cfg.ExcludeScenariosContaining = []string{
-	// 	"ssh",
-	// 	"ftp",
-	// 	"smb",
-	// }
-	// cfg.OnlyIncludeDecisionsFrom = []string{
-	// 	"CAPI",
-	// 	"cscli",
-	// 	"crowdsec",
-	// 	"lists",
-	// }
-
 	cfg.PrometheusConfig = PrometheusConfig{
 		Enabled:       true,
 		ListenAddress: "127.0.0.1",
