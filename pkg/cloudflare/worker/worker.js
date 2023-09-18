@@ -67,9 +67,10 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
 export default {
   async fetch(request, env, ctx) {
 
-    const doBan = () => {
-      return new Response("Access Denied", {
-        status: 403
+    const doBan = async () => {
+      return new Response(await env.CROWDSECCFBOUNCERNS.get("BAN_TEMPLATE"), {
+        status: 403,
+        headers: {"Content-Type": "text/html"}
       });
     }
 
@@ -243,7 +244,7 @@ export default {
     remediation = getSupportedActionForZone(remediation, env.ACTIONS_BY_DOMAIN[zoneForThisRequest])
     console.log("Remediation for request is " + remediation)
     if (remediation === "ban") {
-      return doBan()
+      return await doBan()
     } else if (remediation === "captcha") {
       return doCaptcha(env, zoneForThisRequest)
     } else {

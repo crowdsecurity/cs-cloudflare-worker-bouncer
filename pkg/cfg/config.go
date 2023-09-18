@@ -35,6 +35,7 @@ type ZoneConfig struct {
 
 type AccountConfig struct {
 	ID          string       `yaml:"id"`
+	BanTemplate string       `yaml:"ban_template"`
 	ZoneConfigs []ZoneConfig `yaml:"zones"`
 	Token       string       `yaml:"token"`
 	OwnerEmail  string       `yaml:"owner_email"`
@@ -150,9 +151,15 @@ func stringSliceContains(slice []string, t string) bool {
 func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[string]cloudflare.Account) string {
 	words := strings.Split(l, " ")
 	lastWord := words[len(words)-1]
+
 	if zone, ok := zoneByID[lastWord]; ok {
 		return zone.Name
 	}
+
+	if strings.Contains(l, "ban_template") {
+		return "template to use for ban action, set empty to use default"
+	}
+
 	if strings.Contains(l, "exclude_scenarios_containing") {
 		return "ignore IPs banned for triggering scenarios containing either of provided word"
 	}
@@ -214,6 +221,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 					OwnerEmail:  strings.Replace(account.Name, "'s Account", "", -1),
 					ZoneConfigs: make([]ZoneConfig, 0),
 					Token:       token,
+					BanTemplate: "",
 				})
 				accountIDXByID[account.ID] = len(accountConfigs) - 1
 			}
@@ -225,8 +233,8 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 			accountIDX := accountIDXByID[zone.Account.ID]
 			accountConfigs[accountIDX].ZoneConfigs = append(accountConfigs[accountIDX].ZoneConfigs, ZoneConfig{
 				ID:            zone.ID,
-				Actions:       []string{"captcha"},
-				DefaultAction: "captcha",
+				Actions:       []string{"ban", "captcha"},
+				DefaultAction: "ban",
 				Turnstile: TurnstileConfig{
 					Enabled:              true,
 					RotateSecretKey:      true,

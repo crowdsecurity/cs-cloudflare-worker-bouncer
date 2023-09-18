@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +45,7 @@ const (
 	WidgetName                = "crowdsec-cloudflare-worker-bouncer-widget"
 	TurnstileConfigKey        = "TURNSTILE_CONFIG"
 	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
+	VarNameForBanTemplate     = "BAN_TEMPLATE"
 	IpRangeKeyName            = "IP_RANGES"
 )
 
@@ -165,6 +167,26 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	m.logger.Tracef("KVNS: %+v", kvNSResp)
 	m.NamespaceID = kvNSResp.Result.ID
 
+	var banTemplate []byte
+	if m.AccountCfg.BanTemplate != "" {
+		banTemplate, err = os.ReadFile(m.AccountCfg.BanTemplate)
+		if err != nil {
+			return fmt.Errorf("error while reading ban template at path %s", m.AccountCfg.BanTemplate)
+		}
+	} else {
+		banTemplate = []byte("Access Denied")
+	}
+
+	_, err = m.api.WriteWorkersKVEntries(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
+		NamespaceID: m.NamespaceID,
+		KVs: []*cf.WorkersKVPair{{
+			Key:   VarNameForBanTemplate,
+			Value: string(banTemplate),
+		}},
+	})
+	if err != nil {
+		return err
+	}
 	actionsForZoneByDomain := make(map[string]ActionsForZone)
 	for _, z := range m.AccountCfg.ZoneConfigs {
 		actionsForZoneByDomain[z.Domain] = ActionsForZone{
@@ -178,6 +200,7 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	}
 
 	m.logger.Infof("Creating worker %s", ScriptName)
+
 	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateWorkerParams{
 		Script:     workerScript,
 		ScriptName: ScriptName,

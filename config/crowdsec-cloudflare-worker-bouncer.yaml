@@ -30,6 +30,7 @@ cloudflare_config:
 log_level: info
 log_media: "stdout"
 log_dir: "/var/log/"
+ban_template_path: "" # set to empty to use default template
 
 prometheus:
     enabled: true
