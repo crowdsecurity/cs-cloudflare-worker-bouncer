@@ -1,0 +1,40 @@
+name: build-binary-package
+
+on:
+  release:
+    types: [prereleased]
+
+permissions:
+  # Use write for: hub release edit
+  contents: write
+
+env:
+  PROGRAM_NAME: crowdsec-cloudflare-worker-bouncer
+
+jobs:
+  build:
+    name: Build and upload all platforms
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Check out repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.20.5
+
+    - name: Build all versions
+      run: |
+        make platform-all
+
+    - name: Upload to release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        tag_name="${GITHUB_REF##*/}"
+        hub release edit $(find . -name "$PROGRAM_NAME*" -maxdepth 1 -printf "-a %p ") -m "" "$tag_name"

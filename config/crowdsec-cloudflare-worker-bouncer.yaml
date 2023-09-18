@@ -1,0 +1,38 @@
+crowdsec_config:
+  lapi_key: ${API_KEY}
+  lapi_url: ${CROWDSEC_LAPI_URL}
+  update_frequency: 10s
+  include_scenarios_containing: []
+  exclude_scenarios_containing: []
+  only_include_decisions_from: []
+  insecure_skip_verify: false
+  key_path: ""  # Used for TLS authentification with CrowdSec LAPI
+  cert_path: "" # Used for TLS authentification with CrowdSec LAPI
+  ca_cert_path: "" # Used for TLS authentification with CrowdSec LAPI
+
+cloudflare_config:
+    accounts:
+        - id: <ACCOUNT_ID>
+          zones:
+            - zone_id: <ZONE_ID> # crowdflare.co.uk
+              actions: # Supported Actions [captcha, ban]
+                - captcha
+              default_action: captcha # Supported Actions [captcha, ban, none]
+              routes_to_protect: []
+              turnstile:
+                enabled: true
+                rotate_secret_key: true
+                rotate_secret_key_every: 168h0m0s 
+                mode: managed # Supported Modes "managed"|"invisible"|"non-interactive"
+          token: <CLOUDFLARE_ACCOUNT_TOKEN>
+          owner_email: owner@example.com
+
+log_level: info
+log_media: "stdout"
+log_dir: "/var/log/"
+ban_template_path: "" # set to empty to use default template
+
+prometheus:
+    enabled: true
+    listen_addr: 127.0.0.1
+    listen_port: "2112"
