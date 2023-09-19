@@ -2,7 +2,7 @@ package cf
 
 import (
 	"context"
-	"crowdsec-cloudflare-worker-bouncer/pkg/cfg"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,13 +11,13 @@ import (
 	"sync"
 	"time"
 
-	_ "embed"
-
 	cf "github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cfg"
 )
 
 var CloudflareAPICallsByAccount = prometheus.NewCounterVec(

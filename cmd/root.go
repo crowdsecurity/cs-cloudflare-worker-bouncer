@@ -3,7 +3,6 @@ package cmd
 import (
 	"bytes"
 	"context"
-	cf "crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
 	"errors"
 	"fmt"
 	"net"
@@ -13,16 +12,17 @@ import (
 	"strings"
 	"syscall"
 
-	"crowdsec-cloudflare-worker-bouncer/pkg/cfg"
-
 	"github.com/crowdsecurity/crowdsec/pkg/apiclient"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	csbouncer "github.com/crowdsecurity/go-cs-bouncer"
-	"github.com/crowdsecurity/go-cs-lib/pkg/version"
+	"github.com/crowdsecurity/go-cs-lib/version"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cfg"
+	cf "github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
 )
 
 const (
