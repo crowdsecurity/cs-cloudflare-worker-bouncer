@@ -6,11 +6,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/crowdsecurity/go-cs-lib/ptr"
 	log "github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/writer"
 	"gopkg.in/natefinch/lumberjack.v2"
-
-	"github.com/crowdsecurity/go-cs-lib/pkg/ptr"
 )
 
 type LoggingConfig struct {

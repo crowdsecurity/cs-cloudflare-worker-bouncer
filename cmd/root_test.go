@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	cf "crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +12,8 @@ import (
 	"github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	"golang.org/x/sync/errgroup"
+
+	cf "github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
 )
 
 func PtrTo[T any](v T) *T {
