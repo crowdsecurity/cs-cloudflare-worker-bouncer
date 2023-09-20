@@ -5,6 +5,7 @@ on:
     paths:
       - 'pkg/cloudflare/worker/**'
       - '.github/workflows/generate-js.yml'
+      - '**'
 jobs:
   build:
     runs-on: ubuntu-latest
