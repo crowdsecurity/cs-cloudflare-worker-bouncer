@@ -1,0 +1,29 @@
+name: Generate js
+
+on: 
+  push:
+    paths:
+      - 'pkg/cloudflare/worker/**'
+      - '.github/workflows/update-js.yml'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+    - name: Create local changes
+      run: |
+        sudo apt-get install -y make npm
+        make build-worker-js
+    - name: Commit files
+      if: ${{ github.event_name == 'push'}}
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git commit -m "Update dist js" pkg/cloudflare/worker/dist/main.js || exit 0
+#token to expire on 09/19/2024
+    - name: Push changes
+      if: ${{ github.event_name == 'push'}}
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
+        branch: ${{ github.ref }}
