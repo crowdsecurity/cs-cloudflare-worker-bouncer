@@ -1,0 +1,11 @@
+Source: crowdsec-cloudflare-worker-bouncer
+Maintainer: Crowdsec Team <debian@crowdsec.net>
+Build-Depends: debhelper
+Section: admin
+Priority: optional
+
+Package: crowdsec-cloudflare-worker-bouncer
+Provides: crowdsec-cloudflare-worker-bouncer
+Depends: gettext-base
+Description: Cloudflare-worker bouncer for Crowdsec
+Architecture: any
