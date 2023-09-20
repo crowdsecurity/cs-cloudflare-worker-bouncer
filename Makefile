@@ -62,8 +62,11 @@ binary: goversion
 build-worker-js:
 	@cd pkg/cloudflare/worker && npm install && npm run build
 
+.PHONY: build-all
+build-all: clean build-worker-js binary
+
 .PHONY: build
-build: clean build-worker-js binary
+build: clean binary
 
 
 .PHONY: lint
