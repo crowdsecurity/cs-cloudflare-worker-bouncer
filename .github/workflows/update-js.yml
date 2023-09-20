@@ -1,25 +1,10 @@
-name: Update index
+name: Generate js
 
 on: 
   push:
     paths:
-      - 'scenarios/**.yaml'
-      - 'parsers/**.yaml'
-      - 'postoverflows/**.yaml'
-      - 'collections/**.yaml'
-      - 'waf-rules/**.yaml'
-      - 'scenarios/**.yml'
-      - 'parsers/**.yml'
-      - 'postoverflows/**.yml'
-      - 'collections/**.yml'
-      - 'waf-rules/**.yml'
-      - 'scenarios/**.md'
-      - 'parsers/**.md'
-      - 'postoverflows/**.md'
-      - 'collections/**.md'
-      - 'waf-rules/**.md'
-      - '.github/workflows/update-index.yml'
-
+      - 'pkg/cloudflare/worker/**'
+      - '.github/workflows/generate-js.yml'
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,7 +12,7 @@ jobs:
     - uses: actions/checkout@v1
     - name: Create local changes
       run: |
-        sudo apt-get install make npm
+        sudo apt-get install -y make npm
         make build-worker-js
     - name: Commit files
       if: ${{ github.event_name == 'push'}}
