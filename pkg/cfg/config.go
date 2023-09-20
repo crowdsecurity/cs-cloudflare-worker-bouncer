@@ -9,10 +9,9 @@ import (
 	"time"
 
 	"github.com/cloudflare/cloudflare-go"
+	"github.com/crowdsecurity/go-cs-lib/csstring"
+	"github.com/crowdsecurity/go-cs-lib/yamlpatch"
 	"gopkg.in/yaml.v3"
-
-	"github.com/crowdsecurity/go-cs-lib/pkg/csstring"
-	"github.com/crowdsecurity/go-cs-lib/pkg/yamlpatch"
 )
 
 type TurnstileConfig struct {
