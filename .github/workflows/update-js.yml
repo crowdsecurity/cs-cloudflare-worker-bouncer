@@ -4,8 +4,7 @@ on:
   push:
     paths:
       - 'pkg/cloudflare/worker/**'
-      - '.github/workflows/generate-js.yml'
-      - '**'
+      - '.github/workflows/update-js.yml'
 jobs:
   build:
     runs-on: ubuntu-latest
