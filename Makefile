@@ -75,7 +75,7 @@ lint:
 
 .PHONY: test
 test: goversion
-	@$(GOTEST) $(LD_OPTS) ./...
+	@$(GOTEST) $(LD_OPTS) ./... -v 
 
 RELDIR = $(BINARY_NAME)-$(BUILD_VERSION)
 
