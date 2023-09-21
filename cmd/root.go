@@ -30,7 +30,7 @@ const (
 	name                = "crowdsec-cloudflare-worker-bouncer"
 )
 
-func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx context.Context) error {
+func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx context.Context) {
 	var g errgroup.Group
 	c()
 	<-ctx.Done()
@@ -41,7 +41,9 @@ func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx 
 			return manager.CleanUpExistingWorkers()
 		})
 	}
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func HandleSignals(ctx context.Context) error {
