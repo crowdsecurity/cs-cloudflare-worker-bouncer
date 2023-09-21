@@ -10,6 +10,8 @@
 &#128172; <a href="https://discourse.crowdsec.net">Discourse </a>
 </p>
 
+⚠️ This remediation component requires a paid Cloudflare Worker Plan.
+
 # CrowdSec Cloudflare Worker 
 
 A remediation component for Cloudflare.
