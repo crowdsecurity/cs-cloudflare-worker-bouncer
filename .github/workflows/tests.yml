@@ -1,6 +1,8 @@
-name: Build + tests
+name: End-to-end tests
 
-on: pull_request_target
+on:
+  schedule:
+    - cron: '30 6 * * *'
 
 jobs:
   build:
@@ -32,7 +34,7 @@ jobs:
       run: |
         go install github.com/kyoh86/richgo@v0.3.12
         set -o pipefail
-        make test | richgo testfilter
+        make end-to-end-test | richgo testfilter
       env:
         RICHGO_FORCE_COLOR: 1
         CLOUDFLARE_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}

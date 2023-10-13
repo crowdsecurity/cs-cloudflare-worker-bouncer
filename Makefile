@@ -73,9 +73,9 @@ build: clean binary
 lint:
 	golangci-lint run
 
-.PHONY: test
-test: goversion
-	@$(GOTEST) $(LD_OPTS) ./... -v 
+.PHONY: end-to-end-test
+end-to-end-test: goversion
+	@$(GOTEST) $(LD_OPTS) ./cmd/
 
 RELDIR = $(BINARY_NAME)-$(BUILD_VERSION)
 
