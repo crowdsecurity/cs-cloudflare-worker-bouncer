@@ -1,10 +1,6 @@
 name: Build + tests
 
-on:
-  pull_request_target
-
-permissions:
-  contents: read
+on: pull_request_target
 
 jobs:
   build:
