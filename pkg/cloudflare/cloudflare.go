@@ -122,11 +122,11 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig) (*C
 // and overrides the RoundTrip method to increment a Prometheus counter for each API call made by the account owner.
 type CloudflareManagerHTTPTransport struct {
 	http.Transport
-	accountOwnerEmail string
+	accountName string
 }
 
 func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	CloudflareAPICallsByAccount.WithLabelValues(cfT.accountOwnerEmail).Inc()
+	CloudflareAPICallsByAccount.WithLabelValues(cfT.accountName).Inc()
 	return http.DefaultTransport.RoundTrip(req)
 }
 
@@ -134,7 +134,7 @@ func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.R
 // It initializes the API client with the provided account configuration and HTTP client, and returns the client instance.
 // The function also uses a custom HTTP transport to track the number of Cloudflare API calls made by the account owner.
 func NewCloudflareAPI(accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
-	transport := CloudflareManagerHTTPTransport{accountOwnerEmail: accountCfg.Name}
+	transport := CloudflareManagerHTTPTransport{accountName: accountCfg.Name}
 	httpClient := http.Client{}
 	httpClient.Transport = &transport
 	api, err := cf.NewWithAPIToken(accountCfg.Token, cf.HTTPClient(&httpClient))
