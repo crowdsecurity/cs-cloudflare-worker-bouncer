@@ -268,7 +268,7 @@ func generateRandomZoneName() string {
 func TestBouncer(t *testing.T) {
 	rh := &redactrus.Hook{
 		AcceptedLevels: logrus.AllLevels,
-		RedactionList:  []string{"password", "email", "zone", "owner_email", "account", "id", "secret", "token"},
+		RedactionList:  []string{"password", "email", "zone", "account_name", "owner_name", "account", "id", "secret", "token"},
 	}
 	logrus.AddHook(rh)
 	var cloudflareToken string = os.Getenv("CLOUDFLARE_TOKEN")
