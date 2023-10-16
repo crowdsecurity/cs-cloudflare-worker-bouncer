@@ -11,6 +11,8 @@ import (
 
 	"github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
+	"github.com/sirupsen/logrus"
+	"github.com/whuang8/redactrus"
 	"golang.org/x/sync/errgroup"
 
 	cf "github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
@@ -259,11 +261,50 @@ func runDecisionTests(t *testing.T, m *cf.CloudflareAccountManager, newDecisions
 	return nil
 }
 
+func generateRandomZoneName() string {
+	return fmt.Sprintf("test-%d.com", time.Now().Unix())
+}
+
 func TestBouncer(t *testing.T) {
+	rh := &redactrus.Hook{
+		AcceptedLevels: logrus.AllLevels,
+		RedactionList:  []string{"password", "email", "zone", "owner_email", "account", "id", "secret", "token"},
+	}
+	logrus.AddHook(rh)
 	var cloudflareToken string = os.Getenv("CLOUDFLARE_TOKEN")
 	if cloudflareToken == "" {
 		t.Fatal("CLOUDFLARE_TOKEN not set")
 	}
+	api, err := cloudflare.NewWithAPIToken(cloudflareToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// create test zone per account
+	accounts, _, err := api.Accounts(context.Background(), cloudflare.AccountsListParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	zonesToDelete := make([]string, 0)
+	for _, account := range accounts {
+		zoneName := generateRandomZoneName()
+		zoneObj, err := api.CreateZone(context.Background(), zoneName, false, cloudflare.Account{ID: account.ID}, "full")
+		if err != nil {
+			t.Fatal(err)
+		}
+		zonesToDelete = append(zonesToDelete, zoneObj.ID)
+	}
+	t.Cleanup(func() {
+		eg := errgroup.Group{}
+		for _, zone := range zonesToDelete {
+			zone := zone
+			eg.Go(func() error {
+				_, err := api.DeleteZone(context.Background(), zone)
+				return err
+			})
+		}
+		t.Log(eg.Wait())
+	})
 
 	// generate config
 	configPath := "/tmp/crowdsec-cloudflare-worker-bouncer.yaml"

@@ -407,7 +407,7 @@ func (m *CloudflareAccountManager) writeWidgetCfgToKV(ctx context.Context, widge
 		Key:   TurnstileConfigKey,
 		Value: string(turnstileConfig),
 	}
-	m.logger.Infof("Writing turnstile cfg %+v", kv)
+	m.logger.Infof("Writing turnstile cfg")
 	resp, err := m.api.WriteWorkersKVEntries(ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
 		NamespaceID: m.NamespaceID,
 		KVs:         []*cf.WorkersKVPair{&kv},
