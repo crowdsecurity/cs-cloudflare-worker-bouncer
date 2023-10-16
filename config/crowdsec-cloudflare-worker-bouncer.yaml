@@ -25,7 +25,7 @@ cloudflare_config:
                 rotate_secret_key_every: 168h0m0s 
                 mode: managed # Supported Modes "managed"|"invisible"|"non-interactive"
           token: <CLOUDFLARE_ACCOUNT_TOKEN>
-          owner_email: owner@example.com
+          account_name: owner@example.com
 
 log_level: info
 log_media: "stdout"

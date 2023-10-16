@@ -112,7 +112,7 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig) (*C
 		AccountCfg:      accountCfg,
 		api:             api,
 		Ctx:             ctx,
-		logger:          log.WithFields(log.Fields{"account": accountCfg.OwnerEmail}),
+		logger:          log.WithFields(log.Fields{"account": accountCfg.Name}),
 		ipRangeKVPair:   cf.WorkersKVPair{Key: IpRangeKeyName, Value: "{}"},
 		ActionByIPRange: make(map[string]string),
 	}, nil
@@ -122,11 +122,11 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig) (*C
 // and overrides the RoundTrip method to increment a Prometheus counter for each API call made by the account owner.
 type CloudflareManagerHTTPTransport struct {
 	http.Transport
-	accountOwnerEmail string
+	accountName string
 }
 
 func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	CloudflareAPICallsByAccount.WithLabelValues(cfT.accountOwnerEmail).Inc()
+	CloudflareAPICallsByAccount.WithLabelValues(cfT.accountName).Inc()
 	return http.DefaultTransport.RoundTrip(req)
 }
 
@@ -134,7 +134,7 @@ func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.R
 // It initializes the API client with the provided account configuration and HTTP client, and returns the client instance.
 // The function also uses a custom HTTP transport to track the number of Cloudflare API calls made by the account owner.
 func NewCloudflareAPI(accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
-	transport := CloudflareManagerHTTPTransport{accountOwnerEmail: accountCfg.OwnerEmail}
+	transport := CloudflareManagerHTTPTransport{accountName: accountCfg.Name}
 	httpClient := http.Client{}
 	httpClient.Transport = &transport
 	api, err := cf.NewWithAPIToken(accountCfg.Token, cf.HTTPClient(&httpClient))
@@ -257,7 +257,7 @@ func (m *CloudflareAccountManager) updateMetrics() {
 		totalKVPairs += 1
 	}
 	totalKVPairs += len(m.KVPairByDecisionValue)
-	TotalKeysByAccount.WithLabelValues(m.AccountCfg.OwnerEmail).Set(float64(totalKVPairs))
+	TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
 }
 
 // This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.

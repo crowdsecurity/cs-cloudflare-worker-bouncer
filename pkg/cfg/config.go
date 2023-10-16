@@ -37,7 +37,7 @@ type AccountConfig struct {
 	BanTemplate string       `yaml:"ban_template"`
 	ZoneConfigs []ZoneConfig `yaml:"zones"`
 	Token       string       `yaml:"token"`
-	OwnerEmail  string       `yaml:"owner_email"`
+	Name        string       `yaml:"account_name"`
 }
 
 type CloudflareConfig struct {
@@ -217,7 +217,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 			if _, ok := accountIDXByID[account.ID]; !ok {
 				accountConfigs = append(accountConfigs, AccountConfig{
 					ID:          account.ID,
-					OwnerEmail:  strings.Replace(account.Name, "'s Account", "", -1),
+					Name:        strings.Replace(account.Name, "'s Account", "", -1),
 					ZoneConfigs: make([]ZoneConfig, 0),
 					Token:       token,
 					BanTemplate: "",

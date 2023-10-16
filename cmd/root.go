@@ -174,15 +174,15 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		g.Go(func() error {
 			err := manager.CleanUpExistingWorkers()
 			if err != nil {
-				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.OwnerEmail)
+				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.Name)
 			}
 			if deleteOnly != nil && *deleteOnly {
 				return nil
 			}
 			if err := manager.DeployInfra(); err != nil {
-				return fmt.Errorf("unable to deploy infra: %w for account %s", err, manager.AccountCfg.OwnerEmail)
+				return fmt.Errorf("unable to deploy infra: %w for account %s", err, manager.AccountCfg.Name)
 			}
-			log.Infof("Successfully deployed infra for account %s", manager.AccountCfg.OwnerEmail)
+			log.Infof("Successfully deployed infra for account %s", manager.AccountCfg.Name)
 			return nil
 		})
 	}
@@ -249,10 +249,10 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 				manager := m
 				mg.Go(func() error {
 					if err := manager.ProcessDeletedDecisions(streamDecision.Deleted); err != nil {
-						return fmt.Errorf("account %s, unable to process deleted decisions: %w", manager.AccountCfg.OwnerEmail, err)
+						return fmt.Errorf("account %s, unable to process deleted decisions: %w", manager.AccountCfg.Name, err)
 					}
 					if err := manager.ProcessNewDecisions(streamDecision.New); err != nil {
-						return fmt.Errorf("account %s, unable to process new decisions: %w", manager.AccountCfg.OwnerEmail, err)
+						return fmt.Errorf("account %s, unable to process new decisions: %w", manager.AccountCfg.Name, err)
 					}
 					return nil
 				})
