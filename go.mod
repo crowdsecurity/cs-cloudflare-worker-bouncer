@@ -7,6 +7,7 @@ require (
 	github.com/crowdsecurity/go-cs-bouncer v0.0.11
 	github.com/prometheus/client_golang v1.15.1
 	github.com/sirupsen/logrus v1.9.3
+	github.com/whuang8/redactrus v1.0.2
 	golang.org/x/sync v0.3.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
@@ -39,7 +40,6 @@ require (
 	github.com/prometheus/client_model v0.4.0 // indirect
 	github.com/prometheus/common v0.44.0 // indirect
 	github.com/prometheus/procfs v0.10.0 // indirect
-	github.com/whuang8/redactrus v1.0.2 // indirect
 	go.mongodb.org/mongo-driver v1.11.6 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 	google.golang.org/protobuf v1.30.0 // indirect
@@ -53,9 +53,9 @@ require (
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.4 // indirect
-	golang.org/x/net v0.11.0 // indirect
-	golang.org/x/sys v0.9.0 // indirect
-	golang.org/x/text v0.10.0 // indirect
+	golang.org/x/net v0.17.0 // indirect
+	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/text v0.13.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1
 )
