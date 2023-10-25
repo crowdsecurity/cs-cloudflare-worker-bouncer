@@ -76,7 +76,7 @@ func runInfraTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 			return err
 		}
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(10 * time.Second)
 
 		turnstileCfg, err = api.GetWorkersKV(m.Ctx, cloudflare.AccountIdentifier(m.AccountCfg.ID), cloudflare.GetWorkersKVParams{
 			NamespaceID: kvNamespace.ID,
@@ -352,7 +352,7 @@ func TestBouncer(t *testing.T) {
 				}
 				return nil
 			})
-			time.Sleep(5 * time.Second)
+			time.Sleep(10 * time.Second)
 			if err := runInfraTest(t, m); err != nil {
 				return err
 			}
