@@ -232,8 +232,8 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 			accountIDX := accountIDXByID[zone.Account.ID]
 			accountConfigs[accountIDX].ZoneConfigs = append(accountConfigs[accountIDX].ZoneConfigs, ZoneConfig{
 				ID:            zone.ID,
-				Actions:       []string{"ban", "captcha"},
-				DefaultAction: "ban",
+				Actions:       []string{"captcha"},
+				DefaultAction: "captcha",
 				Turnstile: TurnstileConfig{
 					Enabled:              true,
 					RotateSecretKey:      true,
