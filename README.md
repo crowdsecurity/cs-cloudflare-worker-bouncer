@@ -22,4 +22,4 @@ This remediation component deploys Cloudflare Worker in front of a Cloudflare Zo
 
 # Documentation
 
-Please follow the [official documentation](https://docs.crowdsec.net/docs/bouncers/cloudflare).
+Please follow the [official documentation](https://docs.crowdsec.net/docs/next/bouncers/cloudflare-workers).
