@@ -40,12 +40,14 @@ type AccountConfig struct {
 	Name        string        `yaml:"account_name"`
 }
 
-/*
-A trimmed down struct to only expose configuration options for worker
-*/
+// YAML struct derived from cloudflare.CreateWorkerParams
+// https://github.com/cloudflare/cloudflare-go/blob/056b65c6e956a7119d0d89b27a659ea63b1c0506/workers.go#L24
 type CloudflareWorkerCreateParams struct {
-	ScriptName string `yaml:"script_name"`
-	Logpush    *bool  `yaml:"logpush"`
+	ScriptName         string   `yaml:"script_name"`
+	Logpush            *bool    `yaml:"logpush"`
+	Tags               []string `yaml:"tags"`
+	CompatibilityDate  string   `yaml:"compatibility_date"`
+	CompatibilityFlags []string `yaml:"compatibility_flags"`
 }
 
 func (w *CloudflareWorkerCreateParams) setDefaults() {
@@ -64,8 +66,11 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, I
 				Text: string(varActionsForZoneByDomain),
 			},
 		},
-		Module:  true,
-		Logpush: w.Logpush,
+		Module:             true,
+		Logpush:            w.Logpush,
+		Tags:               w.Tags,
+		CompatibilityDate:  w.CompatibilityDate,
+		CompatibilityFlags: w.CompatibilityFlags,
 	}
 }
 
