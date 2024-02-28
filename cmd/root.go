@@ -86,11 +86,11 @@ func getConfigFromPath(configPath string) (*cfg.BouncerConfig, error) {
 	return conf, nil
 }
 
-func CloudflareManagersFromConfig(ctx context.Context, accountConfigs []cfg.AccountConfig) ([]*cf.CloudflareAccountManager, error) {
-	cfManagers := make([]*cf.CloudflareAccountManager, 0)
-	for _, accountCfg := range accountConfigs {
+func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConfig) ([]*cf.CloudflareAccountManager, error) {
+	cfManagers := make([]*cf.CloudflareAccountManager, len(config.Accounts))
+	for _, accountCfg := range config.Accounts {
 		cfg := accountCfg
-		manager, err := cf.NewCloudflareManager(ctx, cfg)
+		manager, err := cf.NewCloudflareManager(ctx, cfg, config.Worker)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create cloudflare manager: %w", err)
 		}
@@ -165,7 +165,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 
 	rootCtx := context.Background()
 	g, ctx := errgroup.WithContext(rootCtx)
-	cfManagers, err := CloudflareManagersFromConfig(ctx, conf.CloudflareConfig.Accounts)
+	cfManagers, err := CloudflareManagersFromConfig(ctx, conf.CloudflareConfig)
 	if err != nil {
 		return err
 	}

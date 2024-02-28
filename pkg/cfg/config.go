@@ -33,15 +33,45 @@ type ZoneConfig struct {
 }
 
 type AccountConfig struct {
-	ID          string       `yaml:"id"`
-	BanTemplate string       `yaml:"ban_template"`
-	ZoneConfigs []ZoneConfig `yaml:"zones"`
-	Token       string       `yaml:"token"`
-	Name        string       `yaml:"account_name"`
+	ID          string        `yaml:"id"`
+	BanTemplate string        `yaml:"ban_template"`
+	ZoneConfigs []*ZoneConfig `yaml:"zones"`
+	Token       string        `yaml:"token"`
+	Name        string        `yaml:"account_name"`
+}
+
+/*
+A trimmed down struct to only expose configuration options for worker
+*/
+type CloudflareWorkerCreateParams struct {
+	ScriptName string `yaml:"script_name"`
+	Logpush    *bool  `yaml:"logpush"`
+}
+
+func (w *CloudflareWorkerCreateParams) setDefaults() {
+	if w.ScriptName == "" {
+		w.ScriptName = "crowdsec-cloudflare-worker-bouncer"
+	}
+}
+
+func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, ID string, varActionsForZoneByDomain []byte) cloudflare.CreateWorkerParams {
+	return cloudflare.CreateWorkerParams{
+		Script:     workerScript,
+		ScriptName: w.ScriptName,
+		Bindings: map[string]cloudflare.WorkerBinding{
+			"KVNsName": cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
+			"VarNameForActionsByDomain": cloudflare.WorkerPlainTextBinding{
+				Text: string(varActionsForZoneByDomain),
+			},
+		},
+		Module:  true,
+		Logpush: w.Logpush,
+	}
 }
 
 type CloudflareConfig struct {
-	Accounts []AccountConfig `yaml:"accounts"`
+	Worker   *CloudflareWorkerCreateParams `yaml:"worker"`
+	Accounts []AccountConfig               `yaml:"accounts"`
 }
 
 type CrowdSecConfig struct {
@@ -135,6 +165,7 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 			zoneIDSet[zone.ID] = true
 		}
 	}
+	config.CloudflareConfig.Worker.setDefaults() // set defaults for worker
 	return config, nil
 }
 
@@ -218,7 +249,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 				accountConfigs = append(accountConfigs, AccountConfig{
 					ID:          account.ID,
 					Name:        strings.Replace(account.Name, "'s Account", "", -1),
-					ZoneConfigs: make([]ZoneConfig, 0),
+					ZoneConfigs: make([]*ZoneConfig, 0),
 					Token:       token,
 					BanTemplate: "",
 				})
@@ -230,7 +261,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 		for _, zone := range zones {
 			zoneByID[zone.ID] = zone
 			accountIDX := accountIDXByID[zone.Account.ID]
-			accountConfigs[accountIDX].ZoneConfigs = append(accountConfigs[accountIDX].ZoneConfigs, ZoneConfig{
+			accountConfigs[accountIDX].ZoneConfigs = append(accountConfigs[accountIDX].ZoneConfigs, &ZoneConfig{
 				ID:            zone.ID,
 				Actions:       []string{"captcha"},
 				DefaultAction: "captcha",
