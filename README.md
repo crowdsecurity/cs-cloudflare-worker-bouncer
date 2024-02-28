@@ -10,7 +10,11 @@
 &#128172; <a href="https://discourse.crowdsec.net">Discourse </a>
 </p>
 
-⚠️ This remediation component requires a paid Cloudflare Worker Plan.
+⚠️ Due to the heavy usage of KV and Workers quotas on Cloudflare free plan, the paid Cloudflare Worker Plan is recommended for this remediation component.
+
+⚠️ Follow this guide to [test on free Plan](https://doc.crowdsec.net/u/bouncers/cloudflare-workers/#appendix-test-with-cloudflare-free-plan)
+
+⚠️ Make sure to properly set up [The worker route fail mode](https://doc.crowdsec.net/u/bouncers/cloudflare-workers#setting-up-the-worker-route-fail-mode)
 
 # CrowdSec Cloudflare Worker 
 
