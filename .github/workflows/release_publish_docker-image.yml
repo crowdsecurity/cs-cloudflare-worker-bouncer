@@ -71,7 +71,7 @@ jobs:
           tags: ${{ steps.prep.outputs.tags }}
           # Supported by golang:1.18-alpine: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8,linux/ppc64le,linux/s390x
           # Supported by alpine: same
-          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8,linux/ppc64le,linux/s390x
+          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8 #,linux/ppc64le,linux/s390x
           labels: |
             org.opencontainers.image.source=${{ github.event.repository.html_url }}
             org.opencontainers.image.created=${{ steps.prep.outputs.created }}
