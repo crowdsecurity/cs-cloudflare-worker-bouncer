@@ -24,7 +24,7 @@ jobs:
         name: Prepare
         id: prep
         run: |
-          DOCKER_IMAGE=priyankub/cloudflare-worker-bouncer
+          DOCKER_IMAGE=crowdsec/cloudflare-worker-bouncer
           GHCR_IMAGE=ghcr.io/${{ github.repository_owner }}/cloudflare-worker-bouncer
           VERSION=edge
           if [[ $GITHUB_REF == refs/tags/* ]]; then
