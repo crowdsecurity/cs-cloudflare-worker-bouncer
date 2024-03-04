@@ -5,7 +5,7 @@ A bouncer that syncs the decisions made by CrowdSec with CloudFlare's firewall. 
 ### Initial Setup
 
 ```bash
-docker run crowdsecurity/cloudflare-bouncer \
+docker run crowdsecurity/cloudflare-worker-bouncer \
  -g <CLOUDFLARE_TOKEN1> <CLOUDFLARE_TOKEN2> > cfg.yaml # auto-generate cloudflare config for provided space separated tokens 
 vi cfg.yaml # review config and set `crowdsec_lapi_key`
 ```
@@ -21,44 +21,55 @@ The `crowdsec_lapi_url` must be accessible from the container.
 
 ```bash
   docker run \
-  -v $PWD/cfg.yaml:/etc/crowdsec/bouncers/crowdsec-cloudflare-bouncer.yaml \
+  -v $PWD/cfg.yaml:/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml \
   -p 2112:2112 \
-  crowdsecurity/cloudflare-bouncer
+  crowdsecurity/cloudflare-worker-bouncer
 ```
 
 
 # Configuration
 
-Configuration file must be at `/etc/crowdsec/bouncers/crowdsec-cloudflare-bouncer.yaml`
+Configuration file must be at `/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml`
 
 ```yaml
 # CrowdSec Config
-crowdsec_lapi_url: http://localhost:8080/
-crowdsec_lapi_key: ${API_KEY}
-crowdsec_update_frequency: 10s
+crowdsec_config:
+  lapi_url: http://localhost:8080/
+  lapi_key: ${API_KEY}
+  update_frequency: 10s
 
 #Cloudflare Config. 
 cloudflare_config:
-  accounts: 
-  - id: 
-    token: 
-    ip_list_prefix: crowdsec
-    default_action: challenge
-    zones:
-    - actions: 
-      - challenge # valid choices are either of challenge, js_challenge, block
-      zone_id:
+cloudflare_config:
+    accounts:
+        - id: 
+          ban_template: "" # template to use for ban action, set empty to use default
+          zones:
+            - zone_id:  # example.com
+              actions: # supported actions for this zone. eg value ["ban", "captcha"]
+                - captcha
+              default_action: captcha
+              routes_to_protect:
+                - '*example.com/*'
+              turnstile: # Turnstile must be enabled if captcha action is used.
+                enabled: true
+                rotate_secret_key: true
+                rotate_secret_key_every: 168h0m0s
+                mode: managed
     
   update_frequency: 30s # the frequency to update the cloudflare IP list 
 
 # Bouncer Config
-daemon: false
 log_mode: file
 log_dir: /var/log/ 
 log_level: info # valid choices are either debug, info, error 
+log_max_size: 40
+log_max_files: 3
+log_max_age: 30
+compress_logs: true
 
 prometheus:
-  enabled: true
+  enabled: false
   listen_addr: 127.0.0.1
   listen_port: 2112
 ```
@@ -71,7 +82,7 @@ prometheus:
 For obtaining the `token`:
 1. Sign in as a user who has access to the desired account.
 2. Go to [Tokens](https://dash.cloudflare.com/profile/api-tokens) and create the token. The bouncer requires the follwing permissions to function.
-![image](https://raw.githubusercontent.com/crowdsecurity/cs-cloudflare-bouncer/main/docs/assets/token_permissions.png)
+![image](https://docs.crowdsec.net/assets/images/cloudflare_token_permissions-1fd049cf03d8d2440112b9b7f486b7c4.png)
 
 To automatically generate config for cloudflare check the  helper section below.
 
