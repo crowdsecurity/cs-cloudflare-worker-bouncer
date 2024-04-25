@@ -87,7 +87,7 @@ func getConfigFromPath(configPath string) (*cfg.BouncerConfig, error) {
 }
 
 func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConfig) ([]*cf.CloudflareAccountManager, error) {
-	cfManagers := make([]*cf.CloudflareAccountManager, len(config.Accounts))
+	cfManagers := make([]*cf.CloudflareAccountManager, 0, len(config.Accounts))
 	for _, accountCfg := range config.Accounts {
 		cfg := accountCfg
 		manager, err := cf.NewCloudflareManager(ctx, cfg, config.Worker)
