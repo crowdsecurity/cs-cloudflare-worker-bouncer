@@ -14,6 +14,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var (
+	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
+)
+
 type TurnstileConfig struct {
 	Enabled              bool          `yaml:"enabled"`
 	RotateSecretKey      bool          `yaml:"rotate_secret_key"`
@@ -66,7 +70,7 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, I
 		ScriptName: w.ScriptName,
 		Bindings: map[string]cloudflare.WorkerBinding{
 			w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
-			"VarNameForActionsByDomain": cloudflare.WorkerPlainTextBinding{
+			VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
 				Text: string(varActionsForZoneByDomain),
 			},
 		},

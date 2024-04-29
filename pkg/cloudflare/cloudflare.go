@@ -40,11 +40,10 @@ var TotalKeysByAccount = prometheus.NewGaugeVec(
 var workerScript string
 
 const (
-	WidgetName                = "crowdsec-cloudflare-worker-bouncer-widget"
-	TurnstileConfigKey        = "TURNSTILE_CONFIG"
-	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
-	VarNameForBanTemplate     = "BAN_TEMPLATE"
-	IpRangeKeyName            = "IP_RANGES"
+	WidgetName            = "crowdsec-cloudflare-worker-bouncer-widget"
+	TurnstileConfigKey    = "TURNSTILE_CONFIG"
+	VarNameForBanTemplate = "BAN_TEMPLATE"
+	IpRangeKeyName        = "IP_RANGES"
 )
 
 type cloudflareAPI interface {
