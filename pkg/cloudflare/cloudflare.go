@@ -40,7 +40,6 @@ var TotalKeysByAccount = prometheus.NewGaugeVec(
 var workerScript string
 
 const (
-	KVNsName                  = "CROWDSECCFBOUNCERNS"
 	WidgetName                = "crowdsec-cloudflare-worker-bouncer-widget"
 	TurnstileConfigKey        = "TURNSTILE_CONFIG"
 	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
@@ -156,11 +155,11 @@ type ActionsForZone struct {
 // and binds it to the worker.
 func (m *CloudflareAccountManager) DeployInfra() error {
 	// Create the worker
-	m.logger.Infof("Creating KVNS %s", KVNsName)
+	m.logger.Infof("Creating KVNS %s", m.Worker.KVNameSpaceName)
 	kvNSResp, err := m.api.CreateWorkersKVNamespace(
 		m.Ctx,
 		cf.AccountIdentifier(m.AccountCfg.ID),
-		cf.CreateWorkersKVNamespaceParams{Title: KVNsName},
+		cf.CreateWorkersKVNamespaceParams{Title: m.Worker.KVNameSpaceName},
 	)
 	if err != nil {
 		return err
@@ -306,7 +305,7 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 	m.logger.Debugf("Done listing worker KV Namespaces")
 
 	for _, kvNamespace := range kvNamespaces {
-		if kvNamespace.Title == KVNsName {
+		if kvNamespace.Title == m.Worker.KVNameSpaceName {
 			m.logger.Debugf("Deleting worker KV Namespace with ID %s", kvNamespace.ID)
 			_, err := m.api.DeleteWorkersKVNamespace(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), kvNamespace.ID)
 			if err != nil {

@@ -59,7 +59,7 @@ func runInfraTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 
 	foundKVNamespace := false
 	for _, kvNamespace := range kvNamespaces {
-		if kvNamespace.Title != cf.KVNsName {
+		if kvNamespace.Title != m.Worker.KVNameSpaceName {
 			continue
 		}
 		foundKVNamespace = true
@@ -162,7 +162,7 @@ func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 	}
 
 	for _, kvNamespace := range kvNamespaces {
-		if kvNamespace.Title == cf.KVNsName {
+		if kvNamespace.Title == m.Worker.KVNameSpaceName {
 			return fmt.Errorf("kv namespace should not exist")
 		}
 	}

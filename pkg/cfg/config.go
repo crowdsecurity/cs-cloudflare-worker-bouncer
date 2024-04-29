@@ -48,11 +48,15 @@ type CloudflareWorkerCreateParams struct {
 	Tags               []string `yaml:"tags"`
 	CompatibilityDate  string   `yaml:"compatibility_date"`
 	CompatibilityFlags []string `yaml:"compatibility_flags"`
+	KVNameSpaceName    string   `yaml:"-"` // Currently hardcoded string in worker code but may allow customization in future
 }
 
 func (w *CloudflareWorkerCreateParams) setDefaults() {
 	if w.ScriptName == "" {
 		w.ScriptName = "crowdsec-cloudflare-worker-bouncer"
+	}
+	if w.KVNameSpaceName == "" {
+		w.KVNameSpaceName = "CROWDSECCFBOUNCERNS"
 	}
 }
 
@@ -61,7 +65,7 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, I
 		Script:     workerScript,
 		ScriptName: w.ScriptName,
 		Bindings: map[string]cloudflare.WorkerBinding{
-			"KVNsName": cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
+			w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
 			"VarNameForActionsByDomain": cloudflare.WorkerPlainTextBinding{
 				Text: string(varActionsForZoneByDomain),
 			},
