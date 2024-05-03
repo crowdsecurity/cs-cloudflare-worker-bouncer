@@ -16,6 +16,7 @@ import (
 
 var (
 	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
+	EmptyConfigError          = fmt.Errorf("empty config")
 )
 
 type TurnstileConfig struct {
@@ -83,8 +84,8 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, I
 }
 
 type CloudflareConfig struct {
-	Worker   *CloudflareWorkerCreateParams `yaml:"worker"`
-	Accounts []AccountConfig               `yaml:"accounts"`
+	Worker   CloudflareWorkerCreateParams `yaml:"worker"`
+	Accounts []AccountConfig              `yaml:"accounts"`
 }
 
 type CrowdSecConfig struct {
@@ -132,6 +133,10 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 	}
 
 	configBuff := csstring.StrictExpand(string(content), os.LookupEnv)
+
+	if len(configBuff) == 0 {
+		return nil, EmptyConfigError
+	}
 
 	err = yaml.Unmarshal([]byte(configBuff), &config)
 	if err != nil {

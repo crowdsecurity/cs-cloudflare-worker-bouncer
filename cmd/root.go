@@ -90,7 +90,7 @@ func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConf
 	cfManagers := make([]*cf.CloudflareAccountManager, 0, len(config.Accounts))
 	for _, accountCfg := range config.Accounts {
 		cfg := accountCfg
-		manager, err := cf.NewCloudflareManager(ctx, cfg, config.Worker)
+		manager, err := cf.NewCloudflareManager(ctx, cfg, &config.Worker)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create cloudflare manager: %w", err)
 		}
