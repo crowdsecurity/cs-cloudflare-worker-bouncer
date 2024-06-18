@@ -1,6 +1,8 @@
-# cloudflare-bouncer
+# cloudflare-worker-bouncer
 
-A bouncer that syncs the decisions made by CrowdSec with CloudFlare's firewall. Manages multi user, multi account, multi zone setup. Supports IP, Country and AS scoped decisions.
+This Remediation Component (aka Bouncer) deploys a Cloudflare Worker in front of a Cloudflare Zone/Website, which checks if incoming request's IP address/Country/AS is present in a KV store and takes necessary remedial actions. It also periodically updates the KV store with CrowdSec LAPI's decisions.
+
+Full documentation is available at [https://docs.crowdsec.net/u/bouncers/cloudflare-workers/](https://docs.crowdsec.net/u/bouncers/cloudflare-workers/)
 
 ### Initial Setup
 
@@ -10,12 +12,12 @@ docker run crowdsecurity/cloudflare-worker-bouncer \
 vi cfg.yaml # review config and set `crowdsec_lapi_key`
 ```
 
-The `crowdsec_lapi_key` can be obtained by running the following:
+The `crowdsec.lapi_key` can be obtained by running the following:
 ```bash
 sudo cscli -oraw bouncers add cloudflarebouncer # -oraw flag can discarded for human friendly output.
 ```
 
-The `crowdsec_lapi_url` must be accessible from the container.
+The `crowdsec.lapi_url` must be accessible from the container.
 
 ### Run the bouncer
 
@@ -60,17 +62,12 @@ cloudflare_config:
   update_frequency: 30s # the frequency to update the cloudflare IP list 
 
 # Bouncer Config
-log_mode: file
-log_dir: /var/log/ 
-log_level: info # valid choices are either debug, info, error 
-log_max_size: 40
-log_max_files: 3
-log_max_age: 30
-compress_logs: true
+log_mode: stdout
+log_level: info
 
 prometheus:
   enabled: false
-  listen_addr: 127.0.0.1
+  listen_addr: 0.0.0.0
   listen_port: 2112
 ```
 
@@ -103,33 +100,21 @@ Generates bouncer config by discovering all the accounts and the zones associate
 Example Usage:
 
 ```bash
-docker run crowdsecurity/cloudflare-bouncer -g <TOKEN_1>,<TOKEN_2>... > cfg.yaml
+docker run crowdsecurity/cloudflare-worker-bouncer -g <TOKEN_1>,<TOKEN_2>... > cfg.yaml
 ```
 
-After reviewing the config you can bind mount it to the container at path `/etc/crowdsec/bouncers/crowdsec-cloudflare-bouncer.yaml` as shown in the setup gude.
+After reviewing the config you can bind mount it to the container at path `/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml` as shown in the setup gude.
 
 :::note
-This script only generates cloudflare related config. By default it refers to the config at `/etc/crowdsec/bouncers/crowdsec-cloudflare-bouncer.yaml` for crowdsec configuration. 
+This script only generates cloudflare related config. By default it refers to the config at `/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml` for crowdsec configuration. 
 :::
 
 Using custom config:
 ```bash
-docker run crowdsecurity/cloudflare-bouncer -c /cfg.yaml -g <TOKEN_1>,<TOKEN_2>...  -v $PWD/cfg.yaml:/cfg.yaml
+docker run -v $PWD/cfg.yaml:/cfg.yaml crowdsecurity/cloudflare-worker-bouncer -c /cfg.yaml -g <TOKEN_1>,<TOKEN_2>...
 ```
 
 Make sure that the custom config is mounted in the container.
-
-### Cloudflare Setup
-
-This only creates the required IP lists and firewall rules at cloudflare and exits.
-
-Example Usage:
-```bash
-  docker run \
-  -v $PWD/cfg.yaml:/etc/crowdsec/bouncers/crowdsec-cloudflare-bouncer.yaml \
-  -p 2112:2112 \
-  crowdsecurity/cloudflare-bouncer -s
-```
 
 ### Cloudflare Cleanup
 
@@ -138,16 +123,9 @@ This deletes all IP lists and firewall rules at cloudflare which were created by
 Example Usage:
 ```bash
   docker run \
-  -v $PWD/cfg.yaml:/etc/crowdsec/bouncers/crowdsec-cloudflare-bouncer.yaml \
-  -p 2112:2112 \
-  crowdsecurity/cloudflare-bouncer -s
+  -v $PWD/cfg.yaml:/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml \
+  crowdsecurity/cloudflare-worker-bouncer -d
 ```
-
-# How it works
-
-The service polls the CrowdSec Local API for new decisions. It then makes API calls to Cloudflare
-to update IP lists and firewall rules depending upon the decision.
-
 
 # Troubleshooting
  - Metrics are exposed at port 2112
