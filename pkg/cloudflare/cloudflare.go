@@ -40,13 +40,10 @@ var TotalKeysByAccount = prometheus.NewGaugeVec(
 var workerScript string
 
 const (
-	ScriptName                = "crowdsec-cloudflare-worker-bouncer"
-	KVNsName                  = "CROWDSECCFBOUNCERNS"
-	WidgetName                = "crowdsec-cloudflare-worker-bouncer-widget"
-	TurnstileConfigKey        = "TURNSTILE_CONFIG"
-	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
-	VarNameForBanTemplate     = "BAN_TEMPLATE"
-	IpRangeKeyName            = "IP_RANGES"
+	WidgetName            = "crowdsec-cloudflare-worker-bouncer-widget"
+	TurnstileConfigKey    = "TURNSTILE_CONFIG"
+	VarNameForBanTemplate = "BAN_TEMPLATE"
+	IpRangeKeyName        = "IP_RANGES"
 )
 
 type cloudflareAPI interface {
@@ -80,13 +77,14 @@ type CloudflareAccountManager struct {
 	KVPairByDecisionValue map[string]cf.WorkersKVPair
 	ipRangeKVPair         cf.WorkersKVPair
 	ActionByIPRange       map[string]string
+	Worker                *cfg.CloudflareWorkerCreateParams
 }
 
 // This function creates a new instance of the CloudflareAccountManager struct,
 // which is used to manage Cloudflare resources associated with a specific account.
 // It initializes the struct with the account configuration, Cloudflare API client,
 // and other necessary fields.
-func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig) (*CloudflareAccountManager, error) {
+func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, worker *cfg.CloudflareWorkerCreateParams) (*CloudflareAccountManager, error) {
 	api, err := NewCloudflareAPI(accountCfg)
 	if err != nil {
 		return nil, err
@@ -115,6 +113,7 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig) (*C
 		logger:          log.WithFields(log.Fields{"account": accountCfg.Name}),
 		ipRangeKVPair:   cf.WorkersKVPair{Key: IpRangeKeyName, Value: "{}"},
 		ActionByIPRange: make(map[string]string),
+		Worker:          worker,
 	}, nil
 }
 
@@ -155,11 +154,11 @@ type ActionsForZone struct {
 // and binds it to the worker.
 func (m *CloudflareAccountManager) DeployInfra() error {
 	// Create the worker
-	m.logger.Infof("Creating KVNS %s", KVNsName)
+	m.logger.Infof("Creating KVNS %s", m.Worker.KVNameSpaceName)
 	kvNSResp, err := m.api.CreateWorkersKVNamespace(
 		m.Ctx,
 		cf.AccountIdentifier(m.AccountCfg.ID),
-		cf.CreateWorkersKVNamespaceParams{Title: KVNsName},
+		cf.CreateWorkersKVNamespaceParams{Title: m.Worker.KVNameSpaceName},
 	)
 	if err != nil {
 		return err
@@ -199,19 +198,9 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 		return err
 	}
 
-	m.logger.Infof("Creating worker %s", ScriptName)
+	m.logger.Infof("Creating worker %s", m.Worker.ScriptName)
 
-	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateWorkerParams{
-		Script:     workerScript,
-		ScriptName: ScriptName,
-		Bindings: map[string]cf.WorkerBinding{
-			KVNsName: cf.WorkerKvNamespaceBinding{NamespaceID: kvNSResp.Result.ID},
-			VarNameForActionsByDomain: cf.WorkerPlainTextBinding{
-				Text: string(varActionsForZoneByDomain),
-			},
-		},
-		Module: true,
-	})
+	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.Worker.CreateWorkerParams(workerScript, kvNSResp.Result.ID, varActionsForZoneByDomain))
 	m.logger.Tracef("Worker: %+v", worker)
 
 	if err != nil {
@@ -295,7 +284,7 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 		zoneLogger.Debugf("Done listing worker routes")
 
 		for _, route := range routeResp.Routes {
-			if route.ScriptName == ScriptName {
+			if route.ScriptName == m.Worker.ScriptName {
 				zoneLogger.Debugf("Deleting worker route with ID %s", route.ID)
 				_, err := m.api.DeleteWorkerRoute(m.Ctx, cf.ZoneIdentifier(zone.ID), route.ID)
 				if err != nil {
@@ -315,7 +304,7 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 	m.logger.Debugf("Done listing worker KV Namespaces")
 
 	for _, kvNamespace := range kvNamespaces {
-		if kvNamespace.Title == KVNsName {
+		if kvNamespace.Title == m.Worker.KVNameSpaceName {
 			m.logger.Debugf("Deleting worker KV Namespace with ID %s", kvNamespace.ID)
 			_, err := m.api.DeleteWorkersKVNamespace(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), kvNamespace.ID)
 			if err != nil {
@@ -325,17 +314,17 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 		}
 	}
 
-	m.logger.Debugf("Attempting to delete worker script %s", ScriptName)
+	m.logger.Debugf("Attempting to delete worker script %s", m.Worker.ScriptName)
 	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
-		ScriptName: ScriptName,
+		ScriptName: m.Worker.ScriptName,
 	})
 	if err != nil {
 		if !strings.Contains(err.Error(), "workers.api.error.script_not_found") {
 			return err
 		}
-		m.logger.Debugf("Didn't find worker script %s", ScriptName)
+		m.logger.Debugf("Didn't find worker script %s", m.Worker.ScriptName)
 	} else {
-		m.logger.Debugf("Deleted worker script %s", ScriptName)
+		m.logger.Debugf("Deleted worker script %s", m.Worker.ScriptName)
 	}
 	m.logger.Info("Done cleaning up existing workers")
 	return nil

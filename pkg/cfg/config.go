@@ -14,6 +14,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var (
+	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
+	EmptyConfigError          = fmt.Errorf("empty config")
+)
+
 type TurnstileConfig struct {
 	Enabled              bool          `yaml:"enabled"`
 	RotateSecretKey      bool          `yaml:"rotate_secret_key"`
@@ -33,15 +38,54 @@ type ZoneConfig struct {
 }
 
 type AccountConfig struct {
-	ID          string       `yaml:"id"`
-	BanTemplate string       `yaml:"ban_template"`
-	ZoneConfigs []ZoneConfig `yaml:"zones"`
-	Token       string       `yaml:"token"`
-	Name        string       `yaml:"account_name"`
+	ID          string        `yaml:"id"`
+	BanTemplate string        `yaml:"ban_template"`
+	ZoneConfigs []*ZoneConfig `yaml:"zones"`
+	Token       string        `yaml:"token"`
+	Name        string        `yaml:"account_name"`
+}
+
+// YAML struct derived from cloudflare.CreateWorkerParams
+// https://github.com/cloudflare/cloudflare-go/blob/056b65c6e956a7119d0d89b27a659ea63b1c0506/workers.go#L24
+type CloudflareWorkerCreateParams struct {
+	ScriptName         string   `yaml:"script_name"`
+	Logpush            *bool    `yaml:"logpush"`
+	Tags               []string `yaml:"tags"`
+	CompatibilityDate  string   `yaml:"compatibility_date"`
+	CompatibilityFlags []string `yaml:"compatibility_flags"`
+	KVNameSpaceName    string   `yaml:"-"` // Currently hardcoded string in worker code but may allow customization in future
+}
+
+func (w *CloudflareWorkerCreateParams) setDefaults() {
+	if w.ScriptName == "" {
+		w.ScriptName = "crowdsec-cloudflare-worker-bouncer"
+	}
+	if w.KVNameSpaceName == "" {
+		w.KVNameSpaceName = "CROWDSECCFBOUNCERNS"
+	}
+}
+
+func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, ID string, varActionsForZoneByDomain []byte) cloudflare.CreateWorkerParams {
+	return cloudflare.CreateWorkerParams{
+		Script:     workerScript,
+		ScriptName: w.ScriptName,
+		Bindings: map[string]cloudflare.WorkerBinding{
+			w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
+			VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
+				Text: string(varActionsForZoneByDomain),
+			},
+		},
+		Module:             true,
+		Logpush:            w.Logpush,
+		Tags:               w.Tags,
+		CompatibilityDate:  w.CompatibilityDate,
+		CompatibilityFlags: w.CompatibilityFlags,
+	}
 }
 
 type CloudflareConfig struct {
-	Accounts []AccountConfig `yaml:"accounts"`
+	Worker   CloudflareWorkerCreateParams `yaml:"worker"`
+	Accounts []AccountConfig              `yaml:"accounts"`
 }
 
 type CrowdSecConfig struct {
@@ -90,6 +134,10 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 
 	configBuff := csstring.StrictExpand(string(content), os.LookupEnv)
 
+	if len(configBuff) == 0 {
+		return nil, EmptyConfigError
+	}
+
 	err = yaml.Unmarshal([]byte(configBuff), &config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal: %w", err)
@@ -135,6 +183,7 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 			zoneIDSet[zone.ID] = true
 		}
 	}
+	config.CloudflareConfig.Worker.setDefaults() // set defaults for worker
 	return config, nil
 }
 
@@ -218,7 +267,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 				accountConfigs = append(accountConfigs, AccountConfig{
 					ID:          account.ID,
 					Name:        strings.Replace(account.Name, "'s Account", "", -1),
-					ZoneConfigs: make([]ZoneConfig, 0),
+					ZoneConfigs: make([]*ZoneConfig, 0),
 					Token:       token,
 					BanTemplate: "",
 				})
@@ -230,7 +279,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 		for _, zone := range zones {
 			zoneByID[zone.ID] = zone
 			accountIDX := accountIDXByID[zone.Account.ID]
-			accountConfigs[accountIDX].ZoneConfigs = append(accountConfigs[accountIDX].ZoneConfigs, ZoneConfig{
+			accountConfigs[accountIDX].ZoneConfigs = append(accountConfigs[accountIDX].ZoneConfigs, &ZoneConfig{
 				ID:            zone.ID,
 				Actions:       []string{"captcha"},
 				DefaultAction: "captcha",
