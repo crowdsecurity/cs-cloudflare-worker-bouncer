@@ -2,5 +2,8 @@
 # "make release" target, which uses git to retrieve the build version and tag.
 #.git
 
-/tests
-/crowdsec-v*
+crowdsec-cloudflare-worker-bouncer
+crowdsec-cloudflare-worker-bouncer-*
+crowdsec-cloudflare-worker-bouncer.tgz
+docs
+debian
