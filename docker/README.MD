@@ -42,7 +42,6 @@ crowdsec_config:
 
 #Cloudflare Config. 
 cloudflare_config:
-cloudflare_config:
     accounts:
         - id: 
           ban_template: "" # template to use for ban action, set empty to use default
