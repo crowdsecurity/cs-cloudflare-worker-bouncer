@@ -31,7 +31,7 @@ func runInfraTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 	if err != nil {
 		return err
 	}
-	_, err = api.GetWorker(m.Ctx, cloudflare.AccountIdentifier(m.AccountCfg.ID), cf.ScriptName)
+	_, err = api.GetWorker(m.Ctx, cloudflare.AccountIdentifier(m.AccountCfg.ID), m.Worker.ScriptName)
 	if err != nil {
 		return err
 	}
@@ -43,7 +43,7 @@ func runInfraTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 		}
 		foundRoute := false
 		for _, route := range routeResp.Routes {
-			if route.ScriptName == cf.ScriptName {
+			if route.ScriptName == m.Worker.ScriptName {
 				foundRoute = true
 			}
 		}
@@ -59,7 +59,7 @@ func runInfraTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 
 	foundKVNamespace := false
 	for _, kvNamespace := range kvNamespaces {
-		if kvNamespace.Title != cf.KVNsName {
+		if kvNamespace.Title != m.Worker.KVNameSpaceName {
 			continue
 		}
 		foundKVNamespace = true
@@ -128,7 +128,7 @@ func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 		return err
 	}
 	err = api.DeleteWorker(m.Ctx, cloudflare.AccountIdentifier(m.AccountCfg.ID), cloudflare.DeleteWorkerParams{
-		ScriptName: cf.ScriptName,
+		ScriptName: m.Worker.ScriptName,
 	})
 	if err == nil || !strings.Contains(err.Error(), "workers.api.error.script_not_found") {
 		return fmt.Errorf("worker should not exist")
@@ -150,7 +150,7 @@ func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 			return err
 		}
 		for _, route := range routeResp.Routes {
-			if route.ScriptName == cf.ScriptName {
+			if route.ScriptName == m.Worker.ScriptName {
 				return fmt.Errorf("route should not exist")
 			}
 		}
@@ -162,7 +162,7 @@ func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 	}
 
 	for _, kvNamespace := range kvNamespaces {
-		if kvNamespace.Title == cf.KVNsName {
+		if kvNamespace.Title == m.Worker.KVNameSpaceName {
 			return fmt.Errorf("kv namespace should not exist")
 		}
 	}
@@ -318,7 +318,7 @@ func TestBouncer(t *testing.T) {
 	}
 
 	// test setup
-	managers, err := CloudflareManagersFromConfig(context.Background(), cfg.CloudflareConfig.Accounts)
+	managers, err := CloudflareManagersFromConfig(context.Background(), cfg.CloudflareConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
