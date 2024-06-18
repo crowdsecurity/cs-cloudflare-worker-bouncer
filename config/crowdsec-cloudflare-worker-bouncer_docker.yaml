@@ -31,13 +31,7 @@ cloudflare_config:
           default_action: managed_challenge
           total_ip_list_capacity: 5000 # only this many latest IP decisions would be kept          
 
-log_mode: file
-log_dir: /var/log/ 
-log_level: info # valid choices are either debug, info, error 
-log_max_size: 40
-log_max_files: 3
-log_max_age: 30
-compress_logs: true
+log_mode: stdout
 
 prometheus:
     enabled: false
