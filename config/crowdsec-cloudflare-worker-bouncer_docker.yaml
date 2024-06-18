@@ -32,6 +32,7 @@ cloudflare_config:
           total_ip_list_capacity: 5000 # only this many latest IP decisions would be kept          
 
 log_mode: stdout
+log_level: info
 
 prometheus:
     enabled: false
