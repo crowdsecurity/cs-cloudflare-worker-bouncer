@@ -334,7 +334,7 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 	keysToDelete := make([]string, 0)
 	newKVPairByValue := make(map[string]cf.WorkersKVPair)
 	for _, kvPair := range m.KVPairByDecisionValue {
-		newKVPairByValue[kvPair.Value] = kvPair
+		newKVPairByValue[kvPair.Key] = kvPair
 	}
 
 	for _, decision := range decisions {
@@ -345,7 +345,7 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 		if val, ok := m.KVPairByDecisionValue[*decision.Value]; ok {
 			if *decision.Type == val.Value {
 				keysToDelete = append(keysToDelete, val.Key)
-				delete(newKVPairByValue, val.Value)
+				delete(newKVPairByValue, val.Key)
 			}
 		}
 	}
@@ -414,7 +414,7 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 
 	//copy existing kv pairs
 	for _, kvPair := range m.KVPairByDecisionValue {
-		newKVPairByValue[kvPair.Value] = kvPair
+		newKVPairByValue[kvPair.Key] = kvPair
 	}
 
 	for _, decision := range decisions {
