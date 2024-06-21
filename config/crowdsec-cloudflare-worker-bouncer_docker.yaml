@@ -1,0 +1,40 @@
+crowdsec_config:
+  lapi_url: ${CROWDSEC_LAPI_URL}
+  lapi_key: ${API_KEY}
+  update_frequency: 10s
+  include_scenarios_containing: []
+  exclude_scenarios_containing: []
+  only_include_decisions_from: [] # "cscli", "crowdsec" if you want decisions from the local API only.
+                                  # This will include CAPI decisions, which has 10k+ IPs, and hence might hit API limit for a free account.
+                                  # For more information on this, visit - https://docs.crowdsec.net/u/bouncers/cloudflare-workers/#appendix-test-with-cloudflare-free-plan
+  key_path: ""  # Used for TLS authentification with CrowdSec LAPI
+  cert_path: "" # Used for TLS authentification with CrowdSec LAPI
+  ca_cert_path: "" # Used for TLS authentification with CrowdSec LAPI
+
+cloudflare_config:
+    accounts:    
+        - id:  #user@example.com's Account
+          zones: #
+            - zone_id:  #example.com
+              actions:
+                - captcha
+              default_action: captcha # Supported Actions [captcha, ban, none]
+              routes_to_protect: []
+              turnstile:
+                enabled: true
+                rotate_secret_key: true
+                rotate_secret_key_every: 168h0m0s 
+                mode: managed # Supported Modes "managed"|"invisible"|"non-interactive"                
+          token: 
+          account_name: x@x.com
+          ip_list_prefix: crowdsec
+          default_action: managed_challenge
+          total_ip_list_capacity: 5000 # only this many latest IP decisions would be kept          
+
+log_mode: stdout
+log_level: info
+
+prometheus:
+    enabled: false
+    listen_addr: 0.0.0.0
+    listen_port: "2112"
