@@ -249,10 +249,16 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 				manager := m
 				mg.Go(func() error {
 					if err := manager.ProcessDeletedDecisions(streamDecision.Deleted); err != nil {
-						return fmt.Errorf("account %s, unable to process deleted decisions: %w", manager.AccountCfg.Name, err)
+						log.Errorf("account %s, unable to process deleted decisions: %s", manager.AccountCfg.Name, err)
+						log.Error("The internal cache of the bouncer is now likely out of sync, and likely needs a restart")
+						log.Error("If this error persists, please open an issue on https://github.com/crowdsecurity/cs-cloudflare-worker-bouncer/issues")
+						return nil
 					}
 					if err := manager.ProcessNewDecisions(streamDecision.New); err != nil {
-						return fmt.Errorf("account %s, unable to process new decisions: %w", manager.AccountCfg.Name, err)
+						log.Errorf("account %s, unable to process new decisions: %s", manager.AccountCfg.Name, err)
+						log.Error("The internal cache of the bouncer is now likely out of sync, and likely needs a restart")
+						log.Error("If this error persists, please open an issue on https://github.com/crowdsecurity/cs-cloudflare-worker-bouncer/issues")
+						return nil
 					}
 					return nil
 				})
