@@ -11,6 +11,7 @@ import (
 	"github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/go-cs-lib/csstring"
 	"github.com/crowdsecurity/go-cs-lib/yamlpatch"
+	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
@@ -251,15 +252,15 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 	for _, token := range strings.Split(tokens, ",") {
 		api, err := cloudflare.NewWithAPIToken(token)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to create cloudflare api client: %w", err)
 		}
 		accounts, _, err := api.Accounts(ctx, cloudflare.AccountsListParams{})
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to list accounts: %w", err)
 		}
 		zones, err := api.ListZones(ctx)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to list zones: %w", err)
 		}
 		for _, account := range accounts {
 			accountByID[account.ID] = account
@@ -277,6 +278,25 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 		}
 
 		for _, zone := range zones {
+			has_a_record := false
+			records, _, err := api.ListDNSRecords(ctx, cloudflare.ZoneIdentifier(zone.ID), cloudflare.ListDNSRecordsParams{})
+
+			if err != nil {
+				return "", fmt.Errorf("failed to list dns records for zone %s: %w (make sure your token has read permissions the Zone/DNS item)", zone.Name, err)
+			}
+
+			for _, record := range records {
+				if record.Type == "A" || record.Type == "AAAA" {
+					has_a_record = true
+					break
+				}
+			}
+
+			if !has_a_record {
+				log.Infof("Skipping zone %s as it does not have any A or AAAA records", zone.Name)
+				continue
+			}
+
 			zoneByID[zone.ID] = zone
 			accountIDX := accountIDXByID[zone.Account.ID]
 			accountConfigs[accountIDX].ZoneConfigs = append(accountConfigs[accountIDX].ZoneConfigs, &ZoneConfig{
@@ -297,7 +317,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 	baseConfig.CloudflareConfig = cfConfig
 	data, err := yaml.Marshal(baseConfig)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to marshal config: %w", err)
 	}
 
 	lineString := string(data)
