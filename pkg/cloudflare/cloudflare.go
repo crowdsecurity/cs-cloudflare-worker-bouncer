@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/cloudflare-go"
 	cf "github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	"github.com/prometheus/client_golang/prometheus"
@@ -319,7 +321,9 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 		ScriptName: m.Worker.ScriptName,
 	})
 	if err != nil {
-		if !strings.Contains(err.Error(), "workers.api.error.script_not_found") {
+		m.logger.Debugf("Received error while deleting worker script %s: %s (type: %s)", m.Worker.ScriptName, err, fmt.Sprintf("%T", err))
+		var notFoundErr *cloudflare.NotFoundError
+		if !errors.As(err, &notFoundErr) {
 			return err
 		}
 		m.logger.Debugf("Didn't find worker script %s", m.Worker.ScriptName)
