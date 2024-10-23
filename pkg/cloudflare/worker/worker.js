@@ -70,12 +70,8 @@ export default {
     const doBan = async () => {
       return new Response(await env.CROWDSECCFBOUNCERNS.get("BAN_TEMPLATE"), {
         status: 403,
-        headers: {"Content-Type": "text/html"}
+        headers: { "Content-Type": "text/html" }
       });
-    }
-
-    const doNothing = () => {
-      return fetch(request)
     }
 
     const doCaptcha = async (env, zoneForThisRequest) => {
@@ -107,7 +103,7 @@ export default {
         console.log("captchaAuth cookie is present")
         // Check if the JWT token is valid
         try {
-          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"]+ip);
+          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"] + ip);
           return fetch(request)
         } catch (err) {
           console.log(err)
@@ -229,6 +225,24 @@ export default {
       return null
     }
 
+    const incrementMetrics = async (metricName, origin, remediation_type) => {
+      if (env.CROWDSECCFBOUNCERDB !== undefined) {
+        let parameters = [metricName, origin || "", remediation_type || ""]
+        let query = `
+          INSERT INTO metrics (val, metric_name, origin, remediation_type)
+          VALUES (1, ?, ?, ?)
+          ON CONFLICT(metric_name, origin, remediation_type) DO UPDATE SET val=val+1
+        `;
+
+        await env.CROWDSECCFBOUNCERDB
+          .prepare(query)
+          .bind(...parameters)
+          .run();
+
+      };
+    }
+
+    await incrementMetrics("processed")
 
 
     let remediation = await getRemediationForRequest(request, env)
@@ -243,12 +257,15 @@ export default {
     console.log("Zone for this request is " + zoneForThisRequest)
     remediation = getSupportedActionForZone(remediation, env.ACTIONS_BY_DOMAIN[zoneForThisRequest])
     console.log("Remediation for request is " + remediation)
-    if (remediation === "ban") {
-      return await doBan()
-    } else if (remediation === "captcha") {
-      return doCaptcha(env, zoneForThisRequest)
-    } else {
-      return doNothing()
+    switch (remediation) {
+      case "ban":
+        await incrementMetrics("dropped", "crowdsec", "ban")
+        return env.LOG_ONLY === "true" ? fetch(request) : await doBan()
+      case "captcha":
+        await incrementMetrics("dropped", "crowdsec", "captcha")
+        return env.LOG_ONLY === "true" ? fetch(request) : await doCaptcha(env, zoneForThisRequest)
+      default:
+        return fetch(request)
     }
   }
 }

@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudflare/cloudflare-go"
 	cf "github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	"github.com/prometheus/client_golang/prometheus"
@@ -41,11 +40,15 @@ var TotalKeysByAccount = prometheus.NewGaugeVec(
 //go:embed worker/dist/main.js
 var workerScript string
 
+//go:embed metrics.sql
+var sqlCreateTableStatement string
+
 const (
 	WidgetName            = "crowdsec-cloudflare-worker-bouncer-widget"
 	TurnstileConfigKey    = "TURNSTILE_CONFIG"
 	VarNameForBanTemplate = "BAN_TEMPLATE"
 	IpRangeKeyName        = "IP_RANGES"
+	MetricsRoute          = "crowdsec-cloudflare-worker-bouncer-metrics"
 )
 
 type cloudflareAPI interface {
@@ -67,6 +70,10 @@ type cloudflareAPI interface {
 	SetWorkersSecret(ctx context.Context, rc *cf.ResourceContainer, params cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error)
 	UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
 	WriteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.WriteWorkersKVEntriesParams) (cf.Response, error)
+	CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error)
+	DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error
+	ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
+	QueryD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error)
 }
 
 type CloudflareAccountManager struct {
@@ -76,6 +83,7 @@ type CloudflareAccountManager struct {
 	logger                *log.Entry
 	hasIPRangeKV          bool
 	NamespaceID           string
+	DatabaseID            string
 	KVPairByDecisionValue map[string]cf.WorkersKVPair
 	ipRangeKVPair         cf.WorkersKVPair
 	ActionByIPRange       map[string]string
@@ -168,6 +176,28 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	m.logger.Tracef("KVNS: %+v", kvNSResp)
 	m.NamespaceID = kvNSResp.Result.ID
 
+	//Create the database
+	m.logger.Info("Creating D1 Database for metrics")
+
+	databaseResp, err := m.api.CreateD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateD1DatabaseParams{
+		Name: m.Worker.D1DBName,
+	})
+
+	if err != nil {
+		return fmt.Errorf("error while creating D1 DB, make sure your token has the proper permissions: %w", err)
+	}
+
+	m.DatabaseID = databaseResp.UUID
+
+	_, err = m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
+		DatabaseID: m.DatabaseID,
+		SQL:        sqlCreateTableStatement,
+	})
+
+	if err != nil {
+		return fmt.Errorf("error while creating D1 DB table, make sure your token has the proper permissions: %w", err)
+	}
+
 	var banTemplate []byte
 	if m.AccountCfg.BanTemplate != "" {
 		banTemplate, err = os.ReadFile(m.AccountCfg.BanTemplate)
@@ -186,7 +216,7 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 		}},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("error while writing ban template to KV: %w", err)
 	}
 	actionsForZoneByDomain := make(map[string]ActionsForZone)
 	for _, z := range m.AccountCfg.ZoneConfigs {
@@ -202,7 +232,7 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 
 	m.logger.Infof("Creating worker %s", m.Worker.ScriptName)
 
-	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.Worker.CreateWorkerParams(workerScript, kvNSResp.Result.ID, varActionsForZoneByDomain))
+	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.Worker.CreateWorkerParams(workerScript, kvNSResp.Result.ID, varActionsForZoneByDomain, m.DatabaseID))
 	m.logger.Tracef("Worker: %+v", worker)
 
 	if err != nil {
@@ -316,13 +346,34 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 		}
 	}
 
+	m.logger.Debugf("Listing D1 DBs")
+	dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
+
+	if err != nil {
+		return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
+	}
+
+	m.logger.Tracef("dbs: %+v", dbs)
+
+	for _, db := range dbs {
+		m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
+		if db.Name == m.Worker.D1DBName {
+			m.logger.Debugf("Deleting D1 DB %s", db.UUID)
+			err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
+			if err != nil {
+				return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
+			}
+			m.logger.Debugf("Deleted D1 DB %s", db.UUID)
+		}
+	}
+
 	m.logger.Debugf("Attempting to delete worker script %s", m.Worker.ScriptName)
 	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
 		ScriptName: m.Worker.ScriptName,
 	})
 	if err != nil {
 		m.logger.Debugf("Received error while deleting worker script %s: %s (type: %s)", m.Worker.ScriptName, err, fmt.Sprintf("%T", err))
-		var notFoundErr *cloudflare.NotFoundError
+		var notFoundErr *cf.NotFoundError
 		if !errors.As(err, &notFoundErr) {
 			return err
 		}
@@ -330,6 +381,21 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 	} else {
 		m.logger.Debugf("Deleted worker script %s", m.Worker.ScriptName)
 	}
+
+	/*m.logger.Debugf("Attempting to delete D1 DB %s", m.DatabaseID)
+
+	err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.DatabaseID)
+	if err != nil {
+		m.logger.Debugf("Received error while deleting D1 DB %s: %s (type: %s)", m.DatabaseID, err, fmt.Sprintf("%T", err))
+		var notFoundErr *cf.NotFoundError
+		if !errors.As(err, &notFoundErr) {
+			return err
+		}
+		m.logger.Debugf("Didn't find D1 DB %s", m.DatabaseID)
+	} else {
+		m.logger.Debugf("Deleted D1 DB %s", m.DatabaseID)
+	}*/
+
 	m.logger.Info("Done cleaning up existing workers")
 	return nil
 }

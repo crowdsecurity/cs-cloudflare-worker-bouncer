@@ -1,6 +1,6 @@
 /******/ var __webpack_modules__ = ({
 
-/***/ 977:
+/***/ 53:
 /***/ ((__unused_webpack_module, exports) => {
 
 var __webpack_unused_export__;
@@ -175,7 +175,7 @@ function decode(token) {
     };
 }
 __webpack_unused_export__ = decode;
-exports.ZP = {
+exports.Ay = {
     sign,
     verify,
     decode
@@ -184,11 +184,11 @@ exports.ZP = {
 
 /***/ }),
 
-/***/ 282:
+/***/ 148:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
-/* provided dependency */ var process = __webpack_require__(155);
-/* provided dependency */ var console = __webpack_require__(108);
+/* provided dependency */ var process = __webpack_require__(606);
+/* provided dependency */ var console = __webpack_require__(763);
 // Currently in sync with Node.js lib/assert.js
 // https://github.com/nodejs/node/commit/2a51ae424a513ec9a6aa3466baa0cc1d55dd4f3b
 // Originally from narwhal.js (http://narwhaljs.org)
@@ -216,7 +216,7 @@ function _typeof(obj) { if (typeof Symbol === "function" && typeof Symbol.iterat
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
-var _require = __webpack_require__(136),
+var _require = __webpack_require__(597),
     _require$codes = _require.codes,
     ERR_AMBIGUOUS_ARGUMENT = _require$codes.ERR_AMBIGUOUS_ARGUMENT,
     ERR_INVALID_ARG_TYPE = _require$codes.ERR_INVALID_ARG_TYPE,
@@ -224,17 +224,17 @@ var _require = __webpack_require__(136),
     ERR_INVALID_RETURN_VALUE = _require$codes.ERR_INVALID_RETURN_VALUE,
     ERR_MISSING_ARGS = _require$codes.ERR_MISSING_ARGS;
 
-var AssertionError = __webpack_require__(961);
+var AssertionError = __webpack_require__(918);
 
-var _require2 = __webpack_require__(539),
+var _require2 = __webpack_require__(537),
     inspect = _require2.inspect;
 
-var _require$types = (__webpack_require__(539).types),
+var _require$types = (__webpack_require__(537).types),
     isPromise = _require$types.isPromise,
     isRegExp = _require$types.isRegExp;
 
-var objectAssign = Object.assign ? Object.assign : (__webpack_require__(91).assign);
-var objectIs = Object.is ? Object.is : __webpack_require__(609);
+var objectAssign = Object.assign ? Object.assign : (__webpack_require__(491).assign);
+var objectIs = Object.is ? Object.is : __webpack_require__(653);
 var errorCache = new Map();
 var isDeepEqual;
 var isDeepStrictEqual;
@@ -243,7 +243,7 @@ var findNodeAround;
 var decoder;
 
 function lazyLoadComparison() {
-  var comparison = __webpack_require__(158);
+  var comparison = __webpack_require__(299);
 
   isDeepEqual = comparison.isDeepEqual;
   isDeepStrictEqual = comparison.isDeepStrictEqual;
@@ -823,10 +823,10 @@ assert.strict.strict = assert.strict;
 
 /***/ }),
 
-/***/ 961:
+/***/ 918:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
-/* provided dependency */ var process = __webpack_require__(155);
+/* provided dependency */ var process = __webpack_require__(606);
 // Currently in sync with Node.js lib/internal/assert/assertion_error.js
 // https://github.com/nodejs/node/commit/0817840f775032169ddd70c85ac059f18ffcc81c
 
@@ -861,10 +861,10 @@ function _getPrototypeOf(o) { _getPrototypeOf = Object.setPrototypeOf ? Object.g
 
 function _typeof(obj) { if (typeof Symbol === "function" && typeof Symbol.iterator === "symbol") { _typeof = function _typeof(obj) { return typeof obj; }; } else { _typeof = function _typeof(obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; }; } return _typeof(obj); }
 
-var _require = __webpack_require__(539),
+var _require = __webpack_require__(537),
     inspect = _require.inspect;
 
-var _require2 = __webpack_require__(136),
+var _require2 = __webpack_require__(597),
     ERR_INVALID_ARG_TYPE = _require2.codes.ERR_INVALID_ARG_TYPE; // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/endsWith
 
 
@@ -1331,7 +1331,7 @@ module.exports = AssertionError;
 
 /***/ }),
 
-/***/ 136:
+/***/ 597:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 // Currently in sync with Node.js lib/internal/errors.js
@@ -1450,7 +1450,7 @@ function includes(str, search, start) {
 
 createErrorType('ERR_AMBIGUOUS_ARGUMENT', 'The "%s" argument is ambiguous. %s', TypeError);
 createErrorType('ERR_INVALID_ARG_TYPE', function (name, expected, actual) {
-  if (assert === undefined) assert = __webpack_require__(282);
+  if (assert === undefined) assert = __webpack_require__(148);
   assert(typeof name === 'string', "'name' must be a string"); // determiner: 'must be' or 'must not be'
 
   var determiner;
@@ -1478,7 +1478,7 @@ createErrorType('ERR_INVALID_ARG_TYPE', function (name, expected, actual) {
 }, TypeError);
 createErrorType('ERR_INVALID_ARG_VALUE', function (name, value) {
   var reason = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 'is invalid';
-  if (util === undefined) util = __webpack_require__(539);
+  if (util === undefined) util = __webpack_require__(537);
   var inspected = util.inspect(value);
 
   if (inspected.length > 128) {
@@ -1503,7 +1503,7 @@ createErrorType('ERR_MISSING_ARGS', function () {
     args[_key] = arguments[_key];
   }
 
-  if (assert === undefined) assert = __webpack_require__(282);
+  if (assert === undefined) assert = __webpack_require__(148);
   assert(args.length > 0, 'At least one arg needs to be specified');
   var msg = 'The ';
   var len = args.length;
@@ -1532,7 +1532,7 @@ module.exports.codes = codes;
 
 /***/ }),
 
-/***/ 158:
+/***/ 299:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 // Currently in sync with Node.js lib/internal/util/comparisons.js
@@ -1567,11 +1567,11 @@ var arrayFromMap = function arrayFromMap(map) {
   return array;
 };
 
-var objectIs = Object.is ? Object.is : __webpack_require__(609);
+var objectIs = Object.is ? Object.is : __webpack_require__(653);
 var objectGetOwnPropertySymbols = Object.getOwnPropertySymbols ? Object.getOwnPropertySymbols : function () {
   return [];
 };
-var numberIsNaN = Number.isNaN ? Number.isNaN : __webpack_require__(360);
+var numberIsNaN = Number.isNaN ? Number.isNaN : __webpack_require__(133);
 
 function uncurryThis(f) {
   return f.call.bind(f);
@@ -1581,7 +1581,7 @@ var hasOwnProperty = uncurryThis(Object.prototype.hasOwnProperty);
 var propertyIsEnumerable = uncurryThis(Object.prototype.propertyIsEnumerable);
 var objectToString = uncurryThis(Object.prototype.toString);
 
-var _require$types = (__webpack_require__(539).types),
+var _require$types = (__webpack_require__(537).types),
     isAnyArrayBuffer = _require$types.isAnyArrayBuffer,
     isArrayBufferView = _require$types.isArrayBufferView,
     isDate = _require$types.isDate,
@@ -2226,14 +2226,14 @@ module.exports = {
 
 /***/ }),
 
-/***/ 924:
+/***/ 75:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var GetIntrinsic = __webpack_require__(210);
+var GetIntrinsic = __webpack_require__(453);
 
-var callBind = __webpack_require__(559);
+var callBind = __webpack_require__(487);
 
 var $indexOf = callBind(GetIntrinsic('String.prototype.indexOf'));
 
@@ -2248,13 +2248,13 @@ module.exports = function callBoundIntrinsic(name, allowMissing) {
 
 /***/ }),
 
-/***/ 559:
+/***/ 487:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var bind = __webpack_require__(612);
-var GetIntrinsic = __webpack_require__(210);
+var bind = __webpack_require__(743);
+var GetIntrinsic = __webpack_require__(453);
 
 var $apply = GetIntrinsic('%Function.prototype.apply%');
 var $call = GetIntrinsic('%Function.prototype.call%');
@@ -2302,12 +2302,12 @@ if ($defineProperty) {
 
 /***/ }),
 
-/***/ 108:
+/***/ 763:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 /*global window, global*/
-var util = __webpack_require__(539)
-var assert = __webpack_require__(282)
+var util = __webpack_require__(537)
+var assert = __webpack_require__(148)
 function now() { return new Date().getTime() }
 
 var slice = Array.prototype.slice
@@ -2396,290 +2396,252 @@ function consoleAssert(expression) {
 
 /***/ }),
 
-/***/ 489:
+/***/ 232:
 /***/ ((__unused_webpack_module, exports) => {
 
 var __webpack_unused_export__;
-/*!
- * cookie
- * Copyright(c) 2012-2014 Roman Shtylman
- * Copyright(c) 2015 Douglas Christopher Wilson
- * MIT Licensed
- */
 
-
-
-/**
- * Module exports.
- * @public
- */
-
-exports.Q = parse;
+__webpack_unused_export__ = ({ value: true });
+exports.qg = parse;
 __webpack_unused_export__ = serialize;
-
 /**
- * Module variables.
- * @private
- */
-
-var __toString = Object.prototype.toString
-
-/**
- * RegExp to match field-content in RFC 7230 sec 3.2
+ * RegExp to match cookie-name in RFC 6265 sec 4.1.1
+ * This refers out to the obsoleted definition of token in RFC 2616 sec 2.2
+ * which has been replaced by the token definition in RFC 7230 appendix B.
  *
- * field-content = field-vchar [ 1*( SP / HTAB ) field-vchar ]
- * field-vchar   = VCHAR / obs-text
- * obs-text      = %x80-FF
+ * cookie-name       = token
+ * token             = 1*tchar
+ * tchar             = "!" / "#" / "$" / "%" / "&" / "'" /
+ *                     "*" / "+" / "-" / "." / "^" / "_" /
+ *                     "`" / "|" / "~" / DIGIT / ALPHA
  */
-
-var fieldContentRegExp = /^[\u0009\u0020-\u007e\u0080-\u00ff]+$/;
-
+const cookieNameRegExp = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+/**
+ * RegExp to match cookie-value in RFC 6265 sec 4.1.1
+ *
+ * cookie-value      = *cookie-octet / ( DQUOTE *cookie-octet DQUOTE )
+ * cookie-octet      = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+ *                     ; US-ASCII characters excluding CTLs,
+ *                     ; whitespace DQUOTE, comma, semicolon,
+ *                     ; and backslash
+ */
+const cookieValueRegExp = /^("?)[\u0021\u0023-\u002B\u002D-\u003A\u003C-\u005B\u005D-\u007E]*\1$/;
+/**
+ * RegExp to match domain-value in RFC 6265 sec 4.1.1
+ *
+ * domain-value      = <subdomain>
+ *                     ; defined in [RFC1034], Section 3.5, as
+ *                     ; enhanced by [RFC1123], Section 2.1
+ * <subdomain>       = <label> | <subdomain> "." <label>
+ * <label>           = <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ *                     Labels must be 63 characters or less.
+ *                     'let-dig' not 'letter' in the first char, per RFC1123
+ * <ldh-str>         = <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp>     = <let-dig> | "-"
+ * <let-dig>         = <letter> | <digit>
+ * <letter>          = any one of the 52 alphabetic characters A through Z in
+ *                     upper case and a through z in lower case
+ * <digit>           = any one of the ten digits 0 through 9
+ *
+ * Keep support for leading dot: https://github.com/jshttp/cookie/issues/173
+ *
+ * > (Note that a leading %x2E ("."), if present, is ignored even though that
+ * character is not permitted, but a trailing %x2E ("."), if present, will
+ * cause the user agent to ignore the attribute.)
+ */
+const domainValueRegExp = /^([.]?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/i;
+/**
+ * RegExp to match path-value in RFC 6265 sec 4.1.1
+ *
+ * path-value        = <any CHAR except CTLs or ";">
+ * CHAR              = %x01-7F
+ *                     ; defined in RFC 5234 appendix B.1
+ */
+const pathValueRegExp = /^[\u0020-\u003A\u003D-\u007E]*$/;
+const __toString = Object.prototype.toString;
+const NullObject = /* @__PURE__ */ (() => {
+    const C = function () { };
+    C.prototype = Object.create(null);
+    return C;
+})();
 /**
  * Parse a cookie header.
  *
  * Parse the given cookie header string into an object
  * The object has the various cookies as keys(names) => values
- *
- * @param {string} str
- * @param {object} [options]
- * @return {object}
- * @public
  */
-
 function parse(str, options) {
-  if (typeof str !== 'string') {
-    throw new TypeError('argument str must be a string');
-  }
-
-  var obj = {}
-  var opt = options || {};
-  var dec = opt.decode || decode;
-
-  var index = 0
-  while (index < str.length) {
-    var eqIdx = str.indexOf('=', index)
-
-    // no more cookie pairs
-    if (eqIdx === -1) {
-      break
-    }
-
-    var endIdx = str.indexOf(';', index)
-
-    if (endIdx === -1) {
-      endIdx = str.length
-    } else if (endIdx < eqIdx) {
-      // backtrack on prior semicolon
-      index = str.lastIndexOf(';', eqIdx - 1) + 1
-      continue
-    }
-
-    var key = str.slice(index, eqIdx).trim()
-
-    // only assign once
-    if (undefined === obj[key]) {
-      var val = str.slice(eqIdx + 1, endIdx).trim()
-
-      // quoted values
-      if (val.charCodeAt(0) === 0x22) {
-        val = val.slice(1, -1)
-      }
-
-      obj[key] = tryDecode(val, dec);
-    }
-
-    index = endIdx + 1
-  }
-
-  return obj;
+    const obj = new NullObject();
+    const len = str.length;
+    // RFC 6265 sec 4.1.1, RFC 2616 2.2 defines a cookie name consists of one char minimum, plus '='.
+    if (len < 2)
+        return obj;
+    const dec = options?.decode || decode;
+    let index = 0;
+    do {
+        const eqIdx = str.indexOf("=", index);
+        if (eqIdx === -1)
+            break; // No more cookie pairs.
+        const colonIdx = str.indexOf(";", index);
+        const endIdx = colonIdx === -1 ? len : colonIdx;
+        if (eqIdx > endIdx) {
+            // backtrack on prior semicolon
+            index = str.lastIndexOf(";", eqIdx - 1) + 1;
+            continue;
+        }
+        const keyStartIdx = startIndex(str, index, eqIdx);
+        const keyEndIdx = endIndex(str, eqIdx, keyStartIdx);
+        const key = str.slice(keyStartIdx, keyEndIdx);
+        // only assign once
+        if (obj[key] === undefined) {
+            let valStartIdx = startIndex(str, eqIdx + 1, endIdx);
+            let valEndIdx = endIndex(str, endIdx, valStartIdx);
+            const value = dec(str.slice(valStartIdx, valEndIdx));
+            obj[key] = value;
+        }
+        index = endIdx + 1;
+    } while (index < len);
+    return obj;
 }
-
+function startIndex(str, index, max) {
+    do {
+        const code = str.charCodeAt(index);
+        if (code !== 0x20 /*   */ && code !== 0x09 /* \t */)
+            return index;
+    } while (++index < max);
+    return max;
+}
+function endIndex(str, index, min) {
+    while (index > min) {
+        const code = str.charCodeAt(--index);
+        if (code !== 0x20 /*   */ && code !== 0x09 /* \t */)
+            return index + 1;
+    }
+    return min;
+}
 /**
  * Serialize data into a cookie header.
  *
- * Serialize the a name value pair into a cookie string suitable for
- * http headers. An optional options object specified cookie parameters.
+ * Serialize a name value pair into a cookie string suitable for
+ * http headers. An optional options object specifies cookie parameters.
  *
  * serialize('foo', 'bar', { httpOnly: true })
  *   => "foo=bar; httpOnly"
- *
- * @param {string} name
- * @param {string} val
- * @param {object} [options]
- * @return {string}
- * @public
  */
-
 function serialize(name, val, options) {
-  var opt = options || {};
-  var enc = opt.encode || encode;
-
-  if (typeof enc !== 'function') {
-    throw new TypeError('option encode is invalid');
-  }
-
-  if (!fieldContentRegExp.test(name)) {
-    throw new TypeError('argument name is invalid');
-  }
-
-  var value = enc(val);
-
-  if (value && !fieldContentRegExp.test(value)) {
-    throw new TypeError('argument val is invalid');
-  }
-
-  var str = name + '=' + value;
-
-  if (null != opt.maxAge) {
-    var maxAge = opt.maxAge - 0;
-
-    if (isNaN(maxAge) || !isFinite(maxAge)) {
-      throw new TypeError('option maxAge is invalid')
+    const enc = options?.encode || encodeURIComponent;
+    if (!cookieNameRegExp.test(name)) {
+        throw new TypeError(`argument name is invalid: ${name}`);
     }
-
-    str += '; Max-Age=' + Math.floor(maxAge);
-  }
-
-  if (opt.domain) {
-    if (!fieldContentRegExp.test(opt.domain)) {
-      throw new TypeError('option domain is invalid');
+    const value = enc(val);
+    if (!cookieValueRegExp.test(value)) {
+        throw new TypeError(`argument val is invalid: ${val}`);
     }
-
-    str += '; Domain=' + opt.domain;
-  }
-
-  if (opt.path) {
-    if (!fieldContentRegExp.test(opt.path)) {
-      throw new TypeError('option path is invalid');
+    let str = name + "=" + value;
+    if (!options)
+        return str;
+    if (options.maxAge !== undefined) {
+        if (!Number.isInteger(options.maxAge)) {
+            throw new TypeError(`option maxAge is invalid: ${options.maxAge}`);
+        }
+        str += "; Max-Age=" + options.maxAge;
     }
-
-    str += '; Path=' + opt.path;
-  }
-
-  if (opt.expires) {
-    var expires = opt.expires
-
-    if (!isDate(expires) || isNaN(expires.valueOf())) {
-      throw new TypeError('option expires is invalid');
+    if (options.domain) {
+        if (!domainValueRegExp.test(options.domain)) {
+            throw new TypeError(`option domain is invalid: ${options.domain}`);
+        }
+        str += "; Domain=" + options.domain;
     }
-
-    str += '; Expires=' + expires.toUTCString()
-  }
-
-  if (opt.httpOnly) {
-    str += '; HttpOnly';
-  }
-
-  if (opt.secure) {
-    str += '; Secure';
-  }
-
-  if (opt.priority) {
-    var priority = typeof opt.priority === 'string'
-      ? opt.priority.toLowerCase()
-      : opt.priority
-
-    switch (priority) {
-      case 'low':
-        str += '; Priority=Low'
-        break
-      case 'medium':
-        str += '; Priority=Medium'
-        break
-      case 'high':
-        str += '; Priority=High'
-        break
-      default:
-        throw new TypeError('option priority is invalid')
+    if (options.path) {
+        if (!pathValueRegExp.test(options.path)) {
+            throw new TypeError(`option path is invalid: ${options.path}`);
+        }
+        str += "; Path=" + options.path;
     }
-  }
-
-  if (opt.sameSite) {
-    var sameSite = typeof opt.sameSite === 'string'
-      ? opt.sameSite.toLowerCase() : opt.sameSite;
-
-    switch (sameSite) {
-      case true:
-        str += '; SameSite=Strict';
-        break;
-      case 'lax':
-        str += '; SameSite=Lax';
-        break;
-      case 'strict':
-        str += '; SameSite=Strict';
-        break;
-      case 'none':
-        str += '; SameSite=None';
-        break;
-      default:
-        throw new TypeError('option sameSite is invalid');
+    if (options.expires) {
+        if (!isDate(options.expires) ||
+            !Number.isFinite(options.expires.valueOf())) {
+            throw new TypeError(`option expires is invalid: ${options.expires}`);
+        }
+        str += "; Expires=" + options.expires.toUTCString();
     }
-  }
-
-  return str;
+    if (options.httpOnly) {
+        str += "; HttpOnly";
+    }
+    if (options.secure) {
+        str += "; Secure";
+    }
+    if (options.partitioned) {
+        str += "; Partitioned";
+    }
+    if (options.priority) {
+        const priority = typeof options.priority === "string"
+            ? options.priority.toLowerCase()
+            : options.sameSite;
+        switch (priority) {
+            case "low":
+                str += "; Priority=Low";
+                break;
+            case "medium":
+                str += "; Priority=Medium";
+                break;
+            case "high":
+                str += "; Priority=High";
+                break;
+            default:
+                throw new TypeError(`option priority is invalid: ${options.priority}`);
+        }
+    }
+    if (options.sameSite) {
+        const sameSite = typeof options.sameSite === "string"
+            ? options.sameSite.toLowerCase()
+            : options.sameSite;
+        switch (sameSite) {
+            case true:
+            case "strict":
+                str += "; SameSite=Strict";
+                break;
+            case "lax":
+                str += "; SameSite=Lax";
+                break;
+            case "none":
+                str += "; SameSite=None";
+                break;
+            default:
+                throw new TypeError(`option sameSite is invalid: ${options.sameSite}`);
+        }
+    }
+    return str;
 }
-
 /**
  * URL-decode string value. Optimized to skip native call when no %.
- *
- * @param {string} str
- * @returns {string}
  */
-
-function decode (str) {
-  return str.indexOf('%') !== -1
-    ? decodeURIComponent(str)
-    : str
+function decode(str) {
+    if (str.indexOf("%") === -1)
+        return str;
+    try {
+        return decodeURIComponent(str);
+    }
+    catch (e) {
+        return str;
+    }
 }
-
-/**
- * URL-encode value.
- *
- * @param {string} str
- * @returns {string}
- */
-
-function encode (val) {
-  return encodeURIComponent(val)
-}
-
 /**
  * Determine if value is a Date.
- *
- * @param {*} val
- * @private
  */
-
-function isDate (val) {
-  return __toString.call(val) === '[object Date]' ||
-    val instanceof Date
+function isDate(val) {
+    return __toString.call(val) === "[object Date]";
 }
-
-/**
- * Try decoding a string using a decoding function.
- *
- * @param {string} str
- * @param {function} decode
- * @private
- */
-
-function tryDecode(str, decode) {
-  try {
-    return decode(str);
-  } catch (e) {
-    return str;
-  }
-}
-
+//# sourceMappingURL=index.js.map
 
 /***/ }),
 
-/***/ 289:
+/***/ 452:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var keys = __webpack_require__(215);
+var keys = __webpack_require__(189);
 var hasSymbols = typeof Symbol === 'function' && typeof Symbol('foo') === 'symbol';
 
 var toStr = Object.prototype.toString;
@@ -2690,7 +2652,7 @@ var isFunction = function (fn) {
 	return typeof fn === 'function' && toStr.call(fn) === '[object Function]';
 };
 
-var hasPropertyDescriptors = __webpack_require__(44)();
+var hasPropertyDescriptors = __webpack_require__(592)();
 
 var supportsDescriptors = origDefineProperty && hasPropertyDescriptors;
 
@@ -2734,7 +2696,7 @@ module.exports = defineProperties;
 
 /***/ }),
 
-/***/ 91:
+/***/ 491:
 /***/ ((module) => {
 
 /**
@@ -2787,12 +2749,12 @@ module.exports = {
 
 /***/ }),
 
-/***/ 29:
+/***/ 682:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var isCallable = __webpack_require__(320);
+var isCallable = __webpack_require__(600);
 
 var toStr = Object.prototype.toString;
 var hasOwnProperty = Object.prototype.hasOwnProperty;
@@ -2856,7 +2818,7 @@ module.exports = forEach;
 
 /***/ }),
 
-/***/ 648:
+/***/ 353:
 /***/ ((module) => {
 
 
@@ -2915,19 +2877,19 @@ module.exports = function bind(that) {
 
 /***/ }),
 
-/***/ 612:
+/***/ 743:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var implementation = __webpack_require__(648);
+var implementation = __webpack_require__(353);
 
 module.exports = Function.prototype.bind || implementation;
 
 
 /***/ }),
 
-/***/ 210:
+/***/ 453:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
@@ -2974,8 +2936,8 @@ var ThrowTypeError = $gOPD
 	}())
 	: throwTypeError;
 
-var hasSymbols = __webpack_require__(405)();
-var hasProto = __webpack_require__(185)();
+var hasSymbols = __webpack_require__(39)();
+var hasProto = __webpack_require__(24)();
 
 var getProto = Object.getPrototypeOf || (
 	hasProto
@@ -3145,8 +3107,8 @@ var LEGACY_ALIASES = {
 	'%WeakSetPrototype%': ['WeakSet', 'prototype']
 };
 
-var bind = __webpack_require__(612);
-var hasOwn = __webpack_require__(642);
+var bind = __webpack_require__(743);
+var hasOwn = __webpack_require__(30);
 var $concat = bind.call(Function.call, Array.prototype.concat);
 var $spliceApply = bind.call(Function.apply, Array.prototype.splice);
 var $replace = bind.call(Function.call, String.prototype.replace);
@@ -3285,12 +3247,12 @@ module.exports = function GetIntrinsic(name, allowMissing) {
 
 /***/ }),
 
-/***/ 296:
+/***/ 795:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var GetIntrinsic = __webpack_require__(210);
+var GetIntrinsic = __webpack_require__(453);
 
 var $gOPD = GetIntrinsic('%Object.getOwnPropertyDescriptor%', true);
 
@@ -3308,12 +3270,12 @@ module.exports = $gOPD;
 
 /***/ }),
 
-/***/ 44:
+/***/ 592:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var GetIntrinsic = __webpack_require__(210);
+var GetIntrinsic = __webpack_require__(453);
 
 var $defineProperty = GetIntrinsic('%Object.defineProperty%', true);
 
@@ -3348,7 +3310,7 @@ module.exports = hasPropertyDescriptors;
 
 /***/ }),
 
-/***/ 185:
+/***/ 24:
 /***/ ((module) => {
 
 
@@ -3366,13 +3328,13 @@ module.exports = function hasProto() {
 
 /***/ }),
 
-/***/ 405:
+/***/ 39:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
 var origSymbol = typeof Symbol !== 'undefined' && Symbol;
-var hasSymbolSham = __webpack_require__(419);
+var hasSymbolSham = __webpack_require__(333);
 
 module.exports = function hasNativeSymbols() {
 	if (typeof origSymbol !== 'function') { return false; }
@@ -3386,7 +3348,7 @@ module.exports = function hasNativeSymbols() {
 
 /***/ }),
 
-/***/ 419:
+/***/ 333:
 /***/ ((module) => {
 
 
@@ -3435,12 +3397,12 @@ module.exports = function hasSymbols() {
 
 /***/ }),
 
-/***/ 410:
+/***/ 92:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var hasSymbols = __webpack_require__(419);
+var hasSymbols = __webpack_require__(333);
 
 module.exports = function hasToStringTagShams() {
 	return hasSymbols() && !!Symbol.toStringTag;
@@ -3449,19 +3411,19 @@ module.exports = function hasToStringTagShams() {
 
 /***/ }),
 
-/***/ 642:
+/***/ 30:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var bind = __webpack_require__(612);
+var bind = __webpack_require__(743);
 
 module.exports = bind.call(Function.call, Object.prototype.hasOwnProperty);
 
 
 /***/ }),
 
-/***/ 717:
+/***/ 698:
 /***/ ((module) => {
 
 if (typeof Object.create === 'function') {
@@ -3495,7 +3457,7 @@ if (typeof Object.create === 'function') {
 
 /***/ }),
 
-/***/ 512:
+/***/ 640:
 /***/ (function(module) {
 
 (function (root) {
@@ -4502,13 +4464,13 @@ if (typeof Object.create === 'function') {
 
 /***/ }),
 
-/***/ 584:
+/***/ 244:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var hasToStringTag = __webpack_require__(410)();
-var callBound = __webpack_require__(924);
+var hasToStringTag = __webpack_require__(92)();
+var callBound = __webpack_require__(75);
 
 var $toString = callBound('Object.prototype.toString');
 
@@ -4542,7 +4504,7 @@ module.exports = supportsStandardArguments ? isStandardArguments : isLegacyArgum
 
 /***/ }),
 
-/***/ 320:
+/***/ 600:
 /***/ ((module) => {
 
 
@@ -4650,7 +4612,7 @@ module.exports = reflectApply
 
 /***/ }),
 
-/***/ 662:
+/***/ 184:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
@@ -4658,7 +4620,7 @@ module.exports = reflectApply
 var toStr = Object.prototype.toString;
 var fnToStr = Function.prototype.toString;
 var isFnRegex = /^\s*(?:function)?\*/;
-var hasToStringTag = __webpack_require__(410)();
+var hasToStringTag = __webpack_require__(92)();
 var getProto = Object.getPrototypeOf;
 var getGeneratorFunc = function () { // eslint-disable-line consistent-return
 	if (!hasToStringTag) {
@@ -4695,7 +4657,7 @@ module.exports = function isGeneratorFunction(fn) {
 
 /***/ }),
 
-/***/ 611:
+/***/ 3:
 /***/ ((module) => {
 
 
@@ -4709,17 +4671,17 @@ module.exports = function isNaN(value) {
 
 /***/ }),
 
-/***/ 360:
+/***/ 133:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var callBind = __webpack_require__(559);
-var define = __webpack_require__(289);
+var callBind = __webpack_require__(487);
+var define = __webpack_require__(452);
 
-var implementation = __webpack_require__(611);
-var getPolyfill = __webpack_require__(415);
-var shim = __webpack_require__(194);
+var implementation = __webpack_require__(3);
+var getPolyfill = __webpack_require__(642);
+var shim = __webpack_require__(464);
 
 var polyfill = callBind(getPolyfill(), Number);
 
@@ -4736,12 +4698,12 @@ module.exports = polyfill;
 
 /***/ }),
 
-/***/ 415:
+/***/ 642:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var implementation = __webpack_require__(611);
+var implementation = __webpack_require__(3);
 
 module.exports = function getPolyfill() {
 	if (Number.isNaN && Number.isNaN(NaN) && !Number.isNaN('a')) {
@@ -4753,13 +4715,13 @@ module.exports = function getPolyfill() {
 
 /***/ }),
 
-/***/ 194:
+/***/ 464:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var define = __webpack_require__(289);
-var getPolyfill = __webpack_require__(415);
+var define = __webpack_require__(452);
+var getPolyfill = __webpack_require__(642);
 
 /* http://www.ecma-international.org/ecma-262/6.0/#sec-number.isnan */
 
@@ -4776,18 +4738,18 @@ module.exports = function shimNumberIsNaN() {
 
 /***/ }),
 
-/***/ 692:
+/***/ 680:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var forEach = __webpack_require__(29);
-var availableTypedArrays = __webpack_require__(83);
-var callBound = __webpack_require__(924);
+var forEach = __webpack_require__(682);
+var availableTypedArrays = __webpack_require__(209);
+var callBound = __webpack_require__(75);
 
 var $toString = callBound('Object.prototype.toString');
-var hasToStringTag = __webpack_require__(410)();
-var gOPD = __webpack_require__(296);
+var hasToStringTag = __webpack_require__(92)();
+var gOPD = __webpack_require__(795);
 
 var g = typeof globalThis === 'undefined' ? __webpack_require__.g : globalThis;
 var typedArrays = availableTypedArrays();
@@ -4843,7 +4805,7 @@ module.exports = function isTypedArray(value) {
 
 /***/ }),
 
-/***/ 244:
+/***/ 211:
 /***/ ((module) => {
 
 
@@ -4869,17 +4831,17 @@ module.exports = function is(a, b) {
 
 /***/ }),
 
-/***/ 609:
+/***/ 653:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var define = __webpack_require__(289);
-var callBind = __webpack_require__(559);
+var define = __webpack_require__(452);
+var callBind = __webpack_require__(487);
 
-var implementation = __webpack_require__(244);
-var getPolyfill = __webpack_require__(624);
-var shim = __webpack_require__(281);
+var implementation = __webpack_require__(211);
+var getPolyfill = __webpack_require__(394);
+var shim = __webpack_require__(576);
 
 var polyfill = callBind(getPolyfill(), Object);
 
@@ -4894,12 +4856,12 @@ module.exports = polyfill;
 
 /***/ }),
 
-/***/ 624:
+/***/ 394:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var implementation = __webpack_require__(244);
+var implementation = __webpack_require__(211);
 
 module.exports = function getPolyfill() {
 	return typeof Object.is === 'function' ? Object.is : implementation;
@@ -4908,13 +4870,13 @@ module.exports = function getPolyfill() {
 
 /***/ }),
 
-/***/ 281:
+/***/ 576:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var getPolyfill = __webpack_require__(624);
-var define = __webpack_require__(289);
+var getPolyfill = __webpack_require__(394);
+var define = __webpack_require__(452);
 
 module.exports = function shimObjectIs() {
 	var polyfill = getPolyfill();
@@ -4929,7 +4891,7 @@ module.exports = function shimObjectIs() {
 
 /***/ }),
 
-/***/ 987:
+/***/ 875:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
@@ -4939,7 +4901,7 @@ if (!Object.keys) {
 	// modified from https://github.com/es-shims/es5-shim
 	var has = Object.prototype.hasOwnProperty;
 	var toStr = Object.prototype.toString;
-	var isArgs = __webpack_require__(414); // eslint-disable-line global-require
+	var isArgs = __webpack_require__(93); // eslint-disable-line global-require
 	var isEnumerable = Object.prototype.propertyIsEnumerable;
 	var hasDontEnumBug = !isEnumerable.call({ toString: null }, 'toString');
 	var hasProtoEnumBug = isEnumerable.call(function () {}, 'prototype');
@@ -5058,16 +5020,16 @@ module.exports = keysShim;
 
 /***/ }),
 
-/***/ 215:
+/***/ 189:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
 var slice = Array.prototype.slice;
-var isArgs = __webpack_require__(414);
+var isArgs = __webpack_require__(93);
 
 var origKeys = Object.keys;
-var keysShim = origKeys ? function keys(o) { return origKeys(o); } : __webpack_require__(987);
+var keysShim = origKeys ? function keys(o) { return origKeys(o); } : __webpack_require__(875);
 
 var originalKeys = Object.keys;
 
@@ -5097,7 +5059,7 @@ module.exports = keysShim;
 
 /***/ }),
 
-/***/ 414:
+/***/ 93:
 /***/ ((module) => {
 
 
@@ -5121,7 +5083,7 @@ module.exports = function isArguments(value) {
 
 /***/ }),
 
-/***/ 155:
+/***/ 606:
 /***/ ((module) => {
 
 // shim for using process in browser
@@ -5312,7 +5274,7 @@ process.umask = function() { return 0; };
 
 /***/ }),
 
-/***/ 384:
+/***/ 135:
 /***/ ((module) => {
 
 module.exports = function isBuffer(arg) {
@@ -5324,7 +5286,7 @@ module.exports = function isBuffer(arg) {
 
 /***/ }),
 
-/***/ 955:
+/***/ 32:
 /***/ ((__unused_webpack_module, exports, __webpack_require__) => {
 
 // Currently in sync with Node.js lib/internal/util/types.js
@@ -5332,10 +5294,10 @@ module.exports = function isBuffer(arg) {
 
 
 
-var isArgumentsObject = __webpack_require__(584);
-var isGeneratorFunction = __webpack_require__(662);
-var whichTypedArray = __webpack_require__(430);
-var isTypedArray = __webpack_require__(692);
+var isArgumentsObject = __webpack_require__(244);
+var isGeneratorFunction = __webpack_require__(184);
+var whichTypedArray = __webpack_require__(767);
+var isTypedArray = __webpack_require__(680);
 
 function uncurryThis(f) {
   return f.call.bind(f);
@@ -5665,11 +5627,11 @@ exports.isAnyArrayBuffer = isAnyArrayBuffer;
 
 /***/ }),
 
-/***/ 539:
+/***/ 537:
 /***/ ((__unused_webpack_module, exports, __webpack_require__) => {
 
-/* provided dependency */ var process = __webpack_require__(155);
-/* provided dependency */ var console = __webpack_require__(108);
+/* provided dependency */ var process = __webpack_require__(606);
+/* provided dependency */ var console = __webpack_require__(763);
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -6136,7 +6098,7 @@ function reduceToSingleString(output, base, braces) {
 
 // NOTE: These type checking functions intentionally don't use `instanceof`
 // because it is fragile and can be easily faked with `Object.create()`.
-exports.types = __webpack_require__(955);
+exports.types = __webpack_require__(32);
 
 function isArray(ar) {
   return Array.isArray(ar);
@@ -6217,7 +6179,7 @@ function isPrimitive(arg) {
 }
 exports.isPrimitive = isPrimitive;
 
-exports.isBuffer = __webpack_require__(384);
+exports.isBuffer = __webpack_require__(135);
 
 function objectToString(o) {
   return Object.prototype.toString.call(o);
@@ -6261,7 +6223,7 @@ exports.log = function() {
  *     prototype.
  * @param {function} superCtor Constructor function to inherit prototype from.
  */
-exports.inherits = __webpack_require__(717);
+exports.inherits = __webpack_require__(698);
 
 exports._extend = function(origin, add) {
   // Don't do anything if add isn't an object
@@ -6389,18 +6351,18 @@ exports.callbackify = callbackify;
 
 /***/ }),
 
-/***/ 430:
+/***/ 767:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
 
-var forEach = __webpack_require__(29);
-var availableTypedArrays = __webpack_require__(83);
-var callBound = __webpack_require__(924);
-var gOPD = __webpack_require__(296);
+var forEach = __webpack_require__(682);
+var availableTypedArrays = __webpack_require__(209);
+var callBound = __webpack_require__(75);
+var gOPD = __webpack_require__(795);
 
 var $toString = callBound('Object.prototype.toString');
-var hasToStringTag = __webpack_require__(410)();
+var hasToStringTag = __webpack_require__(92)();
 
 var g = typeof globalThis === 'undefined' ? __webpack_require__.g : globalThis;
 var typedArrays = availableTypedArrays();
@@ -6440,7 +6402,7 @@ var tryTypedArrays = function tryAllTypedArrays(value) {
 	return foundName;
 };
 
-var isTypedArray = __webpack_require__(692);
+var isTypedArray = __webpack_require__(680);
 
 module.exports = function whichTypedArray(value) {
 	if (!isTypedArray(value)) { return false; }
@@ -6451,7 +6413,7 @@ module.exports = function whichTypedArray(value) {
 
 /***/ }),
 
-/***/ 83:
+/***/ 209:
 /***/ ((module, __unused_webpack_exports, __webpack_require__) => {
 
 
@@ -6543,15 +6505,13 @@ module.exports = function availableTypedArrays() {
 /******/ 
 /************************************************************************/
 var __webpack_exports__ = {};
-// This entry need to be wrapped in an IIFE because it need to be isolated against other modules in the chunk.
-(() => {
 /* harmony export */ __webpack_require__.d(__webpack_exports__, {
-/* harmony export */   Z: () => (__WEBPACK_DEFAULT_EXPORT__)
+/* harmony export */   A: () => (__WEBPACK_DEFAULT_EXPORT__)
 /* harmony export */ });
-/* harmony import */ var _tsndr_cloudflare_worker_jwt__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(977);
-/* harmony import */ var cookie__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(489);
-/* provided dependency */ var console = __webpack_require__(108);
-const ipaddr = __webpack_require__(512);
+/* harmony import */ var _tsndr_cloudflare_worker_jwt__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(53);
+/* harmony import */ var cookie__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(232);
+/* provided dependency */ var console = __webpack_require__(763);
+const ipaddr = __webpack_require__(640);
 
 
 
@@ -6598,7 +6558,7 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
     });
   } else {
     console.log('Valid captcha solution;', "Issuing JWT token");
-    const jwtToken = await _tsndr_cloudflare_worker_jwt__WEBPACK_IMPORTED_MODULE_0__/* ["default"].sign */ .ZP.sign({
+    const jwtToken = await _tsndr_cloudflare_worker_jwt__WEBPACK_IMPORTED_MODULE_0__/* ["default"].sign */ .Ay.sign({
       data: "captcha solved",
       exp: Math.floor(Date.now() / 1000) + (2 * (60 * 60))
     }, turnstile_secret + ip);
@@ -6623,12 +6583,8 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
     const doBan = async () => {
       return new Response(await env.CROWDSECCFBOUNCERNS.get("BAN_TEMPLATE"), {
         status: 403,
-        headers: {"Content-Type": "text/html"}
+        headers: { "Content-Type": "text/html" }
       });
-    }
-
-    const doNothing = () => {
-      return fetch(request)
     }
 
     const doCaptcha = async (env, zoneForThisRequest) => {
@@ -6655,12 +6611,12 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
       }
       turnstileCfg = turnstileCfg[zoneForThisRequest]
 
-      const cookie = (0,cookie__WEBPACK_IMPORTED_MODULE_1__/* .parse */ .Q)(request.headers.get("Cookie") || "");
+      const cookie = (0,cookie__WEBPACK_IMPORTED_MODULE_1__/* .parse */ .qg)(request.headers.get("Cookie") || "");
       if (cookie[`${zoneForThisRequest}_captcha`] !== undefined) {
         console.log("captchaAuth cookie is present")
         // Check if the JWT token is valid
         try {
-          const decoded = await _tsndr_cloudflare_worker_jwt__WEBPACK_IMPORTED_MODULE_0__/* ["default"].verify */ .ZP.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"]+ip);
+          const decoded = await _tsndr_cloudflare_worker_jwt__WEBPACK_IMPORTED_MODULE_0__/* ["default"].verify */ .Ay.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"] + ip);
           return fetch(request)
         } catch (err) {
           console.log(err)
@@ -6782,6 +6738,24 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
       return null
     }
 
+    const incrementMetrics = async (metricName, origin, remediation_type) => {
+      if (env.CROWDSECCFBOUNCERDB !== undefined) {
+        let parameters = [metricName, origin || "", remediation_type || ""]
+        let query = `
+          INSERT INTO metrics (val, metric_name, origin, remediation_type)
+          VALUES (0, ?, ?, ?)
+          ON CONFLICT(metric_name, origin, remediation_type) DO UPDATE SET val=val+1
+        `;
+
+        await env.CROWDSECCFBOUNCERDB
+          .prepare(query)
+          .bind(...parameters)
+          .run();
+
+      };
+    }
+
+    await incrementMetrics("processed")
 
 
     let remediation = await getRemediationForRequest(request, env)
@@ -6796,16 +6770,17 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
     console.log("Zone for this request is " + zoneForThisRequest)
     remediation = getSupportedActionForZone(remediation, env.ACTIONS_BY_DOMAIN[zoneForThisRequest])
     console.log("Remediation for request is " + remediation)
-    if (remediation === "ban") {
-      return await doBan()
-    } else if (remediation === "captcha") {
-      return doCaptcha(env, zoneForThisRequest)
-    } else {
-      return doNothing()
+    switch (remediation) {
+      case "ban":
+        await incrementMetrics("dropped", "crowdsec", "ban")
+        return env.LOG_ONLY === "true" ? fetch(request) : await doBan()
+      case "captcha":
+        await incrementMetrics("dropped", "crowdsec", "captcha")
+        return env.LOG_ONLY === "true" ? fetch(request) : await doCaptcha(env, zoneForThisRequest)
+      default:
+        return fetch(request)
     }
   }
 });
-})();
-
-var __webpack_exports__default = __webpack_exports__.Z;
+var __webpack_exports__default = __webpack_exports__.A;
 export { __webpack_exports__default as default };

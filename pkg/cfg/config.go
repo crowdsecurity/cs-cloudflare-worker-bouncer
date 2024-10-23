@@ -54,7 +54,9 @@ type CloudflareWorkerCreateParams struct {
 	Tags               []string `yaml:"tags"`
 	CompatibilityDate  string   `yaml:"compatibility_date"`
 	CompatibilityFlags []string `yaml:"compatibility_flags"`
+	LogOnly            bool     `yaml:"log_only"`
 	KVNameSpaceName    string   `yaml:"-"` // Currently hardcoded string in worker code but may allow customization in future
+	D1DBName           string   `yaml:"-"` // Hardcoded, internal implementation detail for metrics support
 }
 
 func (w *CloudflareWorkerCreateParams) setDefaults() {
@@ -64,9 +66,12 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 	if w.KVNameSpaceName == "" {
 		w.KVNameSpaceName = "CROWDSECCFBOUNCERNS"
 	}
+	if w.D1DBName == "" {
+		w.D1DBName = "CROWDSECCFBOUNCERDB"
+	}
 }
 
-func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, ID string, varActionsForZoneByDomain []byte) cloudflare.CreateWorkerParams {
+func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, ID string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
 	return cloudflare.CreateWorkerParams{
 		Script:     workerScript,
 		ScriptName: w.ScriptName,
@@ -74,6 +79,12 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, I
 			w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
 			VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
 				Text: string(varActionsForZoneByDomain),
+			},
+			w.D1DBName: cloudflare.WorkerD1DatabaseBinding{
+				DatabaseID: dbID,
+			},
+			"LOG_ONLY": cloudflare.WorkerPlainTextBinding{
+				Text: fmt.Sprintf("%t", w.LogOnly),
 			},
 		},
 		Module:             true,
