@@ -19,22 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cfg"
-)
-
-var CloudflareAPICallsByAccount = prometheus.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: "cloudflare_api_calls_total",
-		Help: "Number of api calls made to cloudflare by each account",
-	},
-	[]string{"account"},
-)
-
-var TotalKeysByAccount = prometheus.NewGaugeVec(
-	prometheus.GaugeOpts{
-		Name: "cloudflare_keys_total",
-		Help: "Total Worker KV keys by account",
-	},
-	[]string{"account"},
+	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/metrics"
 )
 
 //go:embed worker/dist/main.js
@@ -135,7 +120,7 @@ type CloudflareManagerHTTPTransport struct {
 }
 
 func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	CloudflareAPICallsByAccount.WithLabelValues(cfT.accountName).Inc()
+	metrics.CloudflareAPICallsByAccount.WithLabelValues(cfT.accountName).Inc()
 	return http.DefaultTransport.RoundTrip(req)
 }
 
@@ -278,7 +263,7 @@ func (m *CloudflareAccountManager) updateMetrics() {
 		totalKVPairs += 1
 	}
 	totalKVPairs += len(m.KVPairByDecisionValue)
-	TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
+	metrics.TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
 }
 
 // This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
@@ -662,6 +647,67 @@ func (m *CloudflareAccountManager) HandleTurnstile() error {
 		})
 	}
 	return g.Wait()
+}
+
+func (m *CloudflareAccountManager) UpdateMetrics() error {
+	m.logger.Debug("Getting metrics")
+	resp, err := m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
+		DatabaseID: m.DatabaseID,
+		SQL:        "SELECT * FROM metrics",
+	})
+	if err != nil {
+		return err
+	}
+	m.logger.Tracef("resp: %+v", resp)
+
+	for _, r := range resp {
+		if r.Success == nil || !*r.Success {
+			m.logger.Warnf("Query failed: %+v", r)
+			continue
+		}
+		for _, data := range r.Results {
+			switch data["metric_name"] {
+			case "processed":
+				val, ok := data["val"].(float64)
+				if !ok {
+					m.logger.Warnf("Invalid value for processed metric: %+v", data)
+					continue
+				}
+				ipType, ok := data["ip_type"].(string)
+				if !ok {
+					m.logger.Warnf("Invalid value for ip_type: %+v", data)
+					continue
+				}
+				metrics.TotalProcessedRequests.With(prometheus.Labels{"ip_type": ipType, "account": m.AccountCfg.Name}).Set(val)
+			case "dropped":
+				val, ok := data["val"].(float64)
+				if !ok {
+					m.logger.Warnf("Invalid value for dropped metric: %+v", data)
+					continue
+				}
+				origin, ok := data["origin"].(string)
+				if !ok {
+					m.logger.Warnf("Invalid value for origin: %+v", data)
+					continue
+				}
+				ipType, ok := data["ip_type"].(string)
+				if !ok {
+					m.logger.Warnf("Invalid value for ip_type: %+v", data)
+					continue
+				}
+				remediation, ok := data["remediation_type"].(string)
+				if !ok {
+					m.logger.Warnf("Invalid value for remediation: %+v", data)
+					continue
+				}
+				metrics.TotalBlockedRequests.With(prometheus.Labels{"origin": origin, "remediation": remediation, "ip_type": ipType, "account": m.AccountCfg.Name}).Set(val)
+			default:
+				m.logger.Warnf("Unknown metric: %+v", data)
+			}
+		}
+	}
+
+	return nil
 }
 
 func min(a, b int) int {

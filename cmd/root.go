@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/crowdsecurity/crowdsec/pkg/apiclient"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
@@ -23,12 +24,38 @@ import (
 
 	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cfg"
 	cf "github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
+	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/metrics"
 )
 
 const (
 	DEFAULT_CONFIG_PATH = "/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml"
 	name                = "crowdsec-cloudflare-worker-bouncer"
 )
+
+type metricsHandler struct {
+	cfManagers []*cf.CloudflareAccountManager
+}
+
+func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics, updateInterval time.Duration) {
+	for _, manager := range m.cfManagers {
+		err := manager.UpdateMetrics()
+		if err != nil {
+			log.Errorf("unable to update metrics for account %s: %s", manager.AccountCfg.Name, err)
+		}
+	}
+}
+
+func (m *metricsHandler) computeMetricsHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, manager := range m.cfManagers {
+			err := manager.UpdateMetrics()
+			if err != nil {
+				log.Errorf("unable to update metrics for account %s: %s", manager.AccountCfg.Name, err)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx context.Context) {
 	var g errgroup.Group
@@ -152,7 +179,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		CAPath:   conf.CrowdSecConfig.CAPath,
 	}
 
-	if (testConfig != nil && *testConfig) || (setupOnly == nil || (setupOnly != nil && !*setupOnly)) || (deleteOnly == nil || (deleteOnly != nil && !*deleteOnly)) {
+	if (testConfig != nil && *testConfig) || (setupOnly == nil || !*setupOnly) || (deleteOnly == nil || !*deleteOnly) {
 		if err := csLAPI.Init(); err != nil {
 			return fmt.Errorf("unable to initialize crowdsec bouncer: %w", err)
 		}
@@ -210,6 +237,8 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		})
 	}
 
+	defer cleanUp(cfManagers, cancel, ctx)
+
 	g.Go(func() error {
 		return HandleSignals(ctx)
 	})
@@ -219,14 +248,28 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return fmt.Errorf("crowdsec bouncer stopped")
 	})
 
+	mHandler := metricsHandler{
+		cfManagers: cfManagers,
+	}
+
+	metricsProvider, err := csbouncer.NewMetricsProvider(csLAPI.APIClient, name, mHandler.metricsUpdater, log.StandardLogger())
+	if err != nil {
+		return fmt.Errorf("unable to create metrics provider: %w", err)
+	}
+
+	g.Go(func() error {
+		return metricsProvider.Run(ctx)
+	})
+
+	prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, metrics.CloudflareAPICallsByAccount, metrics.TotalKeysByAccount,
+		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests)
 	if conf.PrometheusConfig.Enabled {
-		prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, cf.CloudflareAPICallsByAccount, cf.TotalKeysByAccount)
 		g.Go(func() error {
-			http.Handle("/metrics", promhttp.Handler())
+			http.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
 			return http.ListenAndServe(net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort), nil)
 		})
 	}
-	defer cleanUp(cfManagers, cancel, ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
