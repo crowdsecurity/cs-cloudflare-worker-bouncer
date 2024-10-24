@@ -16,9 +16,11 @@ import (
 	"github.com/crowdsecurity/crowdsec/pkg/apiclient"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	csbouncer "github.com/crowdsecurity/go-cs-bouncer"
+	"github.com/crowdsecurity/go-cs-lib/ptr"
 	"github.com/crowdsecurity/go-cs-lib/version"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	io_prometheus_client "github.com/prometheus/client_model/go"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
@@ -36,11 +38,102 @@ type metricsHandler struct {
 	cfManagers []*cf.CloudflareAccountManager
 }
 
+func getLabelValue(labels []*io_prometheus_client.LabelPair, key string) string {
+
+	for _, label := range labels {
+		if label.GetName() == key {
+			return label.GetValue()
+		}
+	}
+
+	return ""
+}
+
 func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics, updateInterval time.Duration) {
 	for _, manager := range m.cfManagers {
 		err := manager.UpdateMetrics()
 		if err != nil {
 			log.Errorf("unable to update metrics for account %s: %s", manager.AccountCfg.Name, err)
+		}
+	}
+
+	promMetrics, err := prometheus.DefaultGatherer.Gather()
+
+	if err != nil {
+		log.Errorf("unable to gather prometheus metrics: %s", err)
+		return
+	}
+
+	met.Metrics = append(met.Metrics, &models.DetailedMetrics{
+		Meta: &models.MetricsMeta{
+			UtcNowTimestamp:   ptr.Of(time.Now().Unix()),
+			WindowSizeSeconds: ptr.Of(int64(updateInterval.Seconds())),
+		},
+		Items: make([]*models.MetricsDetailItem, 0),
+	})
+
+	for _, metricFamily := range promMetrics {
+		for _, metric := range metricFamily.GetMetric() {
+			switch metricFamily.GetName() {
+			case metrics.ActiveDecisionsMetricName:
+				//We send the absolute value, as it makes no sense to try to sum them crowdsec side
+				labels := metric.GetLabel()
+				value := metric.GetGauge().GetValue()
+				origin := getLabelValue(labels, "origin")
+				ipType := getLabelValue(labels, "ip_type")
+				account := getLabelValue(labels, "account")
+				remediation := getLabelValue(labels, "remediation")
+				log.Debugf("Sending active decisions for %s %s %s %s| current value: %f", origin, ipType, remediation, account, value)
+				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
+					Name:  ptr.Of("active_decisions"),
+					Value: ptr.Of(value),
+					Labels: map[string]string{
+						"origin":      origin,
+						"ip_type":     ipType,
+						"account":     account,
+						"remediation": remediation,
+					},
+					Unit: ptr.Of("ip"),
+				})
+			case metrics.BlockedRequestMetricName:
+				labels := metric.GetLabel()
+				value := metric.GetGauge().GetValue()
+				origin := getLabelValue(labels, "origin")
+				ipType := getLabelValue(labels, "ip_type")
+				account := getLabelValue(labels, "account")
+				remediation := getLabelValue(labels, "remediation")
+				key := origin + ipType + account + remediation
+				log.Debugf("Sending dropped bytes for %s %s %s %s %f | current value: %f | previous value: %f\n", origin, ipType, remediation, account, value-metrics.LastBlockedRequestValue[key], value, metrics.LastBlockedRequestValue[key])
+				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
+					Name:  ptr.Of("dropped"),
+					Value: ptr.Of(value - metrics.LastBlockedRequestValue[key]),
+					Labels: map[string]string{
+						"origin":      origin,
+						"ip_type":     ipType,
+						"account":     account,
+						"remediation": remediation,
+					},
+					Unit: ptr.Of("request"),
+				})
+				metrics.LastBlockedRequestValue[key] = value
+			case metrics.ProcessedRequestMetricName:
+				labels := metric.GetLabel()
+				value := metric.GetGauge().GetValue()
+				ipType := getLabelValue(labels, "ip_type")
+				account := getLabelValue(labels, "account")
+				key := ipType + account
+				log.Debugf("Sending processed packets for %s %s %f | current value: %f | previous value: %f\n", ipType, account, value-metrics.LastProcessedRequestValue[key], value, metrics.LastProcessedRequestValue[key])
+				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
+					Name:  ptr.Of("processed"),
+					Value: ptr.Of(value - metrics.LastProcessedRequestValue[ipType]),
+					Labels: map[string]string{
+						"ip_type": ipType,
+						"account": account,
+					},
+					Unit: ptr.Of("request"),
+				})
+				metrics.LastProcessedRequestValue[key] = value
+			}
 		}
 	}
 }
