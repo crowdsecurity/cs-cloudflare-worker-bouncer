@@ -3,5 +3,6 @@ CREATE TABLE IF NOT EXISTS metrics (
   metric_name TEXT,
   origin TEXT NOT NULL DEFAULT '',
   remediation_type TEXT NOT NULL DEFAULT '',
-  UNIQUE(metric_name, origin, remediation_type)
+  ip_type TEXT NOT NULL DEFAULT '',
+  UNIQUE(metric_name, origin, remediation_type, ip_type)
 );

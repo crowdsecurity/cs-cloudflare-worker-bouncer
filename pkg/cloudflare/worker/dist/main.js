@@ -6738,13 +6738,13 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
       return null
     }
 
-    const incrementMetrics = async (metricName, origin, remediation_type) => {
+    const incrementMetrics = async (metricName, ipType, origin, remediation_type) => {
       if (env.CROWDSECCFBOUNCERDB !== undefined) {
-        let parameters = [metricName, origin || "", remediation_type || ""]
+        let parameters = [metricName, origin || "", remediation_type || "", ipType]
         let query = `
-          INSERT INTO metrics (val, metric_name, origin, remediation_type)
-          VALUES (0, ?, ?, ?)
-          ON CONFLICT(metric_name, origin, remediation_type) DO UPDATE SET val=val+1
+          INSERT INTO metrics (val, metric_name, origin, remediation_type, ip_type)
+          VALUES (1, ?, ?, ?, ?)
+          ON CONFLICT(metric_name, origin, remediation_type, ip_type) DO UPDATE SET val=val+1
         `;
 
         await env.CROWDSECCFBOUNCERDB
@@ -6755,13 +6755,16 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
       };
     }
 
-    await incrementMetrics("processed")
+    const clientIP = request.headers.get("CF-Connecting-IP");
+    const ipType = ipaddr.parse(clientIP).kind();
+
+    await incrementMetrics("processed", ipType)
 
 
     let remediation = await getRemediationForRequest(request, env)
     if (remediation === null) {
       console.log("No remediation found for request")
-      return doNothing()
+      return fetch(request)
     }
     if (typeof env.ACTIONS_BY_DOMAIN === "string") {
       env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN)
@@ -6772,10 +6775,10 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
     console.log("Remediation for request is " + remediation)
     switch (remediation) {
       case "ban":
-        await incrementMetrics("dropped", "crowdsec", "ban")
+        await incrementMetrics("dropped", ipType, "crowdsec", "ban")
         return env.LOG_ONLY === "true" ? fetch(request) : await doBan()
       case "captcha":
-        await incrementMetrics("dropped", "crowdsec", "captcha")
+        await incrementMetrics("dropped", ipType, "crowdsec", "captcha")
         return env.LOG_ONLY === "true" ? fetch(request) : await doCaptcha(env, zoneForThisRequest)
       default:
         return fetch(request)
