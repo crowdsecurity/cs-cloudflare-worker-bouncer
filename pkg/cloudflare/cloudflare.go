@@ -393,12 +393,32 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 	}
 
 	for _, decision := range decisions {
+		origin := *decision.Origin
+		if origin == "lists" {
+			origin = fmt.Sprintf("%s:%s", *decision.Origin, *decision.Scenario)
+		}
 		if *decision.Scope == "range" {
-			delete(m.ActionByIPRange, *decision.Value)
+			if _, ok := m.ActionByIPRange[*decision.Value]; ok {
+				ipType := "ipv4"
+				if strings.Contains(*decision.Value, ":") {
+					ipType = "ipv6"
+				}
+				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Dec()
+				delete(m.ActionByIPRange, *decision.Value)
+			}
 			continue
 		}
 		if val, ok := m.KVPairByDecisionValue[*decision.Value]; ok {
 			if *decision.Type == val.Value {
+				ipType := "ipv4"
+				if *decision.Scope == "ip" {
+					if strings.Contains(*decision.Value, ":") {
+						ipType = "ipv6"
+					}
+				} else {
+					ipType = "N/A"
+				}
+				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Dec()
 				keysToDelete = append(keysToDelete, val.Key)
 				delete(newKVPairByValue, val.Key)
 			}
@@ -473,28 +493,52 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 	}
 
 	for _, decision := range decisions {
-		if *decision.Scope == "range" {
+		origin := *decision.Origin
+		if origin == "lists" {
+			origin = fmt.Sprintf("%s:%s", *decision.Origin, *decision.Scenario)
+		}
+		switch *decision.Scope {
+		case "range":
+			_, ok := m.ActionByIPRange[*decision.Value]
+			if !ok {
+				ipType := "ipv4"
+				if strings.Contains(*decision.Value, ":") {
+					ipType = "ipv6"
+				}
+				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Inc()
+			}
 			m.ActionByIPRange[*decision.Value] = *decision.Type
 			continue
-		}
-		if val, ok := newKVPairByValue[*decision.Value]; ok {
-			if *decision.Type != val.Value {
-				found := false
-				for idx, kvPair := range keysToWrite {
-					if kvPair.Key == *decision.Value {
-						found = true
-						keysToWrite[idx].Value = *decision.Type
-						break
+		default:
+			if val, ok := newKVPairByValue[*decision.Value]; ok {
+				if *decision.Type != val.Value {
+					found := false
+					for idx, kvPair := range keysToWrite {
+						if kvPair.Key == *decision.Value {
+							found = true
+							keysToWrite[idx].Value = *decision.Type
+							break
+						}
+					}
+					if !found {
+						keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
+						newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
 					}
 				}
-				if !found {
-					keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
-					newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
+			} else {
+				keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
+				newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
+
+				ipType := "ipv4"
+				if *decision.Scope == "ip" {
+					if strings.Contains(*decision.Value, ":") {
+						ipType = "ipv6"
+					}
+				} else {
+					ipType = "N/A"
 				}
+				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Inc()
 			}
-		} else {
-			keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
-			newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
 		}
 	}
 	if len(keysToWrite) == 0 {
