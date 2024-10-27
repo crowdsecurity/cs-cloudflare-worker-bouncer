@@ -73,6 +73,7 @@ type CloudflareAccountManager struct {
 	ipRangeKVPair         cf.WorkersKVPair
 	ActionByIPRange       map[string]string
 	Worker                *cfg.CloudflareWorkerCreateParams
+	hasD1Access           bool
 }
 
 // This function creates a new instance of the CloudflareAccountManager struct,
@@ -168,19 +169,25 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 		Name: m.Worker.D1DBName,
 	})
 
+	//This could probably be a check on a more specific error, but because metrics are not critical, we just log the error and continue
 	if err != nil {
-		return fmt.Errorf("error while creating D1 DB, make sure your token has the proper permissions: %w", err)
+		m.logger.Warnf("Error while creating D1 DB: %s. Remediation component won't be able to send metrics to crowdsec. Make sure your token has the proper permissions.", err)
+		m.hasD1Access = false
+	} else {
+		m.hasD1Access = true
 	}
 
-	m.DatabaseID = databaseResp.UUID
+	if m.hasD1Access {
+		m.DatabaseID = databaseResp.UUID
 
-	_, err = m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
-		DatabaseID: m.DatabaseID,
-		SQL:        sqlCreateTableStatement,
-	})
+		_, err = m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
+			DatabaseID: m.DatabaseID,
+			SQL:        sqlCreateTableStatement,
+		})
 
-	if err != nil {
-		return fmt.Errorf("error while creating D1 DB table, make sure your token has the proper permissions: %w", err)
+		if err != nil {
+			return fmt.Errorf("error while creating D1 DB table, make sure your token has the proper permissions: %w", err)
+		}
 	}
 
 	var banTemplate []byte
@@ -268,7 +275,7 @@ func (m *CloudflareAccountManager) updateMetrics() {
 
 // This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
 // It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
-func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
+func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 	m.logger.Infof("Cleaning up existing workers")
 
 	m.logger.Debug("Listing existing turnstile widgets")
@@ -331,24 +338,29 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 		}
 	}
 
-	m.logger.Debugf("Listing D1 DBs")
-	dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
+	if m.hasD1Access || start {
+		m.logger.Debugf("Listing D1 DBs")
+		dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
 
-	if err != nil {
-		return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
-	}
-
-	m.logger.Tracef("dbs: %+v", dbs)
-
-	for _, db := range dbs {
-		m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
-		if db.Name == m.Worker.D1DBName {
-			m.logger.Debugf("Deleting D1 DB %s", db.UUID)
-			err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
-			if err != nil {
-				return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
+		if err != nil {
+			if !start {
+				return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
 			}
-			m.logger.Debugf("Deleted D1 DB %s", db.UUID)
+			dbs = []cf.D1Database{}
+		}
+
+		m.logger.Tracef("dbs: %+v", dbs)
+
+		for _, db := range dbs {
+			m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
+			if db.Name == m.Worker.D1DBName {
+				m.logger.Debugf("Deleting D1 DB %s", db.UUID)
+				err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
+				if err != nil {
+					return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
+				}
+				m.logger.Debugf("Deleted D1 DB %s", db.UUID)
+			}
 		}
 	}
 
@@ -695,6 +707,10 @@ func (m *CloudflareAccountManager) HandleTurnstile() error {
 
 func (m *CloudflareAccountManager) UpdateMetrics() error {
 	m.logger.Debug("Getting metrics")
+	if !m.hasD1Access {
+		m.logger.Debug("No D1 access, skipping metrics update")
+		return nil
+	}
 	resp, err := m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
 		DatabaseID: m.DatabaseID,
 		SQL:        "SELECT * FROM metrics",

@@ -72,21 +72,25 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 }
 
 func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, ID string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
-	return cloudflare.CreateWorkerParams{
-		Script:     workerScript,
-		ScriptName: w.ScriptName,
-		Bindings: map[string]cloudflare.WorkerBinding{
-			w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
-			VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
-				Text: string(varActionsForZoneByDomain),
-			},
-			w.D1DBName: cloudflare.WorkerD1DatabaseBinding{
-				DatabaseID: dbID,
-			},
-			"LOG_ONLY": cloudflare.WorkerPlainTextBinding{
-				Text: fmt.Sprintf("%t", w.LogOnly),
-			},
+	bindings := map[string]cloudflare.WorkerBinding{
+		w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
+		VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
+			Text: string(varActionsForZoneByDomain),
 		},
+		"LOG_ONLY": cloudflare.WorkerPlainTextBinding{
+			Text: fmt.Sprintf("%t", w.LogOnly),
+		},
+	}
+
+	if dbID != "" {
+		bindings[w.D1DBName] = cloudflare.WorkerD1DatabaseBinding{
+			DatabaseID: dbID,
+		}
+	}
+	return cloudflare.CreateWorkerParams{
+		Script:             workerScript,
+		ScriptName:         w.ScriptName,
+		Bindings:           bindings,
 		Module:             true,
 		Logpush:            w.Logpush,
 		Tags:               w.Tags,

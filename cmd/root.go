@@ -158,7 +158,7 @@ func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx 
 		manager := m
 		manager.Ctx = context.Background()
 		g.Go(func() error {
-			return manager.CleanUpExistingWorkers()
+			return manager.CleanUpExistingWorkers(false)
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -292,7 +292,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	for _, cfManager := range cfManagers {
 		manager := cfManager
 		g.Go(func() error {
-			err := manager.CleanUpExistingWorkers()
+			err := manager.CleanUpExistingWorkers(true)
 			if err != nil {
 				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.Name)
 			}
