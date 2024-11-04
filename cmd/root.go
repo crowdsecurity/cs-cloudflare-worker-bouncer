@@ -125,7 +125,7 @@ func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics
 				log.Debugf("Sending processed packets for %s %s %f | current value: %f | previous value: %f\n", ipType, account, value-metrics.LastProcessedRequestValue[key], value, metrics.LastProcessedRequestValue[key])
 				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
 					Name:  ptr.Of("processed"),
-					Value: ptr.Of(value - metrics.LastProcessedRequestValue[ipType]),
+					Value: ptr.Of(value - metrics.LastProcessedRequestValue[key]),
 					Labels: map[string]string{
 						"ip_type": ipType,
 						"account": account,
