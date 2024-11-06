@@ -33,7 +33,6 @@ const (
 	TurnstileConfigKey    = "TURNSTILE_CONFIG"
 	VarNameForBanTemplate = "BAN_TEMPLATE"
 	IpRangeKeyName        = "IP_RANGES"
-	MetricsRoute          = "crowdsec-cloudflare-worker-bouncer-metrics"
 )
 
 type cloudflareAPI interface {
@@ -378,20 +377,6 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 	} else {
 		m.logger.Debugf("Deleted worker script %s", m.Worker.ScriptName)
 	}
-
-	/*m.logger.Debugf("Attempting to delete D1 DB %s", m.DatabaseID)
-
-	err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.DatabaseID)
-	if err != nil {
-		m.logger.Debugf("Received error while deleting D1 DB %s: %s (type: %s)", m.DatabaseID, err, fmt.Sprintf("%T", err))
-		var notFoundErr *cf.NotFoundError
-		if !errors.As(err, &notFoundErr) {
-			return err
-		}
-		m.logger.Debugf("Didn't find D1 DB %s", m.DatabaseID)
-	} else {
-		m.logger.Debugf("Deleted D1 DB %s", m.DatabaseID)
-	}*/
 
 	m.logger.Info("Done cleaning up existing workers")
 	return nil
