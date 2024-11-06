@@ -1,6 +1,3 @@
-BUILD_REQUIRE_GO_MAJOR ?= 1
-BUILD_REQUIRE_GO_MINOR ?= 20
-
 GO = go
 GOBUILD = $(GO) build
 GOTEST = $(GO) test
@@ -18,8 +15,12 @@ LD_OPTS_VARS=\
 -X 'github.com/crowdsecurity/go-cs-lib/version.BuildDate=$(BUILD_TIMESTAMP)' \
 -X 'github.com/crowdsecurity/go-cs-lib/version.Tag=$(BUILD_TAG)'
 
+ifneq (,$(DOCKER_BUILD))
+LD_OPTS_VARS += -X 'github.com/crowdsecurity/go-cs-lib/version.System=docker'
+endif
+
 export CGO_ENABLED=0
-export LD_OPTS=-ldflags "-a -s -w -extldflags '-static' $(LD_OPTS_VARS)" \
+export LD_OPTS=-ldflags "-s -extldflags '-static' $(LD_OPTS_VARS)" \
 	-trimpath -tags netgo
 
 .PHONY: all
@@ -55,7 +56,7 @@ clean: clean-release-dir clean-debian clean-rpm
 #
 
 .PHONY: binary
-binary: goversion
+binary:
 	$(GOBUILD) $(LD_OPTS) $(BUILD_VENDOR_FLAGS) -o $(BINARY_NAME)
 
 .PHONY: build-worker-js
@@ -68,25 +69,33 @@ build-all: clean build-worker-js binary
 .PHONY: build
 build: clean binary
 
+#
+# Unit and integration tests
+#
 
 .PHONY: lint
 lint:
 	golangci-lint run
 
 .PHONY: end-to-end-test
-end-to-end-test: goversion
+end-to-end-test:
 	@$(GOTEST) $(LD_OPTS) ./cmd/
+
+#
+# Build release tarballs
+#
 
 RELDIR = $(BINARY_NAME)-$(BUILD_VERSION)
 
 .PHONY: vendor
-vendor:
+vendor: vendor-remove
 	$(GO) mod vendor
 	tar czf vendor.tgz vendor
+	tar --create --auto-compress --file=$(RELDIR)-vendor.tar.xz vendor
 
 .PHONY: vendor-remove
 vendor-remove:
-	$(RM) -r vendor vendor.tgz
+	$(RM) -r vendor vendor.tgz *-vendor.tar.xz
 
 # Called during platform-all, to reuse the directory for other platforms
 .PHONY: clean-release-dir
@@ -118,7 +127,5 @@ release: clean tarball
 #
 
 .PHONY: platform-all
-platform-all: goversion clean
+platform-all: clean
 	python3 .github/release.py run-build $(BINARY_NAME)
-
-include mk/goversion.mk
