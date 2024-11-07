@@ -11,24 +11,144 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/crowdsecurity/crowdsec/pkg/apiclient"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	csbouncer "github.com/crowdsecurity/go-cs-bouncer"
+	"github.com/crowdsecurity/go-cs-lib/ptr"
 	"github.com/crowdsecurity/go-cs-lib/version"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	io_prometheus_client "github.com/prometheus/client_model/go"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cfg"
 	cf "github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
+	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/metrics"
 )
 
 const (
 	DEFAULT_CONFIG_PATH = "/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml"
 	name                = "crowdsec-cloudflare-worker-bouncer"
 )
+
+type metricsHandler struct {
+	cfManagers []*cf.CloudflareAccountManager
+}
+
+func getLabelValue(labels []*io_prometheus_client.LabelPair, key string) string {
+
+	for _, label := range labels {
+		if label.GetName() == key {
+			return label.GetValue()
+		}
+	}
+
+	return ""
+}
+
+func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics, updateInterval time.Duration) {
+	for _, manager := range m.cfManagers {
+		err := manager.UpdateMetrics()
+		if err != nil {
+			log.Errorf("unable to update metrics for account %s: %s", manager.AccountCfg.Name, err)
+		}
+	}
+
+	promMetrics, err := prometheus.DefaultGatherer.Gather()
+
+	if err != nil {
+		log.Errorf("unable to gather prometheus metrics: %s", err)
+		return
+	}
+
+	met.Metrics = append(met.Metrics, &models.DetailedMetrics{
+		Meta: &models.MetricsMeta{
+			UtcNowTimestamp:   ptr.Of(time.Now().Unix()),
+			WindowSizeSeconds: ptr.Of(int64(updateInterval.Seconds())),
+		},
+		Items: make([]*models.MetricsDetailItem, 0),
+	})
+
+	for _, metricFamily := range promMetrics {
+		for _, metric := range metricFamily.GetMetric() {
+			switch metricFamily.GetName() {
+			case metrics.ActiveDecisionsMetricName:
+				//We send the absolute value, as it makes no sense to try to sum them crowdsec side
+				labels := metric.GetLabel()
+				value := metric.GetGauge().GetValue()
+				origin := getLabelValue(labels, "origin")
+				ipType := getLabelValue(labels, "ip_type")
+				account := getLabelValue(labels, "account")
+				remediation := getLabelValue(labels, "remediation")
+				log.Debugf("Sending active decisions for %s %s %s %s| current value: %f", origin, ipType, remediation, account, value)
+				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
+					Name:  ptr.Of("active_decisions"),
+					Value: ptr.Of(value),
+					Labels: map[string]string{
+						"origin":      origin,
+						"ip_type":     ipType,
+						"account":     account,
+						"remediation": remediation,
+					},
+					Unit: ptr.Of("ip"),
+				})
+			case metrics.BlockedRequestMetricName:
+				labels := metric.GetLabel()
+				value := metric.GetGauge().GetValue()
+				origin := getLabelValue(labels, "origin")
+				ipType := getLabelValue(labels, "ip_type")
+				account := getLabelValue(labels, "account")
+				remediation := getLabelValue(labels, "remediation")
+				key := origin + ipType + account + remediation
+				log.Debugf("Sending dropped bytes for %s %s %s %s %f | current value: %f | previous value: %f\n", origin, ipType, remediation, account, value-metrics.LastBlockedRequestValue[key], value, metrics.LastBlockedRequestValue[key])
+				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
+					Name:  ptr.Of("dropped"),
+					Value: ptr.Of(value - metrics.LastBlockedRequestValue[key]),
+					Labels: map[string]string{
+						"origin":      origin,
+						"ip_type":     ipType,
+						"account":     account,
+						"remediation": remediation,
+					},
+					Unit: ptr.Of("request"),
+				})
+				metrics.LastBlockedRequestValue[key] = value
+			case metrics.ProcessedRequestMetricName:
+				labels := metric.GetLabel()
+				value := metric.GetGauge().GetValue()
+				ipType := getLabelValue(labels, "ip_type")
+				account := getLabelValue(labels, "account")
+				key := ipType + account
+				log.Debugf("Sending processed packets for %s %s %f | current value: %f | previous value: %f\n", ipType, account, value-metrics.LastProcessedRequestValue[key], value, metrics.LastProcessedRequestValue[key])
+				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
+					Name:  ptr.Of("processed"),
+					Value: ptr.Of(value - metrics.LastProcessedRequestValue[key]),
+					Labels: map[string]string{
+						"ip_type": ipType,
+						"account": account,
+					},
+					Unit: ptr.Of("request"),
+				})
+				metrics.LastProcessedRequestValue[key] = value
+			}
+		}
+	}
+}
+
+func (m *metricsHandler) computeMetricsHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, manager := range m.cfManagers {
+			err := manager.UpdateMetrics()
+			if err != nil {
+				log.Errorf("unable to update metrics for account %s: %s", manager.AccountCfg.Name, err)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx context.Context) {
 	var g errgroup.Group
@@ -38,7 +158,7 @@ func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx 
 		manager := m
 		manager.Ctx = context.Background()
 		g.Go(func() error {
-			return manager.CleanUpExistingWorkers()
+			return manager.CleanUpExistingWorkers(false)
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -152,7 +272,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		CAPath:   conf.CrowdSecConfig.CAPath,
 	}
 
-	if (testConfig != nil && *testConfig) || (setupOnly == nil || (setupOnly != nil && !*setupOnly)) || (deleteOnly == nil || (deleteOnly != nil && !*deleteOnly)) {
+	if (testConfig != nil && *testConfig) || (setupOnly == nil || !*setupOnly) || (deleteOnly == nil || !*deleteOnly) {
 		if err := csLAPI.Init(); err != nil {
 			return fmt.Errorf("unable to initialize crowdsec bouncer: %w", err)
 		}
@@ -172,7 +292,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	for _, cfManager := range cfManagers {
 		manager := cfManager
 		g.Go(func() error {
-			err := manager.CleanUpExistingWorkers()
+			err := manager.CleanUpExistingWorkers(true)
 			if err != nil {
 				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.Name)
 			}
@@ -210,6 +330,8 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		})
 	}
 
+	defer cleanUp(cfManagers, cancel, ctx)
+
 	g.Go(func() error {
 		return HandleSignals(ctx)
 	})
@@ -219,14 +341,28 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return fmt.Errorf("crowdsec bouncer stopped")
 	})
 
+	mHandler := metricsHandler{
+		cfManagers: cfManagers,
+	}
+
+	metricsProvider, err := csbouncer.NewMetricsProvider(csLAPI.APIClient, name, mHandler.metricsUpdater, log.StandardLogger())
+	if err != nil {
+		return fmt.Errorf("unable to create metrics provider: %w", err)
+	}
+
+	g.Go(func() error {
+		return metricsProvider.Run(ctx)
+	})
+
+	prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, metrics.CloudflareAPICallsByAccount, metrics.TotalKeysByAccount,
+		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests)
 	if conf.PrometheusConfig.Enabled {
-		prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, cf.CloudflareAPICallsByAccount, cf.TotalKeysByAccount)
 		g.Go(func() error {
-			http.Handle("/metrics", promhttp.Handler())
+			http.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
 			return http.ListenAndServe(net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort), nil)
 		})
 	}
-	defer cleanUp(cfManagers, cancel, ctx)
+
 	for {
 		select {
 		case <-ctx.Done():

@@ -120,7 +120,7 @@ func runInfraTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 }
 
 func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
-	if err := m.CleanUpExistingWorkers(); err != nil {
+	if err := m.CleanUpExistingWorkers(false); err != nil {
 		return err
 	}
 	api, err := apiFromManager(m)

@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudflare/cloudflare-go"
 	cf "github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,26 +19,14 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cfg"
-)
-
-var CloudflareAPICallsByAccount = prometheus.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: "cloudflare_api_calls_total",
-		Help: "Number of api calls made to cloudflare by each account",
-	},
-	[]string{"account"},
-)
-
-var TotalKeysByAccount = prometheus.NewGaugeVec(
-	prometheus.GaugeOpts{
-		Name: "cloudflare_keys_total",
-		Help: "Total Worker KV keys by account",
-	},
-	[]string{"account"},
+	"github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/metrics"
 )
 
 //go:embed worker/dist/main.js
 var workerScript string
+
+//go:embed metrics.sql
+var sqlCreateTableStatement string
 
 const (
 	WidgetName            = "crowdsec-cloudflare-worker-bouncer-widget"
@@ -67,6 +54,10 @@ type cloudflareAPI interface {
 	SetWorkersSecret(ctx context.Context, rc *cf.ResourceContainer, params cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error)
 	UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
 	WriteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.WriteWorkersKVEntriesParams) (cf.Response, error)
+	CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error)
+	DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error
+	ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
+	QueryD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error)
 }
 
 type CloudflareAccountManager struct {
@@ -76,10 +67,12 @@ type CloudflareAccountManager struct {
 	logger                *log.Entry
 	hasIPRangeKV          bool
 	NamespaceID           string
+	DatabaseID            string
 	KVPairByDecisionValue map[string]cf.WorkersKVPair
 	ipRangeKVPair         cf.WorkersKVPair
 	ActionByIPRange       map[string]string
 	Worker                *cfg.CloudflareWorkerCreateParams
+	hasD1Access           bool
 }
 
 // This function creates a new instance of the CloudflareAccountManager struct,
@@ -127,7 +120,7 @@ type CloudflareManagerHTTPTransport struct {
 }
 
 func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	CloudflareAPICallsByAccount.WithLabelValues(cfT.accountName).Inc()
+	metrics.CloudflareAPICallsByAccount.WithLabelValues(cfT.accountName).Inc()
 	return http.DefaultTransport.RoundTrip(req)
 }
 
@@ -168,6 +161,34 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	m.logger.Tracef("KVNS: %+v", kvNSResp)
 	m.NamespaceID = kvNSResp.Result.ID
 
+	//Create the database
+	m.logger.Info("Creating D1 Database for metrics")
+
+	databaseResp, err := m.api.CreateD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateD1DatabaseParams{
+		Name: m.Worker.D1DBName,
+	})
+
+	//This could probably be a check on a more specific error, but because metrics are not critical, we just log the error and continue
+	if err != nil {
+		m.logger.Warnf("Error while creating D1 DB: %s. Remediation component won't be able to send metrics to crowdsec. Make sure your token has the proper permissions.", err)
+		m.hasD1Access = false
+	} else {
+		m.hasD1Access = true
+	}
+
+	if m.hasD1Access {
+		m.DatabaseID = databaseResp.UUID
+
+		_, err = m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
+			DatabaseID: m.DatabaseID,
+			SQL:        sqlCreateTableStatement,
+		})
+
+		if err != nil {
+			return fmt.Errorf("error while creating D1 DB table, make sure your token has the proper permissions: %w", err)
+		}
+	}
+
 	var banTemplate []byte
 	if m.AccountCfg.BanTemplate != "" {
 		banTemplate, err = os.ReadFile(m.AccountCfg.BanTemplate)
@@ -186,7 +207,7 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 		}},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("error while writing ban template to KV: %w", err)
 	}
 	actionsForZoneByDomain := make(map[string]ActionsForZone)
 	for _, z := range m.AccountCfg.ZoneConfigs {
@@ -202,7 +223,7 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 
 	m.logger.Infof("Creating worker %s", m.Worker.ScriptName)
 
-	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.Worker.CreateWorkerParams(workerScript, kvNSResp.Result.ID, varActionsForZoneByDomain))
+	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.Worker.CreateWorkerParams(workerScript, kvNSResp.Result.ID, varActionsForZoneByDomain, m.DatabaseID))
 	m.logger.Tracef("Worker: %+v", worker)
 
 	if err != nil {
@@ -248,12 +269,12 @@ func (m *CloudflareAccountManager) updateMetrics() {
 		totalKVPairs += 1
 	}
 	totalKVPairs += len(m.KVPairByDecisionValue)
-	TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
+	metrics.TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
 }
 
 // This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
 // It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
-func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
+func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 	m.logger.Infof("Cleaning up existing workers")
 
 	m.logger.Debug("Listing existing turnstile widgets")
@@ -316,13 +337,39 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 		}
 	}
 
+	if m.hasD1Access || start {
+		m.logger.Debugf("Listing D1 DBs")
+		dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
+
+		if err != nil {
+			if !start {
+				return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
+			}
+			dbs = []cf.D1Database{}
+		}
+
+		m.logger.Tracef("dbs: %+v", dbs)
+
+		for _, db := range dbs {
+			m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
+			if db.Name == m.Worker.D1DBName {
+				m.logger.Debugf("Deleting D1 DB %s", db.UUID)
+				err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
+				if err != nil {
+					return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
+				}
+				m.logger.Debugf("Deleted D1 DB %s", db.UUID)
+			}
+		}
+	}
+
 	m.logger.Debugf("Attempting to delete worker script %s", m.Worker.ScriptName)
 	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
 		ScriptName: m.Worker.ScriptName,
 	})
 	if err != nil {
 		m.logger.Debugf("Received error while deleting worker script %s: %s (type: %s)", m.Worker.ScriptName, err, fmt.Sprintf("%T", err))
-		var notFoundErr *cloudflare.NotFoundError
+		var notFoundErr *cf.NotFoundError
 		if !errors.As(err, &notFoundErr) {
 			return err
 		}
@@ -330,6 +377,7 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 	} else {
 		m.logger.Debugf("Deleted worker script %s", m.Worker.ScriptName)
 	}
+
 	m.logger.Info("Done cleaning up existing workers")
 	return nil
 }
@@ -342,12 +390,32 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 	}
 
 	for _, decision := range decisions {
+		origin := *decision.Origin
+		if origin == "lists" {
+			origin = fmt.Sprintf("%s:%s", *decision.Origin, *decision.Scenario)
+		}
 		if *decision.Scope == "range" {
-			delete(m.ActionByIPRange, *decision.Value)
+			if _, ok := m.ActionByIPRange[*decision.Value]; ok {
+				ipType := "ipv4"
+				if strings.Contains(*decision.Value, ":") {
+					ipType = "ipv6"
+				}
+				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Dec()
+				delete(m.ActionByIPRange, *decision.Value)
+			}
 			continue
 		}
 		if val, ok := m.KVPairByDecisionValue[*decision.Value]; ok {
 			if *decision.Type == val.Value {
+				ipType := "ipv4"
+				if *decision.Scope == "ip" {
+					if strings.Contains(*decision.Value, ":") {
+						ipType = "ipv6"
+					}
+				} else {
+					ipType = "N/A"
+				}
+				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Dec()
 				keysToDelete = append(keysToDelete, val.Key)
 				delete(newKVPairByValue, val.Key)
 			}
@@ -422,28 +490,52 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 	}
 
 	for _, decision := range decisions {
-		if *decision.Scope == "range" {
+		origin := *decision.Origin
+		if origin == "lists" {
+			origin = fmt.Sprintf("%s:%s", *decision.Origin, *decision.Scenario)
+		}
+		switch *decision.Scope {
+		case "range":
+			_, ok := m.ActionByIPRange[*decision.Value]
+			if !ok {
+				ipType := "ipv4"
+				if strings.Contains(*decision.Value, ":") {
+					ipType = "ipv6"
+				}
+				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Inc()
+			}
 			m.ActionByIPRange[*decision.Value] = *decision.Type
 			continue
-		}
-		if val, ok := newKVPairByValue[*decision.Value]; ok {
-			if *decision.Type != val.Value {
-				found := false
-				for idx, kvPair := range keysToWrite {
-					if kvPair.Key == *decision.Value {
-						found = true
-						keysToWrite[idx].Value = *decision.Type
-						break
+		default:
+			if val, ok := newKVPairByValue[*decision.Value]; ok {
+				if *decision.Type != val.Value {
+					found := false
+					for idx, kvPair := range keysToWrite {
+						if kvPair.Key == *decision.Value {
+							found = true
+							keysToWrite[idx].Value = *decision.Type
+							break
+						}
+					}
+					if !found {
+						keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
+						newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
 					}
 				}
-				if !found {
-					keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
-					newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
+			} else {
+				keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
+				newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
+
+				ipType := "ipv4"
+				if *decision.Scope == "ip" {
+					if strings.Contains(*decision.Value, ":") {
+						ipType = "ipv6"
+					}
+				} else {
+					ipType = "N/A"
 				}
+				metrics.TotalActiveDecisions.With(prometheus.Labels{"origin": origin, "ip_type": ipType, "scope": *decision.Scope, "account": m.AccountCfg.Name}).Inc()
 			}
-		} else {
-			keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
-			newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
 		}
 	}
 	if len(keysToWrite) == 0 {
@@ -596,6 +688,71 @@ func (m *CloudflareAccountManager) HandleTurnstile() error {
 		})
 	}
 	return g.Wait()
+}
+
+func (m *CloudflareAccountManager) UpdateMetrics() error {
+	m.logger.Debug("Getting metrics")
+	if !m.hasD1Access {
+		m.logger.Debug("No D1 access, skipping metrics update")
+		return nil
+	}
+	resp, err := m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
+		DatabaseID: m.DatabaseID,
+		SQL:        "SELECT * FROM metrics",
+	})
+	if err != nil {
+		return err
+	}
+	m.logger.Tracef("resp: %+v", resp)
+
+	for _, r := range resp {
+		if r.Success == nil || !*r.Success {
+			m.logger.Warnf("Query failed: %+v", r)
+			continue
+		}
+		for _, data := range r.Results {
+			switch data["metric_name"] {
+			case "processed":
+				val, ok := data["val"].(float64)
+				if !ok {
+					m.logger.Warnf("Invalid value for processed metric: %+v", data)
+					continue
+				}
+				ipType, ok := data["ip_type"].(string)
+				if !ok {
+					m.logger.Warnf("Invalid value for ip_type: %+v", data)
+					continue
+				}
+				metrics.TotalProcessedRequests.With(prometheus.Labels{"ip_type": ipType, "account": m.AccountCfg.Name}).Set(val)
+			case "dropped":
+				val, ok := data["val"].(float64)
+				if !ok {
+					m.logger.Warnf("Invalid value for dropped metric: %+v", data)
+					continue
+				}
+				origin, ok := data["origin"].(string)
+				if !ok {
+					m.logger.Warnf("Invalid value for origin: %+v", data)
+					continue
+				}
+				ipType, ok := data["ip_type"].(string)
+				if !ok {
+					m.logger.Warnf("Invalid value for ip_type: %+v", data)
+					continue
+				}
+				remediation, ok := data["remediation_type"].(string)
+				if !ok {
+					m.logger.Warnf("Invalid value for remediation: %+v", data)
+					continue
+				}
+				metrics.TotalBlockedRequests.With(prometheus.Labels{"origin": origin, "remediation": remediation, "ip_type": ipType, "account": m.AccountCfg.Name}).Set(val)
+			default:
+				m.logger.Warnf("Unknown metric: %+v", data)
+			}
+		}
+	}
+
+	return nil
 }
 
 func min(a, b int) int {
