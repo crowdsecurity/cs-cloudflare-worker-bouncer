@@ -318,6 +318,21 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 		}
 	}
 
+	m.logger.Debugf("Attempting to delete worker script %s", m.Worker.ScriptName)
+	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
+		ScriptName: m.Worker.ScriptName,
+	})
+	if err != nil {
+		m.logger.Debugf("Received error while deleting worker script %s: %s (type: %s)", m.Worker.ScriptName, err, fmt.Sprintf("%T", err))
+		var notFoundErr *cf.NotFoundError
+		if !errors.As(err, &notFoundErr) {
+			return err
+		}
+		m.logger.Debugf("Didn't find worker script %s", m.Worker.ScriptName)
+	} else {
+		m.logger.Debugf("Deleted worker script %s", m.Worker.ScriptName)
+	}
+
 	m.logger.Debugf("Listing worker KV Namespaces")
 	kvNamespaces, _, err := m.api.ListWorkersKVNamespaces(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListWorkersKVNamespacesParams{})
 	if err != nil {
@@ -361,21 +376,6 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 				m.logger.Debugf("Deleted D1 DB %s", db.UUID)
 			}
 		}
-	}
-
-	m.logger.Debugf("Attempting to delete worker script %s", m.Worker.ScriptName)
-	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
-		ScriptName: m.Worker.ScriptName,
-	})
-	if err != nil {
-		m.logger.Debugf("Received error while deleting worker script %s: %s (type: %s)", m.Worker.ScriptName, err, fmt.Sprintf("%T", err))
-		var notFoundErr *cf.NotFoundError
-		if !errors.As(err, &notFoundErr) {
-			return err
-		}
-		m.logger.Debugf("Didn't find worker script %s", m.Worker.ScriptName)
-	} else {
-		m.logger.Debugf("Deleted worker script %s", m.Worker.ScriptName)
 	}
 
 	m.logger.Info("Done cleaning up existing workers")
