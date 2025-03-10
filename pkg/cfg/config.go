@@ -8,7 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudflare/cloudflare-go"
+	"github.com/cloudflare/cloudflare-go/v4"
+	"github.com/cloudflare/cloudflare-go/v4/workers"
 	"github.com/crowdsecurity/go-cs-lib/csstring"
 	"github.com/crowdsecurity/go-cs-lib/yamlpatch"
 	log "github.com/sirupsen/logrus"
@@ -71,31 +72,43 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 	}
 }
 
-func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, ID string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
-	bindings := map[string]cloudflare.WorkerBinding{
-		w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
-		VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
-			Text: string(varActionsForZoneByDomain),
+func (w *CloudflareWorkerCreateParams) CreateWorkerParams(ID string, varActionsForZoneByDomain []byte, dbID string) workers.ScriptUpdateParamsMetadata {
+	bindings := []workers.ScriptUpdateParamsMetadataBindingUnion{
+		workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindKVNamespace{
+			Name:        cloudflare.F(w.KVNameSpaceName),
+			NamespaceID: cloudflare.F(ID),
+			Type:        cloudflare.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindKVNamespaceTypeKVNamespace),
 		},
-		"LOG_ONLY": cloudflare.WorkerPlainTextBinding{
-			Text: fmt.Sprintf("%t", w.LogOnly),
+		workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindPlainText{
+			Name: cloudflare.F(VarNameForActionsByDomain),
+			Text: cloudflare.F(string(varActionsForZoneByDomain)),
+			Type: cloudflare.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindPlainTextTypePlainText),
+		},
+		workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindPlainText{
+			Name: cloudflare.F("LOG_ONLY"),
+			Text: cloudflare.F(fmt.Sprintf("%t", w.LogOnly)),
+			Type: cloudflare.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindPlainTextTypePlainText),
 		},
 	}
 
 	if dbID != "" {
-		bindings[w.D1DBName] = cloudflare.WorkerD1DatabaseBinding{
-			DatabaseID: dbID,
-		}
+		bindings = append(bindings,
+			workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindD1{
+				Name: cloudflare.F(w.D1DBName),
+				ID:   cloudflare.F(dbID),
+				Type: cloudflare.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindD1TypeD1),
+			},
+		)
 	}
-	return cloudflare.CreateWorkerParams{
-		Script:             workerScript,
-		ScriptName:         w.ScriptName,
-		Bindings:           bindings,
-		Module:             true,
-		Logpush:            w.Logpush,
-		Tags:               w.Tags,
-		CompatibilityDate:  w.CompatibilityDate,
-		CompatibilityFlags: w.CompatibilityFlags,
+	if w.Logpush == nil {
+		w.Logpush = new(bool)
+	}
+	return workers.ScriptUpdateParamsMetadata{
+		Bindings:           cloudflare.F(bindings),
+		Logpush:            cloudflare.F(*w.Logpush),
+		Tags:               cloudflare.F(w.Tags),
+		CompatibilityDate:  cloudflare.F(w.CompatibilityDate),
+		CompatibilityFlags: cloudflare.F(w.CompatibilityFlags),
 	}
 }
 
