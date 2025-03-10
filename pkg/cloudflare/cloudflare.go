@@ -182,6 +182,7 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 		_, err = m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
 			DatabaseID: m.DatabaseID,
 			SQL:        sqlCreateTableStatement,
+			Parameters: []string{},
 		})
 
 		if err != nil {
@@ -699,6 +700,7 @@ func (m *CloudflareAccountManager) UpdateMetrics() error {
 	resp, err := m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
 		DatabaseID: m.DatabaseID,
 		SQL:        "SELECT * FROM metrics",
+		Parameters: []string{},
 	})
 	if err != nil {
 		return err
