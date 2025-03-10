@@ -12,7 +12,14 @@ import (
 	"sync"
 	"time"
 
-	cf "github.com/cloudflare/cloudflare-go"
+	"github.com/cloudflare/cloudflare-go/v4"
+	"github.com/cloudflare/cloudflare-go/v4/d1"
+	"github.com/cloudflare/cloudflare-go/v4/kv"
+	"github.com/cloudflare/cloudflare-go/v4/packages/pagination"
+	"github.com/cloudflare/cloudflare-go/v4/turnstile"
+	"github.com/cloudflare/cloudflare-go/v4/workers"
+	"github.com/cloudflare/cloudflare-go/v4/zones"
+	"github.com/crowdsecurity/cloudflare-go/v4/option"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
@@ -35,41 +42,21 @@ const (
 	IpRangeKeyName        = "IP_RANGES"
 )
 
-type cloudflareAPI interface {
-	Account(ctx context.Context, accountID string) (cf.Account, cf.ResultInfo, error)
-	CreateTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateTurnstileWidgetParams) (cf.TurnstileWidget, error)
-	CreateWorkerRoute(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerRouteParams) (cf.WorkerRouteResponse, error)
-	CreateWorkersKVNamespace(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkersKVNamespaceParams) (cf.WorkersKVNamespaceResponse, error)
-	DeleteTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, siteKey string) error
-	DeleteWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.DeleteWorkerParams) error
-	DeleteWorkerRoute(ctx context.Context, rc *cf.ResourceContainer, routeID string) (cf.WorkerRouteResponse, error)
-	DeleteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.DeleteWorkersKVEntriesParams) (cf.Response, error)
-	DeleteWorkersKVNamespace(ctx context.Context, rc *cf.ResourceContainer, namespaceID string) (cf.Response, error)
-	ListTurnstileWidgets(ctx context.Context, rc *cf.ResourceContainer, params cf.ListTurnstileWidgetParams) ([]cf.TurnstileWidget, *cf.ResultInfo, error)
-	ListWorkerRoutes(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkerRoutesParams) (cf.WorkerRoutesResponse, error)
-	ListWorkersKVNamespaces(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkersKVNamespacesParams) ([]cf.WorkersKVNamespace, *cf.ResultInfo, error)
-	ListWorkersSecrets(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkersSecretsParams) (cf.WorkersListSecretsResponse, error)
-	ListZones(ctx context.Context, z ...string) ([]cf.Zone, error)
-	RotateTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, param cf.RotateTurnstileWidgetParams) (cf.TurnstileWidget, error)
-	SetWorkersSecret(ctx context.Context, rc *cf.ResourceContainer, params cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error)
-	UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
-	WriteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.WriteWorkersKVEntriesParams) (cf.Response, error)
-	CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error)
-	DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error
-	ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
-	QueryD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error)
+type kvPair struct {
+	Key   string
+	Value string
 }
 
 type CloudflareAccountManager struct {
 	AccountCfg            cfg.AccountConfig
-	api                   cloudflareAPI
+	cfClient              *cloudflare.Client
 	Ctx                   context.Context
 	logger                *log.Entry
 	hasIPRangeKV          bool
 	NamespaceID           string
 	DatabaseID            string
-	KVPairByDecisionValue map[string]cf.WorkersKVPair
-	ipRangeKVPair         cf.WorkersKVPair
+	KVPairByDecisionValue map[string]kvPair
+	ipRangeKVPair         kvPair
 	ActionByIPRange       map[string]string
 	Worker                *cfg.CloudflareWorkerCreateParams
 	hasD1Access           bool
@@ -80,17 +67,19 @@ type CloudflareAccountManager struct {
 // It initializes the struct with the account configuration, Cloudflare API client,
 // and other necessary fields.
 func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, worker *cfg.CloudflareWorkerCreateParams) (*CloudflareAccountManager, error) {
-	api, err := NewCloudflareAPI(accountCfg)
+	cfClient, err := NewCloudflareAPI(accountCfg)
 	if err != nil {
 		return nil, err
 	}
-	zones, err := api.ListZones(ctx)
+	zones, err := cfClient.Zones.List(ctx, zones.ZoneListParams{
+		Account: cloudflare.F(zones.ZoneListParamsAccount{ID: cloudflare.F(accountCfg.ID)}),
+	})
 	if err != nil {
 		return nil, err
 	}
 	for i, zoneCfg := range accountCfg.ZoneConfigs {
 		found := false
-		for _, zone := range zones {
+		for _, zone := range zones.Result {
 			if zone.ID == zoneCfg.ID {
 				found = true
 				accountCfg.ZoneConfigs[i].Domain = zone.Name
@@ -102,11 +91,11 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, wor
 		}
 	}
 	return &CloudflareAccountManager{
-		AccountCfg:      accountCfg,
-		api:             api,
-		Ctx:             ctx,
-		logger:          log.WithFields(log.Fields{"account": accountCfg.Name}),
-		ipRangeKVPair:   cf.WorkersKVPair{Key: IpRangeKeyName, Value: "{}"},
+		AccountCfg: accountCfg,
+		cfClient:   cfClient,
+		Ctx:        ctx,
+		logger:     log.WithFields(log.Fields{"account": accountCfg.Name}),
+		//ipRangeKVPair:   kv.Key{Key: IpRangeKeyName, Value: "{}"},
 		ActionByIPRange: make(map[string]string),
 		Worker:          worker,
 	}, nil
@@ -127,15 +116,13 @@ func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.R
 // The NewCloudflareAPI function creates a new instance of the cloudflareAPI interface, which is used to interact with the Cloudflare API.
 // It initializes the API client with the provided account configuration and HTTP client, and returns the client instance.
 // The function also uses a custom HTTP transport to track the number of Cloudflare API calls made by the account owner.
-func NewCloudflareAPI(accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
+func NewCloudflareAPI(accountCfg cfg.AccountConfig) (*cloudflare.Client, error) {
 	transport := CloudflareManagerHTTPTransport{accountName: accountCfg.Name}
 	httpClient := http.Client{}
 	httpClient.Transport = &transport
-	api, err := cf.NewWithAPIToken(accountCfg.Token, cf.HTTPClient(&httpClient))
-	if err != nil {
-		return nil, err
-	}
-	return api, nil
+	client := cloudflare.NewClient(option.WithAPIKey(accountCfg.Token), option.WithHTTPClient(&httpClient))
+
+	return client, nil
 }
 
 // This is pushed to KV. It is used by workers to determine the action to take for a given IP address and zone.
@@ -150,23 +137,29 @@ type ActionsForZone struct {
 func (m *CloudflareAccountManager) DeployInfra() error {
 	// Create the worker
 	m.logger.Infof("Creating KVNS %s", m.Worker.KVNameSpaceName)
-	kvNSResp, err := m.api.CreateWorkersKVNamespace(
+	kvNSResp, err := m.cfClient.KV.Namespaces.New(
 		m.Ctx,
-		cf.AccountIdentifier(m.AccountCfg.ID),
-		cf.CreateWorkersKVNamespaceParams{Title: m.Worker.KVNameSpaceName},
+		kv.NamespaceNewParams{
+			Title:     cloudflare.F(m.Worker.KVNameSpaceName),
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+		},
 	)
 	if err != nil {
 		return err
 	}
 	m.logger.Tracef("KVNS: %+v", kvNSResp)
-	m.NamespaceID = kvNSResp.Result.ID
+	m.NamespaceID = kvNSResp.ID
 
 	//Create the database
 	m.logger.Info("Creating D1 Database for metrics")
 
-	databaseResp, err := m.api.CreateD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateD1DatabaseParams{
-		Name: m.Worker.D1DBName,
-	})
+	databaseResp, err := m.cfClient.D1.Database.New(
+		m.Ctx,
+		d1.DatabaseNewParams{
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+			Name:      cloudflare.F(m.Worker.D1DBName),
+		},
+	)
 
 	//This could probably be a check on a more specific error, but because metrics are not critical, we just log the error and continue
 	if err != nil {
@@ -179,10 +172,13 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	if m.hasD1Access {
 		m.DatabaseID = databaseResp.UUID
 
-		_, err = m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
-			DatabaseID: m.DatabaseID,
-			SQL:        sqlCreateTableStatement,
-		})
+		_, err = m.cfClient.D1.Database.Query(m.Ctx,
+			m.DatabaseID,
+			d1.DatabaseQueryParams{
+				AccountID: cloudflare.F(m.AccountCfg.ID),
+				Sql:       cloudflare.F(sqlCreateTableStatement),
+			},
+		)
 
 		if err != nil {
 			return fmt.Errorf("error while creating D1 DB table, make sure your token has the proper permissions: %w", err)
@@ -199,13 +195,16 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 		banTemplate = []byte("Access Denied")
 	}
 
-	_, err = m.api.WriteWorkersKVEntries(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
-		NamespaceID: m.NamespaceID,
-		KVs: []*cf.WorkersKVPair{{
-			Key:   VarNameForBanTemplate,
-			Value: string(banTemplate),
-		}},
-	})
+	_, err = m.cfClient.KV.Namespaces.BulkUpdate(m.Ctx,
+		m.NamespaceID,
+		kv.NamespaceBulkUpdateParams{
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+			Body: []kv.NamespaceBulkUpdateParamsBody{
+				{
+					Key:   cloudflare.F(VarNameForBanTemplate),
+					Value: cloudflare.F(string(banTemplate)),
+				},
+			}})
 	if err != nil {
 		return fmt.Errorf("error while writing ban template to KV: %w", err)
 	}
@@ -223,7 +222,14 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 
 	m.logger.Infof("Creating worker %s", m.Worker.ScriptName)
 
-	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.Worker.CreateWorkerParams(workerScript, kvNSResp.Result.ID, varActionsForZoneByDomain, m.DatabaseID))
+	worker, err := m.cfClient.Workers.Scripts.Update(m.Ctx, m.Worker.ScriptName,
+		workers.ScriptUpdateParams{
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+			Metadata: cloudflare.F(
+				m.Worker.CreateWorkerParams(kvNSResp.ID, varActionsForZoneByDomain, m.DatabaseID),
+			),
+		},
+	)
 	m.logger.Tracef("Worker: %+v", worker)
 
 	if err != nil {
@@ -238,10 +244,15 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 			zoneLogger := m.logger.WithFields(log.Fields{"zone": zone.Domain})
 			zoneLogger.Infof("Binding worker to route %s", route)
 			zg.Go(func() error {
-				workerRouteResp, err := m.api.CreateWorkerRoute(m.Ctx, cf.ZoneIdentifier(zone.ID), cf.CreateWorkerRouteParams{
-					Pattern: route,
-					Script:  worker.ID,
-				})
+				workerRouteResp, err := m.cfClient.Workers.Routes.New(
+					m.Ctx,
+					workers.RouteNewParams{
+						ZoneID:  cloudflare.F(zone.ID),
+						Pattern: cloudflare.F(route),
+						Script:  cloudflare.F(worker.ID), // FIXME: should it be the ID or the name?
+					},
+				)
+
 				if err != nil {
 					return err
 				}
@@ -272,26 +283,41 @@ func (m *CloudflareAccountManager) updateMetrics() {
 	metrics.TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
 }
 
+/*).WriteWorkersKVEntries(ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
+	NamespaceID: m.NamespaceID,
+	KVs:         []*cf.WorkersKVPair{&kv},
+})*/
 // This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
 // It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
 func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 	m.logger.Infof("Cleaning up existing workers")
 
 	m.logger.Debug("Listing existing turnstile widgets")
-	widgets, _, err := m.api.ListTurnstileWidgets(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListTurnstileWidgetParams{})
+	widgets, err := m.cfClient.Turnstile.Widgets.List(
+		m.Ctx,
+		turnstile.WidgetListParams{
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+		},
+	)
 	if err != nil {
 		return err
 	}
 	m.logger.Tracef("widgets: %+v", widgets)
 	m.logger.Debug("Done listing existing turnstile widgets")
 
-	for _, widget := range widgets {
+	for _, widget := range widgets.Result {
 		if widget.Name == WidgetName {
-			m.logger.Debugf("Deleting turnstile widget with site key %s", widget.SiteKey)
-			if err := m.api.DeleteTurnstileWidget(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), widget.SiteKey); err != nil {
+			m.logger.Debugf("Deleting turnstile widget with site key %s", widget.Sitekey)
+			if _, err := m.cfClient.Turnstile.Widgets.Delete(
+				m.Ctx,
+				widget.Sitekey,
+				turnstile.WidgetDeleteParams{
+					AccountID: cloudflare.F(m.AccountCfg.ID),
+				},
+			); err != nil {
 				return err
 			}
-			m.logger.Debugf("Done deleting turnstile widget with site key %s", widget.SiteKey)
+			m.logger.Debugf("Done deleting turnstile widget with site key %s", widget.Sitekey)
 		}
 	}
 	m.logger.Debug("Done cleaning up existing turnstile widgets")
@@ -299,17 +325,28 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 	for _, zone := range m.AccountCfg.ZoneConfigs {
 		zoneLogger := m.logger.WithFields(log.Fields{"zone": zone.Domain})
 		zoneLogger.Debugf("Listing worker routes")
-		routeResp, err := m.api.ListWorkerRoutes(m.Ctx, cf.ZoneIdentifier(zone.ID), cf.ListWorkerRoutesParams{})
+		routeResp, err := m.cfClient.Workers.Routes.List(
+			m.Ctx,
+			workers.RouteListParams{
+				ZoneID: cloudflare.F(zone.ID),
+			},
+		)
 		if err != nil {
 			return err
 		}
 		zoneLogger.Tracef("routeResp: %+v", routeResp)
 		zoneLogger.Debugf("Done listing worker routes")
 
-		for _, route := range routeResp.Routes {
+		for _, route := range routeResp.Result {
 			if route.ScriptName == m.Worker.ScriptName {
 				zoneLogger.Debugf("Deleting worker route with ID %s", route.ID)
-				_, err := m.api.DeleteWorkerRoute(m.Ctx, cf.ZoneIdentifier(zone.ID), route.ID)
+				_, err := m.cfClient.Workers.Routes.Delete(
+					m.Ctx,
+					route.ID,
+					workers.RouteDeleteParams{
+						ZoneID: cloudflare.F(zone.ID),
+					},
+				)
 				if err != nil {
 					return err
 				}
@@ -319,12 +356,16 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 	}
 
 	m.logger.Debugf("Attempting to delete worker script %s", m.Worker.ScriptName)
-	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
-		ScriptName: m.Worker.ScriptName,
-	})
+	err = m.cfClient.Workers.Scripts.Delete(
+		m.Ctx,
+		m.Worker.ScriptName,
+		workers.ScriptDeleteParams{
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+		},
+	)
 	if err != nil {
 		m.logger.Debugf("Received error while deleting worker script %s: %s (type: %s)", m.Worker.ScriptName, err, fmt.Sprintf("%T", err))
-		var notFoundErr *cf.NotFoundError
+		var notFoundErr *cloudflare.Error //FIXME: check for 404 / not found error
 		if !errors.As(err, &notFoundErr) {
 			return err
 		}
@@ -334,17 +375,28 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 	}
 
 	m.logger.Debugf("Listing worker KV Namespaces")
-	kvNamespaces, _, err := m.api.ListWorkersKVNamespaces(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListWorkersKVNamespacesParams{})
+	kvNamespaces, err := m.cfClient.KV.Namespaces.List(
+		m.Ctx,
+		kv.NamespaceListParams{
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+		},
+	)
 	if err != nil {
 		return err
 	}
-	m.logger.Tracef("kvNamespaces: %+v", kvNamespaces)
+	m.logger.Tracef("kvNamespaces: %+v", kvNamespaces.Result)
 	m.logger.Debugf("Done listing worker KV Namespaces")
 
-	for _, kvNamespace := range kvNamespaces {
+	for _, kvNamespace := range kvNamespaces.Result {
 		if kvNamespace.Title == m.Worker.KVNameSpaceName {
 			m.logger.Debugf("Deleting worker KV Namespace with ID %s", kvNamespace.ID)
-			_, err := m.api.DeleteWorkersKVNamespace(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), kvNamespace.ID)
+			_, err := m.cfClient.KV.Namespaces.Delete(
+				m.Ctx,
+				kvNamespace.ID,
+				kv.NamespaceDeleteParams{
+					AccountID: cloudflare.F(m.AccountCfg.ID),
+				},
+			)
 			if err != nil {
 				return err
 			}
@@ -354,22 +406,34 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 
 	if m.hasD1Access || start {
 		m.logger.Debugf("Listing D1 DBs")
-		dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
+		dbs, err := m.cfClient.D1.Database.List(
+			m.Ctx,
+			d1.DatabaseListParams{
+				AccountID: cloudflare.F(m.AccountCfg.ID),
+			},
+		)
 
 		if err != nil {
 			if !start {
 				return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
 			}
-			dbs = []cf.D1Database{}
+			dbs = &pagination.V4PagePaginationArray[d1.DatabaseListResponse]{}
 		}
 
-		m.logger.Tracef("dbs: %+v", dbs)
+		m.logger.Tracef("dbs: %+v", dbs.Result)
 
-		for _, db := range dbs {
+		// FIXME: maybe nil deref
+		for _, db := range dbs.Result {
 			m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
 			if db.Name == m.Worker.D1DBName {
 				m.logger.Debugf("Deleting D1 DB %s", db.UUID)
-				err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
+				_, err = m.cfClient.D1.Database.Delete(
+					m.Ctx,
+					db.UUID,
+					d1.DatabaseDeleteParams{
+						AccountID: cloudflare.F(m.AccountCfg.ID),
+					},
+				)
 				if err != nil {
 					return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
 				}
@@ -384,7 +448,7 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 
 func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.Decision) error {
 	keysToDelete := make([]string, 0)
-	newKVPairByValue := make(map[string]cf.WorkersKVPair)
+	newKVPairByValue := make(map[string]kvPair)
 	for _, kvPair := range m.KVPairByDecisionValue {
 		newKVPairByValue[kvPair.Key] = kvPair
 	}
@@ -434,10 +498,14 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 		begin := i
 		end := min(i+10000, len(keysToDelete))
 		deleterGrp.Go(func() error {
-			resp, err := m.api.DeleteWorkersKVEntries(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkersKVEntriesParams{
-				Keys:        keysToDelete[begin:end],
-				NamespaceID: m.NamespaceID,
-			})
+			resp, err := m.cfClient.KV.Namespaces.BulkDelete(
+				m.Ctx,
+				m.NamespaceID,
+				kv.NamespaceBulkDeleteParams{
+					AccountID: cloudflare.F(m.AccountCfg.ID),
+					Body:      keysToDelete[begin:end],
+				},
+			)
 			if err != nil {
 				return err
 			}
@@ -464,15 +532,21 @@ func (m *CloudflareAccountManager) writeWidgetCfgToKV(ctx context.Context, widge
 	if err != nil {
 		return err
 	}
-	kv := cf.WorkersKVPair{
-		Key:   TurnstileConfigKey,
-		Value: string(turnstileConfig),
-	}
+
 	m.logger.Infof("Writing turnstile cfg")
-	resp, err := m.api.WriteWorkersKVEntries(ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
-		NamespaceID: m.NamespaceID,
-		KVs:         []*cf.WorkersKVPair{&kv},
-	})
+	resp, err := m.cfClient.KV.Namespaces.BulkUpdate(
+		ctx,
+		m.NamespaceID,
+		kv.NamespaceBulkUpdateParams{
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+			Body: []kv.NamespaceBulkUpdateParamsBody{
+				{
+					Key:   cloudflare.F(TurnstileConfigKey),
+					Value: cloudflare.F(string(turnstileConfig)),
+				},
+			},
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -481,8 +555,8 @@ func (m *CloudflareAccountManager) writeWidgetCfgToKV(ctx context.Context, widge
 }
 
 func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decision) error {
-	keysToWrite := make([]*cf.WorkersKVPair, 0)
-	newKVPairByValue := make(map[string]cf.WorkersKVPair)
+	keysToWrite := make([]*kvPair, 0)
+	newKVPairByValue := make(map[string]kvPair)
 
 	//copy existing kv pairs
 	for _, kvPair := range m.KVPairByDecisionValue {
@@ -518,13 +592,13 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 						}
 					}
 					if !found {
-						keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
-						newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
+						keysToWrite = append(keysToWrite, &kvPair{Key: *decision.Value, Value: *decision.Type})
+						newKVPairByValue[*decision.Value] = kvPair{Key: *decision.Value, Value: *decision.Type}
 					}
 				}
 			} else {
-				keysToWrite = append(keysToWrite, &cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type})
-				newKVPairByValue[*decision.Value] = cf.WorkersKVPair{Key: *decision.Value, Value: *decision.Type}
+				keysToWrite = append(keysToWrite, &kvPair{Key: *decision.Value, Value: *decision.Type})
+				newKVPairByValue[*decision.Value] = kvPair{Key: *decision.Value, Value: *decision.Type}
 
 				ipType := "ipv4"
 				if *decision.Scope == "ip" {
@@ -550,10 +624,14 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 			begin := i
 			end := min(i+10000, len(keysToWrite))
 			writerErrGroup.Go(func() error {
-				resp, err := m.api.WriteWorkersKVEntries(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
-					NamespaceID: m.NamespaceID,
-					KVs:         keysToWrite[begin:end],
-				})
+				resp, err := m.cfClient.KV.Namespaces.BulkUpdate(
+					m.Ctx,
+					m.NamespaceID,
+					kv.NamespaceBulkUpdateParams{
+						AccountID: cloudflare.F(m.AccountCfg.ID),
+						Body:      keysToWrite[begin:end],
+					},
+				)
 				if err != nil {
 					return err
 				}
@@ -588,10 +666,14 @@ func (m *CloudflareAccountManager) CommitIPRangesIfChanged() error {
 		}
 		m.logger.Debugf("IP ranges changed, writing new value: %s", ipRangeContent)
 		m.ipRangeKVPair.Value = ipRangeContent
-		_, err := m.api.WriteWorkersKVEntries(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.WriteWorkersKVEntriesParams{
-			NamespaceID: m.NamespaceID,
-			KVs:         []*cf.WorkersKVPair{&m.ipRangeKVPair},
-		})
+		_, err := m.cfClient.KV.Namespaces.BulkUpdate(
+			m.Ctx,
+			m.NamespaceID,
+			kv.NamespaceBulkUpdateParams{
+				AccountID: cloudflare.F(m.AccountCfg.ID),
+				Body:      m.ipRangeKVPair,
+			},
+		)
 		if err != nil {
 			return err
 		}
@@ -611,11 +693,15 @@ func (m *CloudflareAccountManager) CreateTurnstileWidgets() (map[string]WidgetTo
 		zoneLogger := m.logger.WithFields(log.Fields{"zone": zone.Domain})
 		zoneLogger.Info(("Creating turnstile widget"))
 		widgetCreatorGrp.Go(func() error {
-			resp, err := m.api.CreateTurnstileWidget(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateTurnstileWidgetParams{
-				Name:    WidgetName,
-				Domains: []string{zone.Domain},
-				Mode:    zone.Turnstile.Mode,
-			})
+			resp, err := m.cfClient.Turnstile.Widgets.New(
+				m.Ctx,
+				turnstile.WidgetNewParams{
+					AccountID: cloudflare.F(m.AccountCfg.ID),
+					Name:      cloudflare.F(WidgetName),
+					Domains:   cloudflare.F([]turnstile.WidgetDomainParam{zone.Domain}),
+					Mode:      cloudflare.F(turnstile.WidgetNewParamsMode(zone.Turnstile.Mode)),
+				},
+			)
 			if err != nil {
 				return err
 			}
@@ -623,7 +709,7 @@ func (m *CloudflareAccountManager) CreateTurnstileWidgets() (map[string]WidgetTo
 			zoneLogger.Info(("Done creating turnstile widget"))
 			widgetTokenCfgByDomainLock.Lock()
 			defer widgetTokenCfgByDomainLock.Unlock()
-			widgetTokenCfgByDomain[zone.Domain] = WidgetTokenCfg{SiteKey: resp.SiteKey, Secret: resp.Secret}
+			widgetTokenCfgByDomain[zone.Domain] = WidgetTokenCfg{SiteKey: resp.Sitekey, Secret: resp.Secret}
 			return nil
 		})
 	}
@@ -668,10 +754,14 @@ func (m *CloudflareAccountManager) HandleTurnstile() error {
 					widgetTokenCfgByDomainLock.Lock()
 					widgetTokenCfg := widgetTokenCfgByDomain[zone.Domain]
 					widgetTokenCfgByDomainLock.Unlock()
-					resp, err := m.api.RotateTurnstileWidget(ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.RotateTurnstileWidgetParams{
-						SiteKey:               widgetTokenCfg.SiteKey,
-						InvalidateImmediately: true,
-					})
+					resp, err := m.cfClient.Turnstile.Widgets.RotateSecret(
+						m.Ctx,
+						widgetTokenCfg.SiteKey,
+						turnstile.WidgetRotateSecretParams{
+							AccountID:             cloudflare.F(m.AccountCfg.ID),
+							InvalidateImmediately: cloudflare.F(true),
+						},
+					)
 					zoneLogger.Tracef("resp: %+v", resp)
 					if err != nil {
 						return err
@@ -696,51 +786,60 @@ func (m *CloudflareAccountManager) UpdateMetrics() error {
 		m.logger.Debug("No D1 access, skipping metrics update")
 		return nil
 	}
-	resp, err := m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
-		DatabaseID: m.DatabaseID,
-		SQL:        "SELECT * FROM metrics",
-	})
+	resp, err := m.cfClient.D1.Database.Query(
+		m.Ctx,
+		m.DatabaseID,
+		d1.DatabaseQueryParams{
+			AccountID: cloudflare.F(m.AccountCfg.ID),
+			Sql:       cloudflare.F("SELECT * FROM metrics"),
+		},
+	)
 	if err != nil {
 		return err
 	}
 	m.logger.Tracef("resp: %+v", resp)
 
-	for _, r := range resp {
-		if r.Success == nil || !*r.Success {
+	for _, r := range resp.Result {
+		if !r.Success {
 			m.logger.Warnf("Query failed: %+v", r)
 			continue
 		}
 		for _, data := range r.Results {
-			switch data["metric_name"] {
+			d, ok := data.(map[string]interface{})
+			if !ok {
+				m.logger.Warnf("could not assert metrics data: %+v", data)
+				continue
+			}
+			switch d["metric_name"] {
 			case "processed":
-				val, ok := data["val"].(float64)
+				val, ok := d["val"].(float64)
 				if !ok {
 					m.logger.Warnf("Invalid value for processed metric: %+v", data)
 					continue
 				}
-				ipType, ok := data["ip_type"].(string)
+				ipType, ok := d["ip_type"].(string)
 				if !ok {
 					m.logger.Warnf("Invalid value for ip_type: %+v", data)
 					continue
 				}
 				metrics.TotalProcessedRequests.With(prometheus.Labels{"ip_type": ipType, "account": m.AccountCfg.Name}).Set(val)
 			case "dropped":
-				val, ok := data["val"].(float64)
+				val, ok := d["val"].(float64)
 				if !ok {
 					m.logger.Warnf("Invalid value for dropped metric: %+v", data)
 					continue
 				}
-				origin, ok := data["origin"].(string)
+				origin, ok := d["origin"].(string)
 				if !ok {
 					m.logger.Warnf("Invalid value for origin: %+v", data)
 					continue
 				}
-				ipType, ok := data["ip_type"].(string)
+				ipType, ok := d["ip_type"].(string)
 				if !ok {
 					m.logger.Warnf("Invalid value for ip_type: %+v", data)
 					continue
 				}
-				remediation, ok := data["remediation_type"].(string)
+				remediation, ok := d["remediation_type"].(string)
 				if !ok {
 					m.logger.Warnf("Invalid value for remediation: %+v", data)
 					continue
