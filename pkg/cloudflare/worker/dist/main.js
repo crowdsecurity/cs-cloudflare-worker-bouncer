@@ -6572,6 +6572,24 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
   }
 }
 
+const getFromKV = async (kv, key) => {
+  try {
+    const value = await kv.get(key);
+    return value;
+  } catch (e) {
+    console.log(e)
+    return null
+  }
+}
+
+const writeToKV = async (kv, key, value) => {
+  try {
+    await kv.put(key, value);
+  } catch (e) {
+    console.log(e)
+  }
+}
+
 // request ->
 // <-captcha
 // solved_captcha ->
@@ -6581,7 +6599,7 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
   async fetch(request, env, ctx) {
 
     const doBan = async () => {
-      return new Response(await env.CROWDSECCFBOUNCERNS.get("BAN_TEMPLATE"), {
+      return new Response(await getFromKV(env.CROWDSECCFBOUNCERNS, "BAN_TEMPLATE"), {
         status: 403,
         headers: { "Content-Type": "text/html" }
       });
@@ -6594,7 +6612,7 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
       // If it's captcha submission, do the validation  and issue a JWT token as a cookie. 
       // Else return the captcha HTML
       const ip = request.headers.get('CF-Connecting-IP');
-      let turnstileCfg = await env.CROWDSECCFBOUNCERNS.get("TURNSTILE_CONFIG")
+      let turnstileCfg = await getFromKV(env.CROWDSECCFBOUNCERNS, "TURNSTILE_CONFIG")
       if (turnstileCfg == null) {
         console.log("No turnstile config found for zone")
         return fetch(request)
@@ -6602,7 +6620,7 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
       if (typeof turnstileCfg === "string") {
         console.log("Converting turnstile config to JSON")
         turnstileCfg = JSON.parse(turnstileCfg)
-        env.CROWDSECCFBOUNCERNS.put("TURNSTILE_CONFIG", turnstileCfg)
+        writeToKV(env.CROWDSECCFBOUNCERNS, "TURNSTILE_CONFIG", turnstileCfg)
       }
 
       if (!turnstileCfg[zoneForThisRequest]) {
@@ -6702,13 +6720,13 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
     const getRemediationForRequest = async (request, env) => {
       console.log("Checking for decision against the IP")
       const clientIP = request.headers.get("CF-Connecting-IP");
-      let value = await env.CROWDSECCFBOUNCERNS.get(clientIP);
+      let value = await getFromKV(env.CROWDSECCFBOUNCERNS, clientIP);
       if (value !== null) {
         return value
       }
 
       console.log("Checking for decision against the IP ranges")
-      let actionByIPRange = await env.CROWDSECCFBOUNCERNS.get("IP_RANGES");
+      let actionByIPRange = await getFromKV(env.CROWDSECCFBOUNCERNS, "IP_RANGES");
       if (typeof actionByIPRange === "string") {
         actionByIPRange = JSON.parse(actionByIPRange)
       }
@@ -6722,7 +6740,7 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
       }
       // Check for decision against the AS
       const clientASN = request.cf.asn.toString();
-      value = await env.CROWDSECCFBOUNCERNS.get(clientASN);
+      value = await getFromKV(env.CROWDSECCFBOUNCERNS, clientASN);
       if (value !== null) {
         return value
       }
@@ -6730,7 +6748,7 @@ const handleTurnstilePost = async (request, body, turnstile_secret, zoneForThisR
       // Check for decision against the country of the request
       const clientCountry = request.cf.country.toLowerCase();
       if (clientCountry !== null) {
-        value = await env.CROWDSECCFBOUNCERNS.get(clientCountry);
+        value = await getFromKV(env.CROWDSECCFBOUNCERNS, clientCountry);
         if (value !== null) {
           return value
         }
