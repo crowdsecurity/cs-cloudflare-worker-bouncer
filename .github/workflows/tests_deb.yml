@@ -38,9 +38,9 @@ jobs:
         sudo apt update
         sudo apt install -y build-essential debhelper devscripts fakeroot lintian
         docker network create net-test
-        python3 -m pip install --upgrade pipenv wheel
+        python3 -m pip install --upgrade pipenv
         pipenv install --deploy
-        sudo python3 -m pip install --upgrade pipenv wheel
+        sudo python3 -m pip install --upgrade pipenv
         sudo pipenv install --deploy
 
     - name: Run functional tests
