@@ -1,0 +1,221 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    - testableexamples
+    - copyloopvar
+    - fatcontext
+    - forbidigo
+    - govet
+    - interfacebloat
+    - staticcheck
+    - revive
+    - unconvert
+    - perfsprint
+    - unparam
+    - nilerr
+    - maintidx
+    - containedctx
+    - errname
+    - gocritic
+    - promlinter
+    - predeclared
+    - thelper
+    - nestif
+    - ireturn
+
+    #
+    # Redundant
+    #
+    - cyclop    # revive
+    - funlen    # revive
+    - gocognit  # revive
+    - gocyclo   # revive
+    - lll       # revive
+
+    #
+    # Recommended? (easy)
+    #
+
+    - godot                 # Check if comments end in a period
+    - gosec                 # (gas): Inspects source code for security problems
+    - inamedparam           # reports interfaces with unnamed method parameters
+    - wrapcheck             # Checks that errors returned from external packages are wrapped
+
+    #
+    # Recommended? (requires some work)
+    #
+
+    - mnd                   # An analyzer to detect magic numbers.
+
+    #
+    # Formatting only, useful in IDE but should not be forced on CI?
+    #
+
+    - nlreturn              # nlreturn checks for a new line before return and branch statements to increase code clarity
+    - whitespace            # Whitespace is a linter that checks for unnecessary newlines at the start and end of functions, if, for, etc.
+    - wsl                   # add or remove empty lines
+
+    #
+    # Well intended, but not ready for this
+    #
+    - godox                 # Tool for detection of FIXME, TODO and other comment keywords
+    - err113                # Go linter to check the errors handling expressions
+    - paralleltest          # Detects missing usage of t.Parallel() method in your Go test
+    - testpackage           # linter that makes you use a separate _test package
+
+    #
+    # Too strict / too many false positives (for now?)
+    #
+    - exhaustruct           # Checks if all structure fields are initialized
+    - gochecknoglobals      # Check that no global variables exist.
+    - goconst               # Finds repeated strings that could be replaced by a constant
+    - tagliatelle           # Checks the struct tags.
+    - varnamelen            # checks that the length of a variable's name matches its scope
+    - prealloc
+
+  settings:
+
+    depguard:
+      rules:
+        yaml:
+          files:
+            - '!**/live_bouncer.go'
+            - '!**/stream_bouncer.go'
+          deny:
+            - pkg: gopkg.in/yaml.v2
+              desc: yaml.v2 is deprecated for new code in favor of yaml.v3
+
+    errcheck:
+      # Report about not checking of errors in type assertions: `a := b.(MyStruct)`.
+      # Such cases aren't reported by default.
+      check-type-assertions: false
+      # List of functions to exclude from checking, where each entry is a single function to exclude.
+      # See https://github.com/kisielk/errcheck#excluding-functions for details.
+
+    gocritic:
+      enable-all: true
+      disabled-checks:
+        - paramTypeCombine
+        - deferInLoop             #
+
+    gomoddirectives:
+      replace-allow-list:
+        - golang.org/x/time/rate
+        - github.com/corazawaf/coraza/v3
+
+    govet:
+      disable:
+        - fieldalignment
+      enable-all: true
+
+    misspell:
+      locale: US
+
+    nlreturn:
+      block-size: 5
+
+    nolintlint:
+      require-explanation: false  # don't require an explanation for nolint directives
+      require-specific: false     # don't require nolint directives to be specific about which linter is being skipped
+      allow-unused: false         # report any unused nolint directives
+
+    revive:
+      severity: error
+      enable-all-rules: true
+      rules:
+        - name: add-constant
+          disabled: true
+        - name: cognitive-complexity
+          arguments:
+            # lower this after refactoring
+            - 25
+        - name: comment-spacings
+          disabled: true
+        - name: confusing-results
+          disabled: true
+        - name: cyclomatic
+          arguments:
+            # lower this after refactoring
+            - 16
+        - name: defer
+          disabled: true
+        - name: empty-block
+          disabled: true
+        - name: empty-lines
+          disabled: true
+        - name: error-naming
+          disabled: true
+        - name: flag-parameter
+          disabled: true
+        - name: increment-decrement
+          disabled: true
+        - name: import-alias-naming
+          disabled: true
+        - name: line-length-limit
+          arguments:
+            # lower this after refactoring
+            - 190
+        - name: max-public-structs
+          disabled: true
+        - name: package-comments
+          disabled: true
+        - name: var-naming
+          disabled: true
+        - name: unhandled-error
+          arguments:
+            - fmt.Print
+            - fmt.Printf
+            - fmt.Println
+          disabled: true
+        - name: use-any
+          disabled: true
+        - name: useless-break
+          disabled: true
+
+    staticcheck:
+      checks:
+        - all
+
+    wsl:
+      # Allow blocks to end with comments
+      allow-trailing-comment: true
+
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+
+      # `err` is often shadowed, we may continue to do it
+
+      - linters:
+          - govet
+        text: 'shadow: declaration of "(err|ctx)" shadows declaration'
+
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/crowdsecurity)
+        - prefix(github.com/crowdsecurity/cs-cloudflare-worker-bouncer)
+
+  exclusions:
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
