@@ -24,24 +24,29 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: 1.23
+        go-version-file: go.mod
 
-    - name: Cache virtualenvs
-      id: cache-pipenv
-      uses: actions/cache@v4
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
       with:
-        path: ~/.local/share/virtualenvs
-        key: ${{ runner.os }}-pipenv-${{ hashFiles('**/Pipfile.lock') }}
+        version: 0.5.24
+        enable-cache: true
+        cache-dependency-glob: "test/uv.lock"
+
+    - name: "Set up Python"
+      uses: actions/setup-python@v5
+      with:
+        python-version-file: "test/.python-version"
+
+    - name: Install the project
+      run: uv sync --all-extras --dev
+      working-directory: ./test
 
     - name: Install functional test dependencies
       run: |
         sudo apt update
         sudo apt install -y build-essential debhelper devscripts fakeroot lintian
         docker network create net-test
-        python3 -m pip install --upgrade pipenv wheel
-        pipenv install --deploy
-        sudo python3 -m pip install --upgrade pipenv wheel
-        sudo pipenv install --deploy
 
     - name: Run functional tests
       env:
@@ -50,5 +55,6 @@ jobs:
         CROWDSEC_TEST_NETWORK: net-test
         CROWDSEC_TEST_TIMEOUT: 60
         PYTEST_ADDOPTS: --durations=0 -vv --color=yes
+      working-directory: ./test
       run: |
-        pipenv run pytest test/pkg/test_build_deb.py
+        uv run pytest ./tests/pkg/test_build_deb.py
