@@ -1,0 +1,50 @@
+[project]
+name = "cs-cloudflare-worker-bouncer-tests"
+version = "0.1.0"
+description = "Tests for cs-cloudflare-worker-bouncer"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pexpect>=4.9.0",
+    "pytest>=8.3.4",
+    "pytest-cs",
+    "pytest-dependency>=0.6.0",
+    "pytest-dotenv>=0.5.2",
+    "zxcvbn>=4.4.28",
+]
+
+[tool.uv.sources]
+pytest-cs = { git = "https://github.com/crowdsecurity/pytest-cs" }
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.27.1",
+    "ipdb>=0.13.13",
+    "ruff>=0.9.6",
+]
+
+[tool.ruff]
+
+line-length = 130
+
+[tool.ruff.lint]
+select = [
+  "ALL"
+]
+
+ignore = [
+    "ANN",      # Missing type annotations
+    "ARG001",   # Unused function argument: `...`
+    "D100",     # Missing docstring in public module
+    "D104",     # Missing docstring in public package
+    "D203",     # incorrect-blank-line-before-class
+    "D212",     # Multi-line docstring summary should start at the first line
+    "S101",     # Use of 'assert' detected
+    "Q000",     # Single quotes found but double quotes preferred
+]
+
+[tool.basedpyright]
+reportMissingParameterType = "none"
+reportUnknownMemberType = "none"
+reportUnknownParameterType = "none"
+reportUnusedParameter = "none"
