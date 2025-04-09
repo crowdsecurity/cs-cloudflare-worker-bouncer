@@ -82,11 +82,11 @@ type CloudflareAccountManager struct {
 func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, worker *cfg.CloudflareWorkerCreateParams) (*CloudflareAccountManager, error) {
 	api, err := NewCloudflareAPI(accountCfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create Cloudflare API: %w", err)
 	}
 	zones, err := api.ListZones(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to list zones: %w", err)
 	}
 	for i, zoneCfg := range accountCfg.ZoneConfigs {
 		found := false
@@ -133,7 +133,7 @@ func NewCloudflareAPI(accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
 	httpClient.Transport = &transport
 	api, err := cf.NewWithAPIToken(accountCfg.Token, cf.HTTPClient(&httpClient))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create Cloudflare API: %w", err)
 	}
 	return api, nil
 }
@@ -440,7 +440,7 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 				NamespaceID: m.NamespaceID,
 			})
 			if err != nil {
-				return err
+				return fmt.Errorf("error while deleting keys: %w", err)
 			}
 			m.logger.Tracef("batch %d delete key resp: %+v", batch, resp)
 			return nil
@@ -594,7 +594,7 @@ func (m *CloudflareAccountManager) CommitIPRangesIfChanged() error {
 			KVs:         []*cf.WorkersKVPair{&m.ipRangeKVPair},
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("error while writing IP ranges to KV: %w", err)
 		}
 	}
 	return nil
