@@ -5,7 +5,7 @@
   "source": "worker.js",
   "main": "worker.js",
   "devDependencies": {
-    "webpack": "^5.95.0",
+    "webpack": "^5.99.5",
     "webpack-cli": "5.1.4"
   },
   "scripts": {
@@ -14,10 +14,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@tsndr/cloudflare-worker-jwt": "2.2.1",
-    "cookie": "^1.0.1",
-    "ipaddr.js": "2.1.0",
-    "jsonwebtoken": "9.0.0",
+    "@tsndr/cloudflare-worker-jwt": "3.1.4",
+    "cookie": "^1.0.2",
+    "ipaddr.js": "2.2.0",
+    "jsonwebtoken": "9.0.2",
     "node-polyfill-webpack-plugin": "2.0.1"
   }
 }
