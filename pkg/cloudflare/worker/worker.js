@@ -121,7 +121,7 @@ export default {
         console.log("captchaAuth cookie is present")
         // Check if the JWT token is valid
         try {
-          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"] + ip);
+          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"] + ip, {throwError: true});
           return fetch(request)
         } catch (err) {
           console.log(err)
