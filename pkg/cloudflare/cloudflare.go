@@ -131,7 +131,17 @@ func NewCloudflareAPI(accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
 	transport := CloudflareManagerHTTPTransport{accountName: accountCfg.Name}
 	httpClient := http.Client{}
 	httpClient.Transport = &transport
-	api, err := cf.NewWithAPIToken(accountCfg.Token, cf.HTTPClient(&httpClient))
+
+	opts := []cf.Option{
+		cf.HTTPClient(&httpClient),
+	}
+
+	if log.IsLevelEnabled(log.DebugLevel) {
+		opts = append(opts, cf.Debug(true))
+		opts = append(opts, cf.UsingLogger(log.StandardLogger()))
+	}
+
+	api, err := cf.NewWithAPIToken(accountCfg.Token, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Cloudflare API: %w", err)
 	}
