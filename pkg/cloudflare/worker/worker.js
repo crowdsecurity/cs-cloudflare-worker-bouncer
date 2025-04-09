@@ -121,7 +121,7 @@ export default {
         console.log("captchaAuth cookie is present")
         // Check if the JWT token is valid
         try {
-          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"] + ip);
+          const decoded = await jwt.verify(cookie[`${zoneForThisRequest}_captcha`], turnstileCfg["secret"] + ip, {throwError: true});
           return fetch(request)
         } catch (err) {
           console.log(err)
@@ -220,8 +220,13 @@ export default {
       if (actionByIPRange !== null) {
         const clientIPAddr = ipaddr.parse(clientIP);
         for (const [range, action] of Object.entries(actionByIPRange)) {
-          if (clientIPAddr.match(ipaddr.parseCIDR(range))) {
-            return action
+          try {
+            if (clientIPAddr.match(ipaddr.parseCIDR(range))) {
+              return action
+            }
+          } catch (error) {
+            // This happens when trying to match IPv6 address with IPv4 CIDR (or vice versa)
+            // Just ignore the error and continue
           }
         }
       }
