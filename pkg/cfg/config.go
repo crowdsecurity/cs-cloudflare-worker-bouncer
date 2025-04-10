@@ -2,6 +2,7 @@ package cfg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,7 +18,7 @@ import (
 
 var (
 	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
-	EmptyConfigError          = fmt.Errorf("empty config")
+	ErrEmptyConfig            = errors.New("empty config")
 )
 
 type TurnstileConfig struct {
@@ -151,7 +152,7 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 	configBuff := csstring.StrictExpand(string(content), os.LookupEnv)
 
 	if len(configBuff) == 0 {
-		return nil, EmptyConfigError
+		return nil, ErrEmptyConfig
 	}
 
 	err = yaml.Unmarshal([]byte(configBuff), &config)

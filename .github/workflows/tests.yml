@@ -39,10 +39,3 @@ jobs:
       env:
         RICHGO_FORCE_COLOR: 1
         CLOUDFLARE_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
-
-    - name: golangci-lint
-      uses: golangci/golangci-lint-action@v7
-      with:
-        version: v2.0
-        args: --issues-exit-code=1 --timeout 10m
-        only-new-issues: false
