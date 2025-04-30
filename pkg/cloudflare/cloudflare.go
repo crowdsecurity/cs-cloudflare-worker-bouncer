@@ -1,17 +1,21 @@
 package cf
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cloudflare/cloudflare-go"
 	cf "github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	"github.com/prometheus/client_golang/prometheus"
@@ -35,34 +39,12 @@ const (
 	IpRangeKeyName        = "IP_RANGES"
 )
 
-type cloudflareAPI interface {
-	Account(ctx context.Context, accountID string) (cf.Account, cf.ResultInfo, error)
-	CreateTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateTurnstileWidgetParams) (cf.TurnstileWidget, error)
-	CreateWorkerRoute(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerRouteParams) (cf.WorkerRouteResponse, error)
-	CreateWorkersKVNamespace(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkersKVNamespaceParams) (cf.WorkersKVNamespaceResponse, error)
-	DeleteTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, siteKey string) error
-	DeleteWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.DeleteWorkerParams) error
-	DeleteWorkerRoute(ctx context.Context, rc *cf.ResourceContainer, routeID string) (cf.WorkerRouteResponse, error)
-	DeleteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.DeleteWorkersKVEntriesParams) (cf.Response, error)
-	DeleteWorkersKVNamespace(ctx context.Context, rc *cf.ResourceContainer, namespaceID string) (cf.Response, error)
-	ListTurnstileWidgets(ctx context.Context, rc *cf.ResourceContainer, params cf.ListTurnstileWidgetParams) ([]cf.TurnstileWidget, *cf.ResultInfo, error)
-	ListWorkerRoutes(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkerRoutesParams) (cf.WorkerRoutesResponse, error)
-	ListWorkersKVNamespaces(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkersKVNamespacesParams) ([]cf.WorkersKVNamespace, *cf.ResultInfo, error)
-	ListWorkersSecrets(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkersSecretsParams) (cf.WorkersListSecretsResponse, error)
-	ListZones(ctx context.Context, z ...string) ([]cf.Zone, error)
-	RotateTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, param cf.RotateTurnstileWidgetParams) (cf.TurnstileWidget, error)
-	SetWorkersSecret(ctx context.Context, rc *cf.ResourceContainer, params cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error)
-	UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
-	WriteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.WriteWorkersKVEntriesParams) (cf.Response, error)
-	CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error)
-	DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error
-	ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
-	QueryD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error)
-}
-
 type CloudflareAccountManager struct {
-	AccountCfg            cfg.AccountConfig
-	api                   cloudflareAPI
+	AccountCfg cfg.AccountConfig
+	api        *cloudflare.API
+	// We store the client, as we need to make a manual call to the cloudflare API when creating the worker route
+	// Because we want to use the `request_limit_fail_open` parameter, which is not supported by the cloudflare-go library
+	httpClient            *http.Client
 	Ctx                   context.Context
 	logger                *log.Entry
 	hasIPRangeKV          bool
@@ -80,7 +62,10 @@ type CloudflareAccountManager struct {
 // It initializes the struct with the account configuration, Cloudflare API client,
 // and other necessary fields.
 func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, worker *cfg.CloudflareWorkerCreateParams) (*CloudflareAccountManager, error) {
-	api, err := NewCloudflareAPI(accountCfg)
+	transport := CloudflareManagerHTTPTransport{accountName: accountCfg.Name}
+	httpClient := http.Client{}
+	httpClient.Transport = &transport
+	api, err := NewCloudflareAPI(accountCfg, &httpClient)
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +89,7 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, wor
 	return &CloudflareAccountManager{
 		AccountCfg:      accountCfg,
 		api:             api,
+		httpClient:      &httpClient,
 		Ctx:             ctx,
 		logger:          log.WithFields(log.Fields{"account": accountCfg.Name}),
 		ipRangeKVPair:   cf.WorkersKVPair{Key: IpRangeKeyName, Value: "{}"},
@@ -127,14 +113,12 @@ func (cfT *CloudflareManagerHTTPTransport) RoundTrip(req *http.Request) (*http.R
 // The NewCloudflareAPI function creates a new instance of the cloudflareAPI interface, which is used to interact with the Cloudflare API.
 // It initializes the API client with the provided account configuration and HTTP client, and returns the client instance.
 // The function also uses a custom HTTP transport to track the number of Cloudflare API calls made by the account owner.
-func NewCloudflareAPI(accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
-	transport := CloudflareManagerHTTPTransport{accountName: accountCfg.Name}
-	httpClient := http.Client{}
-	httpClient.Transport = &transport
-	api, err := cf.NewWithAPIToken(accountCfg.Token, cf.HTTPClient(&httpClient))
+func NewCloudflareAPI(accountCfg cfg.AccountConfig, httpClient *http.Client) (*cloudflare.API, error) {
+	api, err := cf.NewWithAPIToken(accountCfg.Token, cf.HTTPClient(httpClient))
 	if err != nil {
 		return nil, err
 	}
+
 	return api, nil
 }
 
@@ -142,6 +126,68 @@ func NewCloudflareAPI(accountCfg cfg.AccountConfig) (cloudflareAPI, error) {
 type ActionsForZone struct {
 	SupportedActions []string `json:"supported_actions"`
 	DefaultAction    string   `json:"default_action"`
+}
+
+type createWorkerRouteParams struct {
+	Pattern string `json:"pattern"`
+	Script  string `json:"script"`
+	// This is not supported by the cloudflare-go library
+	RequestLimitFailOpen bool `json:"request_limit_fail_open,omitempty"`
+}
+
+// We do this call manually as we need request_limit_fail_open parameter which is not supported by the cloudflare-go library
+// This is way more basic than what the library does (no retries, no rate limiting, not much error handling), but it should be enough for our use case
+func (m *CloudflareAccountManager) CreateWorkerRoute(zoneID string, route string, workerID string, failOpen bool) (cf.WorkerRouteResponse, error) {
+	url, err := url.JoinPath(m.api.BaseURL, "zones", zoneID, "workers", "routes")
+	if err != nil {
+		return cf.WorkerRouteResponse{}, fmt.Errorf("error joining URL path: %w", err)
+	}
+	payload := createWorkerRouteParams{
+		Pattern:              route,
+		Script:               workerID,
+		RequestLimitFailOpen: failOpen,
+	}
+
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return cf.WorkerRouteResponse{}, fmt.Errorf("error marshalling payload: %w", err)
+	}
+
+	m.logger.Tracef("Creating worker route with payload: %s", jsonBody)
+
+	req, err := http.NewRequestWithContext(m.Ctx, http.MethodPost, url, bytes.NewBuffer(jsonBody))
+
+	if err != nil {
+		return cf.WorkerRouteResponse{}, fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+m.api.APIToken)
+
+	resp, err := m.httpClient.Do(req)
+
+	if err != nil {
+		return cf.WorkerRouteResponse{}, fmt.Errorf("error making request: %w", err)
+	}
+
+	var cfResponse cf.WorkerRouteResponse
+
+	respBody, err := io.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	if err != nil {
+		return cf.WorkerRouteResponse{}, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return cf.WorkerRouteResponse{}, fmt.Errorf("error response from API: %s", respBody)
+	}
+
+	err = json.Unmarshal(respBody, &cfResponse)
+	if err != nil {
+		return cf.WorkerRouteResponse{}, fmt.Errorf("error unmarshalling response body: %w", err)
+	}
+
+	return cfResponse, nil
 }
 
 // Creates a new Cloudflare Workers KV namespace, uploads a new worker script, and binds the worker to one or more routes for
@@ -239,11 +285,12 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 			zoneLogger := m.logger.WithFields(log.Fields{"zone": zone.Domain})
 			zoneLogger.Infof("Binding worker to route %s", route)
 			zg.Go(func() error {
-				workerRouteResp, err := m.api.CreateWorkerRoute(m.Ctx, cf.ZoneIdentifier(zone.ID), cf.CreateWorkerRouteParams{
-					Pattern: route,
-					Script:  worker.ID,
-				})
+				workerRouteResp, err := m.CreateWorkerRoute(zone.ID, route, worker.ID, zone.FailOpen)
 				if err != nil {
+					if zone.FailOpen {
+						zoneLogger.Errorf("Received an error when creating worker route. `fail_open` parameter is set to true, this might be the issue as it's not officially supported by the Cloudflare API")
+						zoneLogger.Errorf("Please open an issue on our repository with this error: https://github.com/crowdsecurity/cs-cloudflare-worker-bouncer/issues")
+					}
 					return err
 				}
 				zoneLogger.Tracef("WorkerRouteResp: %+v", workerRouteResp)
