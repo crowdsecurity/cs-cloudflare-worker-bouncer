@@ -292,7 +292,7 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 					return err
 				}
 				zoneLogger.Tracef("WorkerRouteResp: %+v", workerRouteResp)
-				zoneLogger.Infof("Binded worker to route %s", route)
+				zoneLogger.Infof("Bound worker to route %s", route)
 				return nil
 			})
 		}
