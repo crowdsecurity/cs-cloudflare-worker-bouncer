@@ -287,8 +287,10 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 			zg.Go(func() error {
 				workerRouteResp, err := m.CreateWorkerRoute(zone.ID, route, worker.ID, zone.FailOpen)
 				if err != nil {
-					zoneLogger.Errorf("Received an error when creating worker route. If you have set the `fail_open` parameter in your configuration, this might be the issue as it's not officially supported by the Cloudflare API")
-					zoneLogger.Errorf("Please open an issue on our repository with this error: https://github.com/crowdsecurity/cs-cloudflare-worker-bouncer/issues")
+					if zone.FailOpen {
+						zoneLogger.Errorf("Received an error when creating worker route. `fail_open` parameter is set to true, this might be the issue as it's not officially supported by the Cloudflare API")
+						zoneLogger.Errorf("Please open an issue on our repository with this error: https://github.com/crowdsecurity/cs-cloudflare-worker-bouncer/issues")
+					}
 					return err
 				}
 				zoneLogger.Tracef("WorkerRouteResp: %+v", workerRouteResp)
