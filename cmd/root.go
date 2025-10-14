@@ -336,8 +336,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	})
 
 	g.Go(func() error {
-		csLAPI.Run(ctx)
-		return fmt.Errorf("crowdsec bouncer stopped")
+		return csLAPI.Run(ctx)
 	})
 
 	mHandler := metricsHandler{
