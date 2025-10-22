@@ -11,7 +11,7 @@ import (
 
 	"github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/go-cs-lib/csstring"
-	"github.com/crowdsecurity/go-cs-lib/yamlpatch"
+	"github.com/crowdsecurity/go-cs-lib/csyaml"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -72,9 +72,9 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 	}
 }
 
-func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, ID string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
+func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, id string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
 	bindings := map[string]cloudflare.WorkerBinding{
-		w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
+		w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: id},
 		VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
 			Text: string(varActionsForZoneByDomain),
 		},
@@ -132,7 +132,7 @@ type BouncerConfig struct {
 }
 
 func MergedConfig(configPath string) ([]byte, error) {
-	patcher := yamlpatch.NewPatcher(configPath, ".local")
+	patcher := csyaml.NewPatcher(configPath, ".local")
 	data, err := patcher.MergedPatchContent()
 	if err != nil {
 		return nil, err

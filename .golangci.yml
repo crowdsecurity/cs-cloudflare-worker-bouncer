@@ -3,21 +3,21 @@ version: "2"
 linters:
   default: all
   disable:
-    - fatcontext
-    - interfacebloat
-    - perfsprint
-    - unparam
-    - nilerr
     - containedctx
-    - promlinter
-    - thelper
-    - nestif
-    - ireturn
-    - testpackage
     - embeddedstructfieldcheck
+    - fatcontext
     - funcorder
     - godoclint
+    - interfacebloat
+    - ireturn
+    - nestif
+    - nilerr
     - noinlineerr
+    - perfsprint
+    - promlinter
+    - testpackage
+    - thelper
+    - unparam
     - wsl_v5
 
     - cyclop    # revive
@@ -59,13 +59,12 @@ linters:
     gocritic:
       enable-all: true
       disabled-checks:
-        - captLocal
-        - commentFormatting
-        - emptyStringTest
-        - hugeParam
-        - rangeValCopy
-        - paramTypeCombine
-        - wrapperFunc
+       - commentFormatting
+       - emptyStringTest
+       - hugeParam
+       - paramTypeCombine
+       - rangeValCopy
+       - wrapperFunc
 
     govet:
       disable:
@@ -136,15 +135,9 @@ linters:
           disabled: true
         - name: package-directory-mismatch
           disabled: true
-        - name: var-naming
-          disabled: true
-        - name: unexported-naming
-          disabled: true
-        - name: unnecessary-format
-          disabled: true
         - name: unused-parameter
           disabled: true
-        - name: use-errors-new
+        - name: var-naming
           disabled: true
 
     staticcheck:
