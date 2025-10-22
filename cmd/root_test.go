@@ -255,9 +255,6 @@ func runDecisionTests(t *testing.T, m *cf.CloudflareAccountManager, newDecisions
 		}
 	}
 
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -271,7 +268,7 @@ func TestBouncer(t *testing.T) {
 		RedactionList:  []string{"password", "email", "zone", "account_name", "owner_name", "account", "id", "secret", "token"},
 	}
 	logrus.AddHook(rh)
-	var cloudflareToken string = os.Getenv("CLOUDFLARE_TOKEN")
+	var cloudflareToken = os.Getenv("CLOUDFLARE_TOKEN")
 	if cloudflareToken == "" {
 		t.Fatal("CLOUDFLARE_TOKEN not set")
 	}
@@ -297,7 +294,6 @@ func TestBouncer(t *testing.T) {
 	t.Cleanup(func() {
 		eg := errgroup.Group{}
 		for _, zone := range zonesToDelete {
-			zone := zone
 			eg.Go(func() error {
 				_, err := api.DeleteZone(context.Background(), zone)
 				return err

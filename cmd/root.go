@@ -209,8 +209,7 @@ func getConfigFromPath(configPath string) (*cfg.BouncerConfig, error) {
 func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConfig) ([]*cf.CloudflareAccountManager, error) {
 	cfManagers := make([]*cf.CloudflareAccountManager, 0, len(config.Accounts))
 	for _, accountCfg := range config.Accounts {
-		cfg := accountCfg
-		manager, err := cf.NewCloudflareManager(ctx, cfg, &config.Worker)
+		manager, err := cf.NewCloudflareManager(ctx, accountCfg, &config.Worker)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create cloudflare manager: %w", err)
 		}
@@ -221,7 +220,7 @@ func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConf
 
 func Execute(configTokens *string, configOutputPath *string, configPath *string, ver *bool, testConfig *bool, showConfig *bool, deleteOnly *bool, setupOnly *bool) error {
 	if ver != nil && *ver {
-		fmt.Print(version.FullString())
+		fmt.Fprint(os.Stdout, version.FullString())
 		return nil
 	}
 
@@ -236,13 +235,13 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 			return err
 		}
 		if configOutputPath != nil && *configOutputPath != "" {
-			err := os.WriteFile(*configOutputPath, []byte(cfgTokenString), 0664)
+			err := os.WriteFile(*configOutputPath, []byte(cfgTokenString), 0o664)
 			if err != nil {
 				return err
 			}
 			log.Printf("Config successfully generated in %s", *configOutputPath)
 		} else {
-			fmt.Print(cfgTokenString)
+			fmt.Fprint(os.Stdout, cfgTokenString)
 		}
 		return nil
 	}
@@ -252,7 +251,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return err
 	}
 	if showConfig != nil && *showConfig {
-		fmt.Printf("%+v", conf)
+		fmt.Fprintf(os.Stdout, "%+v", conf)
 		return nil
 	}
 
@@ -337,8 +336,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	})
 
 	g.Go(func() error {
-		csLAPI.Run(ctx)
-		return fmt.Errorf("crowdsec bouncer stopped")
+		return csLAPI.Run(ctx)
 	})
 
 	mHandler := metricsHandler{

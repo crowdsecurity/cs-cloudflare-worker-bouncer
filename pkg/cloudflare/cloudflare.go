@@ -431,7 +431,6 @@ func (m *CloudflareAccountManager) ProcessDeletedDecisions(decisions []*models.D
 	// Cloudflare API only allows deleting 10k keys at a time. So we need to batch the deletes.
 	for batch, i := 0, 0; i < len(keysToDelete); i += 10000 {
 		batch++
-		batch := batch
 		begin := i
 		end := min(i+10000, len(keysToDelete))
 		deleterGrp.Go(func() error {
@@ -547,7 +546,6 @@ func (m *CloudflareAccountManager) ProcessNewDecisions(decisions []*models.Decis
 		// Cloudflare API only allows writing 10k keys at a time. So we need to batch the writes.
 		for batch, i := 0, 0; i < len(keysToWrite); i += 10000 {
 			batch++
-			batch := batch
 			begin := i
 			end := min(i+10000, len(keysToWrite))
 			writerErrGroup.Go(func() error {

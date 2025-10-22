@@ -10,7 +10,7 @@ import (
 
 	"github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/go-cs-lib/csstring"
-	"github.com/crowdsecurity/go-cs-lib/yamlpatch"
+	"github.com/crowdsecurity/go-cs-lib/csyaml"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -131,7 +131,7 @@ type BouncerConfig struct {
 }
 
 func MergedConfig(configPath string) ([]byte, error) {
-	patcher := yamlpatch.NewPatcher(configPath, ".local")
+	patcher := csyaml.NewPatcher(configPath, ".local")
 	data, err := patcher.MergedPatchContent()
 	if err != nil {
 		return nil, err
