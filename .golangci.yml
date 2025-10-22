@@ -59,12 +59,12 @@ linters:
     gocritic:
       enable-all: true
       disabled-checks:
-       - commentFormatting
-       - emptyStringTest
-       - hugeParam
-       - paramTypeCombine
-       - rangeValCopy
-       - wrapperFunc
+        - commentFormatting
+        - emptyStringTest
+        - hugeParam
+        - paramTypeCombine
+        - rangeValCopy
+        - wrapperFunc
 
     govet:
       disable:
