@@ -174,9 +174,9 @@ func HandleSignals(ctx context.Context) error {
 	case s := <-signalChan:
 		switch s {
 		case syscall.SIGTERM:
-			return fmt.Errorf("received SIGTERM")
+			return errors.New("received SIGTERM")
 		case syscall.SIGINT:
-			return fmt.Errorf("received SIGINT")
+			return errors.New("received SIGINT")
 		}
 	case <-ctx.Done():
 		return ctx.Err()
@@ -368,7 +368,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 			return ctx.Err()
 		case streamDecision := <-csLAPI.Stream:
 			if streamDecision == nil {
-				return fmt.Errorf("stream decision is nil")
+				return errors.New("stream decision is nil")
 			}
 			streamDecision.Deleted = normalizeDecisions(streamDecision.Deleted)
 			streamDecision.New = normalizeDecisions(streamDecision.New)

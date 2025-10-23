@@ -27,12 +27,12 @@ func TestConfig(t *testing.T) {
 		{
 			name: "Empty yaml",
 			yaml: []byte(""),
-			err:  cfg.EmptyConfigError,
+			err:  cfg.ErrEmptyConfig,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := cfg.NewConfig(bytes.NewReader([]byte(tt.yaml)))
+			_, err := cfg.NewConfig(bytes.NewReader(tt.yaml))
 			if err != nil {
 				if tt.err == nil {
 					t.Fatalf("unexpected error: %s", err)

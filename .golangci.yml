@@ -3,25 +3,21 @@ version: "2"
 linters:
   default: all
   disable:
-    - fatcontext
-    - interfacebloat
-    - unconvert
-    - perfsprint
-    - unparam
-    - nilerr
     - containedctx
-    - errname
-    - promlinter
-    - predeclared
-    - thelper
-    - nestif
-    - ireturn
-    - testpackage
     - embeddedstructfieldcheck
+    - fatcontext
     - funcorder
     - godoclint
+    - interfacebloat
+    - ireturn
+    - nestif
+    - nilerr
     - noinlineerr
-    - revive
+    - perfsprint
+    - promlinter
+    - testpackage
+    - thelper
+    - unparam
     - wsl_v5
 
     - cyclop    # revive
@@ -53,36 +49,22 @@ linters:
     depguard:
       rules:
         yaml:
-          files:
-            - '!**/live_bouncer.go'
-            - '!**/stream_bouncer.go'
           deny:
             - pkg: gopkg.in/yaml.v2
               desc: yaml.v2 is deprecated for new code in favor of yaml.v3
 
     errcheck:
-      # Report about not checking of errors in type assertions: `a := b.(MyStruct)`.
-      # Such cases aren't reported by default.
       check-type-assertions: false
-      # List of functions to exclude from checking, where each entry is a single function to exclude.
-      # See https://github.com/kisielk/errcheck#excluding-functions for details.
 
     gocritic:
       enable-all: true
       disabled-checks:
-        - builtinShadowDecl
-        - captLocal
         - commentFormatting
         - emptyStringTest
         - hugeParam
-        - rangeValCopy
         - paramTypeCombine
+        - rangeValCopy
         - wrapperFunc
-
-    gomoddirectives:
-      replace-allow-list:
-        - golang.org/x/time/rate
-        - github.com/corazawaf/coraza/v3
 
     govet:
       disable:
@@ -128,7 +110,7 @@ linters:
           disabled: true
         - name: empty-lines
           disabled: true
-        - name: error-naming
+        - name: enforce-switch-style
           disabled: true
         - name: flag-parameter
           disabled: true
@@ -149,19 +131,13 @@ linters:
           arguments:
             # lower this after refactoring
             - 240
-        - name: redefines-builtin-id
-          disabled: true
         - name: max-public-structs
           disabled: true
-#        - name: package-comments
-#          disabled: true
-        - name: var-naming
-          disabled: true
-        - name: unexported-naming
+        - name: package-directory-mismatch
           disabled: true
         - name: unused-parameter
           disabled: true
-        - name: use-errors-new
+        - name: var-naming
           disabled: true
 
     staticcheck:
@@ -170,10 +146,6 @@ linters:
         - -QF1004
         - -ST1003
         - -ST1012
-
-    wsl:
-      # Allow blocks to end with comments
-      allow-trailing-comment: true
 
   exclusions:
     presets:
