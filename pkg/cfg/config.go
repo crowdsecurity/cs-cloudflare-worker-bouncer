@@ -135,7 +135,6 @@ type BouncerConfig struct {
 	CloudflareConfig CloudflareConfig `yaml:"cloudflare_config"`
 	CrowdSecConfig   CrowdSecConfig   `yaml:"crowdsec_config"`
 	Daemon           bool             `yaml:"daemon"`
-	AutonomousMode   bool             `yaml:"autonomous_mode"`
 	Logging          LoggingConfig    `yaml:",inline"`
 	PrometheusConfig PrometheusConfig `yaml:"prometheus"`
 }
@@ -254,9 +253,6 @@ func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[
 	}
 	if strings.Contains(l, "cron:") {
 		return `Cron schedule for syncing decisions (e.g., "*/5 * * * *" for every 5 minutes)`
-	}
-	if strings.Contains(l, "autonomous_mode:") {
-		return `Enable autonomous mode: decisions-sync-worker handles decision syncing instead of Go daemon`
 	}
 	return ""
 }

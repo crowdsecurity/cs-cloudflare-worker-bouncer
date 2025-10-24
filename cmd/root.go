@@ -219,7 +219,7 @@ func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConf
 	return cfManagers, nil
 }
 
-func Execute(configTokens *string, configOutputPath *string, configPath *string, ver *bool, testConfig *bool, showConfig *bool, deleteOnly *bool, setupOnly *bool) error {
+func Execute(configTokens *string, configOutputPath *string, configPath *string, ver *bool, testConfig *bool, showConfig *bool, deleteOnly *bool, setupOnly *bool, setupAutonomous *bool) error {
 	if ver != nil && *ver {
 		fmt.Print(version.FullString())
 		return nil
@@ -256,7 +256,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return nil
 	}
 
-	// Initialize CrowdSec LAPI connection (needed for metrics even in autonomous mode)
+	// Initialize CrowdSec LAPI connection (needed for metrics)
 	csLAPI := &csbouncer.StreamBouncer{
 		APIKey:         conf.CrowdSecConfig.CrowdSecLAPIKey,
 		APIUrl:         conf.CrowdSecConfig.CrowdSecLAPIUrl,
@@ -305,9 +305,9 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 			}
 			log.Infof("Successfully deployed infra for account %s", manager.AccountCfg.Name)
 
-			// Deploy decisions sync worker if autonomous mode is enabled
-			if conf.AutonomousMode {
-				log.Infof("Autonomous mode enabled, deploying decisions sync worker for account %s", manager.AccountCfg.Name)
+			// Deploy decisions sync worker if autonomous setup (-S flag)
+			if setupAutonomous != nil && *setupAutonomous {
+				log.Infof("Autonomous setup mode, deploying decisions sync worker for account %s", manager.AccountCfg.Name)
 				if err := manager.DeployDecisionsSyncWorker(conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker.Cron); err != nil {
 					return fmt.Errorf("unable to deploy decisions sync worker: %w for account %s", err, manager.AccountCfg.Name)
 				}
@@ -323,7 +323,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return nil
 	}
 	log.Info("Successfully deployed infra for all accounts")
-	if setupOnly != nil && *setupOnly {
+	if (setupOnly != nil && *setupOnly) || (setupAutonomous != nil && *setupAutonomous) {
 		return nil
 	}
 
@@ -382,15 +382,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		})
 	}
 
-	// In autonomous mode, skip CrowdSec LAPI decision processing
-	// The decisions-sync-worker will handle syncing decisions to KV
-	if conf.AutonomousMode {
-		log.Info("Autonomous mode enabled. Decision syncing is handled by the decisions-sync-worker.")
-		log.Info("Go daemon running: Turnstile rotation + Metrics reporting to CrowdSec")
-		return g.Wait()
-	}
-
-	// Non-autonomous mode: process decisions from CrowdSec LAPI
+	// Process decisions from CrowdSec LAPI
 	g.Go(func() error {
 		csLAPI.Run(ctx)
 		return fmt.Errorf("crowdsec bouncer stopped")
