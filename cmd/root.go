@@ -256,6 +256,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return nil
 	}
 
+	// Initialize CrowdSec LAPI connection (needed for metrics even in autonomous mode)
 	csLAPI := &csbouncer.StreamBouncer{
 		APIKey:         conf.CrowdSecConfig.CrowdSecLAPIKey,
 		APIUrl:         conf.CrowdSecConfig.CrowdSecLAPIUrl,
@@ -303,6 +304,15 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 				return fmt.Errorf("unable to deploy infra: %w for account %s", err, manager.AccountCfg.Name)
 			}
 			log.Infof("Successfully deployed infra for account %s", manager.AccountCfg.Name)
+
+			// Deploy decisions sync worker if autonomous mode is enabled
+			if conf.AutonomousMode {
+				log.Infof("Autonomous mode enabled, deploying decisions sync worker for account %s", manager.AccountCfg.Name)
+				if err := manager.DeployDecisionsSyncWorker(conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker.Cron); err != nil {
+					return fmt.Errorf("unable to deploy decisions sync worker: %w for account %s", err, manager.AccountCfg.Name)
+				}
+			}
+
 			return nil
 		})
 	}
@@ -336,15 +346,11 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return HandleSignals(ctx)
 	})
 
-	g.Go(func() error {
-		csLAPI.Run(ctx)
-		return fmt.Errorf("crowdsec bouncer stopped")
-	})
-
 	mHandler := metricsHandler{
 		cfManagers: cfManagers,
 	}
 
+	// Always initialize metrics provider (needed for sending metrics to CrowdSec)
 	metricsProvider, err := csbouncer.NewMetricsProvider(csLAPI.APIClient, name, mHandler.metricsUpdater, log.StandardLogger())
 	if err != nil {
 		return fmt.Errorf("unable to create metrics provider: %w", err)
@@ -357,11 +363,38 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, metrics.CloudflareAPICallsByAccount, metrics.TotalKeysByAccount,
 		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests)
 	if conf.PrometheusConfig.Enabled {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
+		server := &http.Server{
+			Addr:    net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort),
+			Handler: mux,
+		}
 		g.Go(func() error {
-			http.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
-			return http.ListenAndServe(net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort), nil)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				return err
+			}
+			return nil
+		})
+		g.Go(func() error {
+			<-ctx.Done()
+			log.Info("Shutting down Prometheus HTTP server")
+			return server.Shutdown(context.Background())
 		})
 	}
+
+	// In autonomous mode, skip CrowdSec LAPI decision processing
+	// The decisions-sync-worker will handle syncing decisions to KV
+	if conf.AutonomousMode {
+		log.Info("Autonomous mode enabled. Decision syncing is handled by the decisions-sync-worker.")
+		log.Info("Go daemon running: Turnstile rotation + Metrics reporting to CrowdSec")
+		return g.Wait()
+	}
+
+	// Non-autonomous mode: process decisions from CrowdSec LAPI
+	g.Go(func() error {
+		csLAPI.Run(ctx)
+		return fmt.Errorf("crowdsec bouncer stopped")
+	})
 
 	for {
 		select {

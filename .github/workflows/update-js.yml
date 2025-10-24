@@ -1,9 +1,10 @@
 name: Generate js
 
-on: 
+on:
   push:
     paths:
       - 'pkg/cloudflare/worker/**'
+      - 'pkg/cloudflare/decisions-sync-worker/**'
       - '.github/workflows/update-js.yml'
 jobs:
   build:
@@ -21,7 +22,7 @@ jobs:
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git commit -m "Update dist js" pkg/cloudflare/worker/dist/main.js || exit 0
+        git commit -m "Update dist js" pkg/cloudflare/worker/dist/main.js pkg/cloudflare/decisions-sync-worker/dist/main.js || exit 0
 #token to expire on 09/19/2024
     - name: Push changes
       if: ${{ github.event_name == 'push'}}

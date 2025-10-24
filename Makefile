@@ -60,7 +60,10 @@ binary: goversion
 
 .PHONY: build-worker-js
 build-worker-js:
+	@echo "Building bouncer worker..."
 	@cd pkg/cloudflare/worker && npm install && npm run build
+	@echo "Building decisions-sync-worker..."
+	@cd pkg/cloudflare/decisions-sync-worker && npm install && npm run build
 
 .PHONY: build-all
 build-all: clean build-worker-js binary

@@ -49,14 +49,15 @@ type AccountConfig struct {
 // YAML struct derived from cloudflare.CreateWorkerParams
 // https://github.com/cloudflare/cloudflare-go/blob/056b65c6e956a7119d0d89b27a659ea63b1c0506/workers.go#L24
 type CloudflareWorkerCreateParams struct {
-	ScriptName         string   `yaml:"script_name"`
-	Logpush            *bool    `yaml:"logpush"`
-	Tags               []string `yaml:"tags"`
-	CompatibilityDate  string   `yaml:"compatibility_date"`
-	CompatibilityFlags []string `yaml:"compatibility_flags"`
-	LogOnly            bool     `yaml:"log_only"`
-	KVNameSpaceName    string   `yaml:"-"` // Currently hardcoded string in worker code but may allow customization in future
-	D1DBName           string   `yaml:"-"` // Hardcoded, internal implementation detail for metrics support
+	ScriptName              string   `yaml:"script_name"`
+	Logpush                 *bool    `yaml:"logpush"`
+	Tags                    []string `yaml:"tags"`
+	CompatibilityDate       string   `yaml:"compatibility_date"`
+	CompatibilityFlags      []string `yaml:"compatibility_flags"`
+	LogOnly                 bool     `yaml:"log_only"`
+	KVNameSpaceName         string   `yaml:"-"` // Currently hardcoded string in worker code but may allow customization in future
+	D1DBName                string   `yaml:"-"` // Hardcoded, internal implementation detail for metrics support
+	DecisionsSyncScriptName string   `yaml:"-"` // Hardcoded, internal implementation detail for autonomous mode
 }
 
 func (w *CloudflareWorkerCreateParams) setDefaults() {
@@ -68,6 +69,9 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 	}
 	if w.D1DBName == "" {
 		w.D1DBName = "CROWDSECCFBOUNCERDB"
+	}
+	if w.DecisionsSyncScriptName == "" {
+		w.DecisionsSyncScriptName = "crowdsec-decisions-sync-worker"
 	}
 }
 
@@ -99,9 +103,14 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, I
 	}
 }
 
+type DecisionsSyncWorkerConfig struct {
+	Cron string `yaml:"cron"` // Cron schedule for autonomous decisions sync (e.g., "*/5 * * * *" for every 5 minutes)
+}
+
 type CloudflareConfig struct {
-	Worker   CloudflareWorkerCreateParams `yaml:"worker"`
-	Accounts []AccountConfig              `yaml:"accounts"`
+	Worker               CloudflareWorkerCreateParams `yaml:"worker"`
+	DecisionsSyncWorker  DecisionsSyncWorkerConfig    `yaml:"decisions_sync_worker,omitempty"`
+	Accounts             []AccountConfig              `yaml:"accounts"`
 }
 
 type CrowdSecConfig struct {
@@ -126,6 +135,7 @@ type BouncerConfig struct {
 	CloudflareConfig CloudflareConfig `yaml:"cloudflare_config"`
 	CrowdSecConfig   CrowdSecConfig   `yaml:"crowdsec_config"`
 	Daemon           bool             `yaml:"daemon"`
+	AutonomousMode   bool             `yaml:"autonomous_mode"`
 	Logging          LoggingConfig    `yaml:",inline"`
 	PrometheusConfig PrometheusConfig `yaml:"prometheus"`
 }
@@ -239,6 +249,15 @@ func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[
 	if strings.Contains(l, "turnstile:") {
 		return `Turnstile must be enabled if captcha action is used.`
 	}
+	if strings.Contains(l, "decisions_sync_worker:") {
+		return `Configuration for autonomous decisions sync worker`
+	}
+	if strings.Contains(l, "cron:") {
+		return `Cron schedule for syncing decisions (e.g., "*/5 * * * *" for every 5 minutes)`
+	}
+	if strings.Contains(l, "autonomous_mode:") {
+		return `Enable autonomous mode: decisions-sync-worker handles decision syncing instead of Go daemon`
+	}
 	return ""
 }
 
@@ -328,8 +347,12 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 			})
 		}
 	}
-	cfConfig := CloudflareConfig{Accounts: accountConfigs}
-	baseConfig.CloudflareConfig = cfConfig
+	// Preserve Worker and DecisionsSyncWorker config, only update Accounts
+	baseConfig.CloudflareConfig.Accounts = accountConfigs
+	// Set default cron schedule if not already set
+	if baseConfig.CloudflareConfig.DecisionsSyncWorker.Cron == "" {
+		baseConfig.CloudflareConfig.DecisionsSyncWorker.Cron = "*/5 * * * *"
+	}
 	data, err := yaml.Marshal(baseConfig)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal config: %w", err)
@@ -371,4 +394,6 @@ func setDefaults(cfg *BouncerConfig) {
 		ListenAddress: "127.0.0.1",
 		ListenPort:    "2112",
 	}
+	cfg.CloudflareConfig.Worker.setDefaults()
+	cfg.CloudflareConfig.DecisionsSyncWorker.Cron = "*/5 * * * *" // Default: every 5 minutes
 }

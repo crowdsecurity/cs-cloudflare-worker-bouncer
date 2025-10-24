@@ -25,6 +25,9 @@ import (
 //go:embed worker/dist/main.js
 var workerScript string
 
+//go:embed decisions-sync-worker/dist/main.js
+var decisionsSyncWorkerScript string
+
 //go:embed metrics.sql
 var sqlCreateTableStatement string
 
@@ -53,6 +56,7 @@ type cloudflareAPI interface {
 	RotateTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, param cf.RotateTurnstileWidgetParams) (cf.TurnstileWidget, error)
 	SetWorkersSecret(ctx context.Context, rc *cf.ResourceContainer, params cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error)
 	UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
+	UpdateWorkerCronTriggers(ctx context.Context, rc *cf.ResourceContainer, params cf.UpdateWorkerCronTriggersParams) ([]cf.WorkerCronTrigger, error)
 	WriteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.WriteWorkersKVEntriesParams) (cf.Response, error)
 	CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error)
 	DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error
@@ -255,6 +259,77 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	return zg.Wait()
 }
 
+// DeployDecisionsSyncWorker deploys the autonomous decisions sync worker.
+// This worker runs on a cron schedule and syncs decisions from CrowdSec LAPI to Cloudflare KV.
+func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.CrowdSecConfig, cronSchedule string) error {
+	m.logger.Infof("Deploying decisions sync worker %s with cron schedule: %s", m.Worker.DecisionsSyncScriptName, cronSchedule)
+
+	// Build scenario filters
+	includeScenarios := strings.Join(crowdSecConfig.IncludeScenariosContaining, ",")
+	excludeScenarios := strings.Join(crowdSecConfig.ExcludeScenariosContaining, ",")
+	origins := strings.Join(crowdSecConfig.OnlyIncludeDecisionsFrom, ",")
+
+	// Create bindings for the sync worker
+	bindings := map[string]cf.WorkerBinding{
+		m.Worker.KVNameSpaceName: cf.WorkerKvNamespaceBinding{NamespaceID: m.NamespaceID},
+		"LAPI_URL": cf.WorkerPlainTextBinding{
+			Text: crowdSecConfig.CrowdSecLAPIUrl,
+		},
+		"LAPI_KEY": cf.WorkerSecretTextBinding{
+			Text: crowdSecConfig.CrowdSecLAPIKey,
+		},
+	}
+
+	// Only add filter bindings if they have values (Cloudflare doesn't allow empty text bindings)
+	if includeScenarios != "" {
+		bindings["INCLUDE_SCENARIOS"] = cf.WorkerPlainTextBinding{
+			Text: includeScenarios,
+		}
+	}
+	if excludeScenarios != "" {
+		bindings["EXCLUDE_SCENARIOS"] = cf.WorkerPlainTextBinding{
+			Text: excludeScenarios,
+		}
+	}
+	if origins != "" {
+		bindings["ONLY_INCLUDE_ORIGINS"] = cf.WorkerPlainTextBinding{
+			Text: origins,
+		}
+	}
+
+	// Upload the decisions sync worker
+	workerParams := cf.CreateWorkerParams{
+		Script:             decisionsSyncWorkerScript,
+		ScriptName:         m.Worker.DecisionsSyncScriptName,
+		Bindings:           bindings,
+		Module:             true,
+		Logpush:            m.Worker.Logpush,
+		Tags:               m.Worker.Tags,
+		CompatibilityDate:  m.Worker.CompatibilityDate,
+		CompatibilityFlags: m.Worker.CompatibilityFlags,
+	}
+
+	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), workerParams)
+	if err != nil {
+		return fmt.Errorf("failed to upload decisions sync worker: %w", err)
+	}
+	m.logger.Tracef("Decisions sync worker: %+v", worker)
+
+	// Deploy cron trigger for the decisions sync worker
+	m.logger.Infof("Deploying cron trigger for decisions sync worker: %s", cronSchedule)
+	cronTriggers, err := m.api.UpdateWorkerCronTriggers(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.UpdateWorkerCronTriggersParams{
+		ScriptName: m.Worker.DecisionsSyncScriptName,
+		Crons:      []cf.WorkerCronTrigger{{Cron: cronSchedule}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to deploy cron trigger for decisions sync worker: %w", err)
+	}
+	m.logger.Tracef("Cron triggers: %+v", cronTriggers)
+	m.logger.Infof("Successfully deployed decisions sync worker %s with cron: %s", m.Worker.DecisionsSyncScriptName, cronSchedule)
+
+	return nil
+}
+
 func (m *CloudflareAccountManager) updateMetrics() {
 	totalKVPairs := 1 // one for ActionsByDomain KV pair
 	for _, zone := range m.AccountCfg.ZoneConfigs {
@@ -332,6 +407,22 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 		m.logger.Debugf("Didn't find worker script %s", m.Worker.ScriptName)
 	} else {
 		m.logger.Debugf("Deleted worker script %s", m.Worker.ScriptName)
+	}
+
+	// Clean up decisions sync worker if it exists
+	m.logger.Debugf("Attempting to delete decisions sync worker script %s", m.Worker.DecisionsSyncScriptName)
+	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
+		ScriptName: m.Worker.DecisionsSyncScriptName,
+	})
+	if err != nil {
+		m.logger.Debugf("Received error while deleting decisions sync worker script %s: %s (type: %s)", m.Worker.DecisionsSyncScriptName, err, fmt.Sprintf("%T", err))
+		var notFoundErr *cf.NotFoundError
+		if !errors.As(err, &notFoundErr) {
+			return err
+		}
+		m.logger.Debugf("Didn't find decisions sync worker script %s", m.Worker.DecisionsSyncScriptName)
+	} else {
+		m.logger.Debugf("Deleted decisions sync worker script %s", m.Worker.DecisionsSyncScriptName)
 	}
 
 	m.logger.Debugf("Listing worker KV Namespaces")
