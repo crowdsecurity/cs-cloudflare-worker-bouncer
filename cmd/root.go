@@ -283,36 +283,50 @@ func startPrometheusServer(g *errgroup.Group, ctx context.Context, conf *cfg.Bou
 	g.Go(func() error {
 		<-ctx.Done()
 		log.Info("Shutting down Prometheus HTTP server")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Use a fresh context for shutdown since ctx is already cancelled
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
 	})
 }
 
-func Execute(configTokens *string, configOutputPath *string, configPath *string, ver *bool, testConfig *bool, showConfig *bool, deleteOnly *bool, setupOnly *bool, setupAutonomous *bool) error {
-	if ver != nil && *ver {
+// ExecuteOptions holds configuration options for the Execute function.
+type ExecuteOptions struct {
+	ConfigTokens     *string
+	ConfigOutputPath *string
+	ConfigPath       *string
+	Ver              *bool
+	TestConfig       *bool
+	ShowConfig       *bool
+	DeleteOnly       *bool
+	SetupOnly        *bool
+	SetupAutonomous  *bool
+}
+
+func Execute(opts ExecuteOptions) error {
+	if opts.Ver != nil && *opts.Ver {
 		fmt.Fprint(os.Stdout, version.FullString())
 		return nil
 	}
 
-	if configPath == nil || *configPath == "" {
-		configPath = new(string)
-		*configPath = DEFAULT_CONFIG_PATH
+	if opts.ConfigPath == nil || *opts.ConfigPath == "" {
+		opts.ConfigPath = new(string)
+		*opts.ConfigPath = DEFAULT_CONFIG_PATH
 	}
 
-	if configTokens != nil && *configTokens != "" {
+	if opts.ConfigTokens != nil && *opts.ConfigTokens != "" {
 		outputPath := ""
-		if configOutputPath != nil {
-			outputPath = *configOutputPath
+		if opts.ConfigOutputPath != nil {
+			outputPath = *opts.ConfigOutputPath
 		}
-		return handleConfigTokens(*configTokens, outputPath, *configPath)
+		return handleConfigTokens(*opts.ConfigTokens, outputPath, *opts.ConfigPath)
 	}
 
-	conf, err := getConfigFromPath(*configPath)
+	conf, err := getConfigFromPath(*opts.ConfigPath)
 	if err != nil {
 		return err
 	}
-	if showConfig != nil && *showConfig {
+	if opts.ShowConfig != nil && *opts.ShowConfig {
 		fmt.Fprintf(os.Stdout, "%+v", conf)
 		return nil
 	}
@@ -333,13 +347,13 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		CAPath:   conf.CrowdSecConfig.CAPath,
 	}
 
-	if (testConfig != nil && *testConfig) || (setupOnly == nil || !*setupOnly) || (deleteOnly == nil || !*deleteOnly) {
+	if (opts.TestConfig != nil && *opts.TestConfig) || (opts.SetupOnly == nil || !*opts.SetupOnly) || (opts.DeleteOnly == nil || !*opts.DeleteOnly) {
 		if err := csLAPI.Init(); err != nil {
 			return fmt.Errorf("unable to initialize crowdsec bouncer: %w", err)
 		}
 	}
 
-	if testConfig != nil && *testConfig {
+	if opts.TestConfig != nil && *opts.TestConfig {
 		log.Info("config is valid")
 		return nil
 	}
@@ -351,17 +365,17 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return err
 	}
 
-	isDeleteOnly := deleteOnly != nil && *deleteOnly
-	isSetupAutonomous := setupAutonomous != nil && *setupAutonomous
+	isDeleteOnly := opts.DeleteOnly != nil && *opts.DeleteOnly
+	isSetupAutonomous := opts.SetupAutonomous != nil && *opts.SetupAutonomous
 	deployInfraForManagers(g, cfManagers, isDeleteOnly, isSetupAutonomous, conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker.Cron)
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	if deleteOnly != nil && *deleteOnly {
+	if opts.DeleteOnly != nil && *opts.DeleteOnly {
 		return nil
 	}
 	log.Info("Successfully deployed infra for all accounts")
-	if (setupOnly != nil && *setupOnly) || (setupAutonomous != nil && *setupAutonomous) {
+	if (opts.SetupOnly != nil && *opts.SetupOnly) || (opts.SetupAutonomous != nil && *opts.SetupAutonomous) {
 		return nil
 	}
 

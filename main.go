@@ -19,7 +19,17 @@ func main() {
 	setupOnly := flag.Bool("s", false, "setup the infra and exit")
 	setupAutonomous := flag.Bool("S", false, "setup the infra in autonomous mode (with decisions-sync-worker) and exit")
 	flag.Parse()
-	err := cmd.Execute(configTokens, configOutputPath, configPath, ver, testConfig, showConfig, deleteOnly, setupOnly, setupAutonomous)
+	err := cmd.Execute(cmd.ExecuteOptions{
+		ConfigTokens:     configTokens,
+		ConfigOutputPath: configOutputPath,
+		ConfigPath:       configPath,
+		Ver:              ver,
+		TestConfig:       testConfig,
+		ShowConfig:       showConfig,
+		DeleteOnly:       deleteOnly,
+		SetupOnly:        setupOnly,
+		SetupAutonomous:  setupAutonomous,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
