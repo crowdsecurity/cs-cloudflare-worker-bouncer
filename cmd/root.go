@@ -283,7 +283,7 @@ func startPrometheusServer(g *errgroup.Group, ctx context.Context, conf *cfg.Bou
 	g.Go(func() error {
 		<-ctx.Done()
 		log.Info("Shutting down Prometheus HTTP server")
-		// Use a fresh context for shutdown since ctx is already cancelled
+		// Use a fresh context for shutdown since ctx is already canceled
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
