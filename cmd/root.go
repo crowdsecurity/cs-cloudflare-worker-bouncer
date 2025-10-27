@@ -174,9 +174,9 @@ func HandleSignals(ctx context.Context) error {
 	case s := <-signalChan:
 		switch s {
 		case syscall.SIGTERM:
-			return fmt.Errorf("received SIGTERM")
+			return errors.New("received SIGTERM")
 		case syscall.SIGINT:
-			return fmt.Errorf("received SIGINT")
+			return errors.New("received SIGINT")
 		}
 	case <-ctx.Done():
 		return ctx.Err()
@@ -209,8 +209,7 @@ func getConfigFromPath(configPath string) (*cfg.BouncerConfig, error) {
 func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConfig) ([]*cf.CloudflareAccountManager, error) {
 	cfManagers := make([]*cf.CloudflareAccountManager, 0, len(config.Accounts))
 	for _, accountCfg := range config.Accounts {
-		cfg := accountCfg
-		manager, err := cf.NewCloudflareManager(ctx, cfg, &config.Worker)
+		manager, err := cf.NewCloudflareManager(ctx, accountCfg, &config.Worker)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create cloudflare manager: %w", err)
 		}
@@ -221,7 +220,7 @@ func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConf
 
 func Execute(configTokens *string, configOutputPath *string, configPath *string, ver *bool, testConfig *bool, showConfig *bool, deleteOnly *bool, setupOnly *bool, setupAutonomous *bool) error {
 	if ver != nil && *ver {
-		fmt.Print(version.FullString())
+		fmt.Fprint(os.Stdout, version.FullString())
 		return nil
 	}
 
@@ -236,13 +235,13 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 			return err
 		}
 		if configOutputPath != nil && *configOutputPath != "" {
-			err := os.WriteFile(*configOutputPath, []byte(cfgTokenString), 0664)
+			err := os.WriteFile(*configOutputPath, []byte(cfgTokenString), 0o664)
 			if err != nil {
 				return err
 			}
 			log.Printf("Config successfully generated in %s", *configOutputPath)
 		} else {
-			fmt.Print(cfgTokenString)
+			fmt.Fprint(os.Stdout, cfgTokenString)
 		}
 		return nil
 	}
@@ -252,11 +251,10 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		return err
 	}
 	if showConfig != nil && *showConfig {
-		fmt.Printf("%+v", conf)
+		fmt.Fprintf(os.Stdout, "%+v", conf)
 		return nil
 	}
 
-	// Initialize CrowdSec LAPI connection (needed for metrics)
 	csLAPI := &csbouncer.StreamBouncer{
 		APIKey:         conf.CrowdSecConfig.CrowdSecLAPIKey,
 		APIUrl:         conf.CrowdSecConfig.CrowdSecLAPIUrl,
@@ -350,7 +348,6 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		cfManagers: cfManagers,
 	}
 
-	// Always initialize metrics provider (needed for sending metrics to CrowdSec)
 	metricsProvider, err := csbouncer.NewMetricsProvider(csLAPI.APIClient, name, mHandler.metricsUpdater, log.StandardLogger())
 	if err != nil {
 		return fmt.Errorf("unable to create metrics provider: %w", err)
@@ -395,7 +392,7 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 			return ctx.Err()
 		case streamDecision := <-csLAPI.Stream:
 			if streamDecision == nil {
-				return fmt.Errorf("stream decision is nil")
+				return errors.New("stream decision is nil")
 			}
 			streamDecision.Deleted = normalizeDecisions(streamDecision.Deleted)
 			streamDecision.New = normalizeDecisions(streamDecision.New)

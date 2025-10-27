@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -48,7 +49,7 @@ func runInfraTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 			}
 		}
 		if !foundRoute {
-			return fmt.Errorf("route not found")
+			return errors.New("route not found")
 		}
 	}
 
@@ -113,7 +114,7 @@ func runInfraTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 	}
 
 	if !foundKVNamespace {
-		return fmt.Errorf("kv namespace not found")
+		return errors.New("kv namespace not found")
 	}
 
 	return nil
@@ -131,7 +132,7 @@ func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 		ScriptName: m.Worker.ScriptName,
 	})
 	if err == nil || !strings.Contains(err.Error(), "workers.api.error.script_not_found") {
-		return fmt.Errorf("worker should not exist")
+		return errors.New("worker should not exist")
 	}
 
 	widgets, _, err := api.ListTurnstileWidgets(m.Ctx, cloudflare.AccountIdentifier(m.AccountCfg.ID), cloudflare.ListTurnstileWidgetParams{})
@@ -140,7 +141,7 @@ func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 	}
 	for _, widget := range widgets {
 		if widget.Name == cf.WidgetName {
-			return fmt.Errorf("widget should not exist")
+			return errors.New("widget should not exist")
 		}
 	}
 
@@ -151,7 +152,7 @@ func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 		}
 		for _, route := range routeResp.Routes {
 			if route.ScriptName == m.Worker.ScriptName {
-				return fmt.Errorf("route should not exist")
+				return errors.New("route should not exist")
 			}
 		}
 	}
@@ -163,7 +164,7 @@ func runCleanUpTest(t *testing.T, m *cf.CloudflareAccountManager) error {
 
 	for _, kvNamespace := range kvNamespaces {
 		if kvNamespace.Title == m.Worker.KVNameSpaceName {
-			return fmt.Errorf("kv namespace should not exist")
+			return errors.New("kv namespace should not exist")
 		}
 	}
 	return nil
@@ -255,9 +256,6 @@ func runDecisionTests(t *testing.T, m *cf.CloudflareAccountManager, newDecisions
 		}
 	}
 
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -271,7 +269,7 @@ func TestBouncer(t *testing.T) {
 		RedactionList:  []string{"password", "email", "zone", "account_name", "owner_name", "account", "id", "secret", "token"},
 	}
 	logrus.AddHook(rh)
-	var cloudflareToken string = os.Getenv("CLOUDFLARE_TOKEN")
+	var cloudflareToken = os.Getenv("CLOUDFLARE_TOKEN")
 	if cloudflareToken == "" {
 		t.Fatal("CLOUDFLARE_TOKEN not set")
 	}
@@ -297,7 +295,6 @@ func TestBouncer(t *testing.T) {
 	t.Cleanup(func() {
 		eg := errgroup.Group{}
 		for _, zone := range zonesToDelete {
-			zone := zone
 			eg.Go(func() error {
 				_, err := api.DeleteZone(context.Background(), zone)
 				return err

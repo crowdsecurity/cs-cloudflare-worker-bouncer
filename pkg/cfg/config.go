@@ -2,6 +2,7 @@ package cfg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,14 +11,14 @@ import (
 
 	"github.com/cloudflare/cloudflare-go"
 	"github.com/crowdsecurity/go-cs-lib/csstring"
-	"github.com/crowdsecurity/go-cs-lib/yamlpatch"
+	"github.com/crowdsecurity/go-cs-lib/csyaml"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
 var (
 	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
-	EmptyConfigError          = fmt.Errorf("empty config")
+	ErrEmptyConfig            = errors.New("empty config")
 )
 
 type TurnstileConfig struct {
@@ -75,9 +76,9 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 	}
 }
 
-func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, ID string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
+func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, id string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
 	bindings := map[string]cloudflare.WorkerBinding{
-		w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: ID},
+		w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: id},
 		VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
 			Text: string(varActionsForZoneByDomain),
 		},
@@ -140,7 +141,7 @@ type BouncerConfig struct {
 }
 
 func MergedConfig(configPath string) ([]byte, error) {
-	patcher := yamlpatch.NewPatcher(configPath, ".local")
+	patcher := csyaml.NewPatcher(configPath, ".local")
 	data, err := patcher.MergedPatchContent()
 	if err != nil {
 		return nil, err
@@ -160,7 +161,7 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 	configBuff := csstring.StrictExpand(string(content), os.LookupEnv)
 
 	if len(configBuff) == 0 {
-		return nil, EmptyConfigError
+		return nil, ErrEmptyConfig
 	}
 
 	err = yaml.Unmarshal([]byte(configBuff), &config)
