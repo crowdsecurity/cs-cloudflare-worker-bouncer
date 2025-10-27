@@ -348,11 +348,7 @@ func (m *CloudflareAccountManager) updateMetrics() {
 	metrics.TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
 }
 
-// This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
-// It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
-func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
-	m.logger.Infof("Cleaning up existing workers")
-
+func (m *CloudflareAccountManager) cleanupTurnstileWidgets() error {
 	m.logger.Debug("Listing existing turnstile widgets")
 	widgets, _, err := m.api.ListTurnstileWidgets(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListTurnstileWidgetParams{})
 	if err != nil {
@@ -371,7 +367,10 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 		}
 	}
 	m.logger.Debug("Done cleaning up existing turnstile widgets")
+	return nil
+}
 
+func (m *CloudflareAccountManager) cleanupWorkerRoutes() error {
 	for _, zone := range m.AccountCfg.ZoneConfigs {
 		zoneLogger := m.logger.WithFields(log.Fields{"zone": zone.Domain})
 		zoneLogger.Debugf("Listing worker routes")
@@ -393,9 +392,12 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 			}
 		}
 	}
+	return nil
+}
 
+func (m *CloudflareAccountManager) cleanupWorkerScripts() error {
 	m.logger.Debugf("Attempting to delete worker script %s", m.Worker.ScriptName)
-	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
+	err := m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
 		ScriptName: m.Worker.ScriptName,
 	})
 	if err != nil {
@@ -424,7 +426,10 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 	} else {
 		m.logger.Debugf("Deleted decisions sync worker script %s", m.Worker.DecisionsSyncScriptName)
 	}
+	return nil
+}
 
+func (m *CloudflareAccountManager) cleanupKVNamespaces() error {
 	m.logger.Debugf("Listing worker KV Namespaces")
 	kvNamespaces, _, err := m.api.ListWorkersKVNamespaces(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListWorkersKVNamespacesParams{})
 	if err != nil {
@@ -443,31 +448,63 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 			m.logger.Debugf("Done deleting worker KV Namespace with ID %s", kvNamespace.ID)
 		}
 	}
+	return nil
+}
 
-	if m.hasD1Access || start {
-		m.logger.Debugf("Listing D1 DBs")
-		dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
+func (m *CloudflareAccountManager) cleanupD1Databases(start bool) error {
+	if !m.hasD1Access && !start {
+		return nil
+	}
 
-		if err != nil {
-			if !start {
-				return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
-			}
-			dbs = []cf.D1Database{}
+	m.logger.Debugf("Listing D1 DBs")
+	dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
+
+	if err != nil {
+		if !start {
+			return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
 		}
+		dbs = []cf.D1Database{}
+	}
 
-		m.logger.Tracef("dbs: %+v", dbs)
+	m.logger.Tracef("dbs: %+v", dbs)
 
-		for _, db := range dbs {
-			m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
-			if db.Name == m.Worker.D1DBName {
-				m.logger.Debugf("Deleting D1 DB %s", db.UUID)
-				err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
-				if err != nil {
-					return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
-				}
-				m.logger.Debugf("Deleted D1 DB %s", db.UUID)
+	for _, db := range dbs {
+		m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
+		if db.Name == m.Worker.D1DBName {
+			m.logger.Debugf("Deleting D1 DB %s", db.UUID)
+			err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
+			if err != nil {
+				return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
 			}
+			m.logger.Debugf("Deleted D1 DB %s", db.UUID)
 		}
+	}
+	return nil
+}
+
+// This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
+// It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
+func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
+	m.logger.Infof("Cleaning up existing workers")
+
+	if err := m.cleanupTurnstileWidgets(); err != nil {
+		return err
+	}
+
+	if err := m.cleanupWorkerRoutes(); err != nil {
+		return err
+	}
+
+	if err := m.cleanupWorkerScripts(); err != nil {
+		return err
+	}
+
+	if err := m.cleanupKVNamespaces(); err != nil {
+		return err
+	}
+
+	if err := m.cleanupD1Databases(start); err != nil {
+		return err
 	}
 
 	m.logger.Info("Done cleaning up existing workers")

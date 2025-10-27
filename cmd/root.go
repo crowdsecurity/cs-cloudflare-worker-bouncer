@@ -218,6 +218,77 @@ func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConf
 	return cfManagers, nil
 }
 
+func handleConfigTokens(configTokens, configOutputPath, configPath string) error {
+	cfgTokenString, err := cfg.ConfigTokens(configTokens, configPath)
+	if err != nil {
+		return err
+	}
+	if configOutputPath != "" {
+		err := os.WriteFile(configOutputPath, []byte(cfgTokenString), 0o664)
+		if err != nil {
+			return err
+		}
+		log.Printf("Config successfully generated in %s", configOutputPath)
+	} else {
+		fmt.Fprint(os.Stdout, cfgTokenString)
+	}
+	return nil
+}
+
+func deployInfraForManagers(g *errgroup.Group, cfManagers []*cf.CloudflareAccountManager, deleteOnly, setupAutonomous bool, crowdSecConfig cfg.CrowdSecConfig, cronSchedule string) {
+	for _, cfManager := range cfManagers {
+		manager := cfManager
+		g.Go(func() error {
+			err := manager.CleanUpExistingWorkers(true)
+			if err != nil {
+				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.Name)
+			}
+			if deleteOnly {
+				return nil
+			}
+			if err := manager.DeployInfra(); err != nil {
+				return fmt.Errorf("unable to deploy infra: %w for account %s", err, manager.AccountCfg.Name)
+			}
+			log.Infof("Successfully deployed infra for account %s", manager.AccountCfg.Name)
+
+			// Deploy decisions sync worker if autonomous setup (-S flag)
+			if setupAutonomous {
+				log.Infof("Autonomous setup mode, deploying decisions sync worker for account %s", manager.AccountCfg.Name)
+				if err := manager.DeployDecisionsSyncWorker(crowdSecConfig, cronSchedule); err != nil {
+					return fmt.Errorf("unable to deploy decisions sync worker: %w for account %s", err, manager.AccountCfg.Name)
+				}
+			}
+
+			return nil
+		})
+	}
+}
+
+func startPrometheusServer(g *errgroup.Group, ctx context.Context, conf *cfg.BouncerConfig, mHandler *metricsHandler) {
+	if !conf.PrometheusConfig.Enabled {
+		return
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
+	server := &http.Server{
+		Addr:    net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort),
+		Handler: mux,
+	}
+	g.Go(func() error {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	})
+	g.Go(func() error {
+		<-ctx.Done()
+		log.Info("Shutting down Prometheus HTTP server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return server.Shutdown(shutdownCtx)
+	})
+}
+
 func Execute(configTokens *string, configOutputPath *string, configPath *string, ver *bool, testConfig *bool, showConfig *bool, deleteOnly *bool, setupOnly *bool, setupAutonomous *bool) error {
 	if ver != nil && *ver {
 		fmt.Fprint(os.Stdout, version.FullString())
@@ -230,20 +301,11 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	}
 
 	if configTokens != nil && *configTokens != "" {
-		cfgTokenString, err := cfg.ConfigTokens(*configTokens, *configPath)
-		if err != nil {
-			return err
+		outputPath := ""
+		if configOutputPath != nil {
+			outputPath = *configOutputPath
 		}
-		if configOutputPath != nil && *configOutputPath != "" {
-			err := os.WriteFile(*configOutputPath, []byte(cfgTokenString), 0o664)
-			if err != nil {
-				return err
-			}
-			log.Printf("Config successfully generated in %s", *configOutputPath)
-		} else {
-			fmt.Fprint(os.Stdout, cfgTokenString)
-		}
-		return nil
+		return handleConfigTokens(*configTokens, outputPath, *configPath)
 	}
 
 	conf, err := getConfigFromPath(*configPath)
@@ -288,32 +350,10 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	if err != nil {
 		return err
 	}
-	for _, cfManager := range cfManagers {
-		manager := cfManager
-		g.Go(func() error {
-			err := manager.CleanUpExistingWorkers(true)
-			if err != nil {
-				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.Name)
-			}
-			if deleteOnly != nil && *deleteOnly {
-				return nil
-			}
-			if err := manager.DeployInfra(); err != nil {
-				return fmt.Errorf("unable to deploy infra: %w for account %s", err, manager.AccountCfg.Name)
-			}
-			log.Infof("Successfully deployed infra for account %s", manager.AccountCfg.Name)
 
-			// Deploy decisions sync worker if autonomous setup (-S flag)
-			if setupAutonomous != nil && *setupAutonomous {
-				log.Infof("Autonomous setup mode, deploying decisions sync worker for account %s", manager.AccountCfg.Name)
-				if err := manager.DeployDecisionsSyncWorker(conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker.Cron); err != nil {
-					return fmt.Errorf("unable to deploy decisions sync worker: %w for account %s", err, manager.AccountCfg.Name)
-				}
-			}
-
-			return nil
-		})
-	}
+	isDeleteOnly := deleteOnly != nil && *deleteOnly
+	isSetupAutonomous := setupAutonomous != nil && *setupAutonomous
+	deployInfraForManagers(g, cfManagers, isDeleteOnly, isSetupAutonomous, conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker.Cron)
 	if err := g.Wait(); err != nil {
 		return err
 	}
@@ -359,30 +399,14 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 
 	prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, metrics.CloudflareAPICallsByAccount, metrics.TotalKeysByAccount,
 		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests)
-	if conf.PrometheusConfig.Enabled {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
-		server := &http.Server{
-			Addr:    net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort),
-			Handler: mux,
-		}
-		g.Go(func() error {
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				return err
-			}
-			return nil
-		})
-		g.Go(func() error {
-			<-ctx.Done()
-			log.Info("Shutting down Prometheus HTTP server")
-			return server.Shutdown(context.Background())
-		})
-	}
+	startPrometheusServer(g, ctx, conf, &mHandler)
 
 	// Process decisions from CrowdSec LAPI
 	g.Go(func() error {
-		csLAPI.Run(ctx)
-		return fmt.Errorf("crowdsec bouncer stopped")
+		if err := csLAPI.Run(ctx); err != nil {
+			return fmt.Errorf("crowdsec bouncer error: %w", err)
+		}
+		return errors.New("crowdsec bouncer stopped")
 	})
 
 	for {
