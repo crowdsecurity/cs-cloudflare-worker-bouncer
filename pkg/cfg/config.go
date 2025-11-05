@@ -109,9 +109,10 @@ type DecisionsSyncWorkerConfig struct {
 }
 
 type CloudflareConfig struct {
-	Worker               CloudflareWorkerCreateParams `yaml:"worker"`
-	DecisionsSyncWorker  DecisionsSyncWorkerConfig    `yaml:"decisions_sync_worker,omitempty"`
-	Accounts             []AccountConfig              `yaml:"accounts"`
+	Worker                       CloudflareWorkerCreateParams `yaml:"worker"`
+	DecisionsSyncWorker          DecisionsSyncWorkerConfig    `yaml:"decisions_sync_worker,omitempty"`
+	IgnoreBindingErrorsOnDeploy  bool                         `yaml:"ignore_binding_errors_on_deploy"`
+	Accounts                     []AccountConfig              `yaml:"accounts"`
 }
 
 type CrowdSecConfig struct {
@@ -254,6 +255,9 @@ func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[
 	}
 	if strings.Contains(l, "cron:") {
 		return `Cron schedule for syncing decisions (e.g., "*/5 * * * *" for every 5 minutes)`
+	}
+	if strings.Contains(l, "ignore_binding_errors_on_deploy:") {
+		return `If true, worker route binding errors during deployment will only log warnings instead of failing`
 	}
 	return ""
 }

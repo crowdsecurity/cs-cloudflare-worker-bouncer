@@ -65,25 +65,26 @@ type cloudflareAPI interface {
 }
 
 type CloudflareAccountManager struct {
-	AccountCfg            cfg.AccountConfig
-	api                   cloudflareAPI
-	Ctx                   context.Context
-	logger                *log.Entry
-	hasIPRangeKV          bool
-	NamespaceID           string
-	DatabaseID            string
-	KVPairByDecisionValue map[string]cf.WorkersKVPair
-	ipRangeKVPair         cf.WorkersKVPair
-	ActionByIPRange       map[string]string
-	Worker                *cfg.CloudflareWorkerCreateParams
-	hasD1Access           bool
+	AccountCfg                  cfg.AccountConfig
+	api                         cloudflareAPI
+	Ctx                         context.Context
+	logger                      *log.Entry
+	hasIPRangeKV                bool
+	NamespaceID                 string
+	DatabaseID                  string
+	KVPairByDecisionValue       map[string]cf.WorkersKVPair
+	ipRangeKVPair               cf.WorkersKVPair
+	ActionByIPRange             map[string]string
+	Worker                      *cfg.CloudflareWorkerCreateParams
+	hasD1Access                 bool
+	ignoreBindingErrorsOnDeploy bool
 }
 
 // This function creates a new instance of the CloudflareAccountManager struct,
 // which is used to manage Cloudflare resources associated with a specific account.
 // It initializes the struct with the account configuration, Cloudflare API client,
 // and other necessary fields.
-func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, worker *cfg.CloudflareWorkerCreateParams) (*CloudflareAccountManager, error) {
+func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, worker *cfg.CloudflareWorkerCreateParams, ignoreBindingErrorsOnDeploy bool) (*CloudflareAccountManager, error) {
 	api, err := NewCloudflareAPI(accountCfg)
 	if err != nil {
 		return nil, err
@@ -106,13 +107,14 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, wor
 		}
 	}
 	return &CloudflareAccountManager{
-		AccountCfg:      accountCfg,
-		api:             api,
-		Ctx:             ctx,
-		logger:          log.WithFields(log.Fields{"account": accountCfg.Name}),
-		ipRangeKVPair:   cf.WorkersKVPair{Key: IpRangeKeyName, Value: "{}"},
-		ActionByIPRange: make(map[string]string),
-		Worker:          worker,
+		AccountCfg:                  accountCfg,
+		api:                         api,
+		Ctx:                         ctx,
+		logger:                      log.WithFields(log.Fields{"account": accountCfg.Name}),
+		ipRangeKVPair:               cf.WorkersKVPair{Key: IpRangeKeyName, Value: "{}"},
+		ActionByIPRange:             make(map[string]string),
+		Worker:                      worker,
+		ignoreBindingErrorsOnDeploy: ignoreBindingErrorsOnDeploy,
 	}, nil
 }
 
@@ -248,6 +250,10 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 					Script:  worker.ID,
 				})
 				if err != nil {
+					if m.ignoreBindingErrorsOnDeploy {
+						zoneLogger.Warnf("Failed to bind worker to route %s: %s (continuing due to ignore_binding_errors_on_deploy)", route, err)
+						return nil
+					}
 					return err
 				}
 				zoneLogger.Tracef("WorkerRouteResp: %+v", workerRouteResp)
