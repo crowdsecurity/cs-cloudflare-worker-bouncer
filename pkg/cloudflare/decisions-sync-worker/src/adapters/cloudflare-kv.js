@@ -1,20 +1,35 @@
 /**
  * Cloudflare KV Adapter
  * Handles batch read/write/delete operations for Cloudflare KV store
+ * Uses Cloudflare REST API bulk endpoints to minimize operation count
  */
 
 import logger from '../utils/logger.js';
 
-const BATCH_SIZE = 10000; // Cloudflare KV limit for batch operations
+const BATCH_SIZE = 10000; // Cloudflare KV limit for bulk operations
 const IP_RANGES_KEY = 'IP_RANGES';
 
 /**
- * Write decisions to KV in batches
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * Build headers for Cloudflare API requests
+ * @param {string} apiToken - Cloudflare API token
+ * @returns {Object} Headers object
+ */
+function buildApiHeaders(apiToken) {
+	return {
+		'Authorization': `Bearer ${apiToken}`,
+		'Content-Type': 'application/json',
+	};
+}
+
+/**
+ * Write decisions to KV using bulk API
+ * @param {string} accountId - Cloudflare account ID
+ * @param {string} namespaceId - KV namespace ID
+ * @param {string} apiToken - Cloudflare API token
  * @param {import('../types.js').KVEntry[]} entries - Entries to write
  * @returns {Promise<number>} Number of entries written
  */
-export async function batchWriteStringBasedDecisions(kvNamespace, entries) {
+export async function batchWriteStringBasedDecisions(accountId, namespaceId, apiToken, entries) {
 	if (!entries || entries.length === 0) {
 		logger.debug('No entries to write to KV');
 		return 0;
@@ -22,36 +37,50 @@ export async function batchWriteStringBasedDecisions(kvNamespace, entries) {
 
 	let written = 0;
 
-	// Process in batches of BATCH_SIZE
+	logger.debug(`Writing ${entries.length} entries to KV using bulk API`);
+
+	// Process in batches of BATCH_SIZE (10,000 max per bulk request)
 	for (let i = 0; i < entries.length; i += BATCH_SIZE) {
 		const batch = entries.slice(i, i + BATCH_SIZE);
 		const batchNum = Math.floor(i / BATCH_SIZE) + 1;
 		const totalBatches = Math.ceil(entries.length / BATCH_SIZE);
 
-		logger.debug(`Writing batch ${batchNum}/${totalBatches}`, {
+		logger.debug(`Writing bulk batch ${batchNum}/${totalBatches}`, {
 			batchSize: batch.length,
 			totalEntries: entries.length,
 		});
 
-		// Write each entry in the batch
-		const promises = batch.map((entry) => kvNamespace.put(entry.key, entry.value));
+		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk`;
 
-		await Promise.all(promises);
+		const response = await fetch(url, {
+			method: 'PUT',
+			headers: buildApiHeaders(apiToken),
+			body: JSON.stringify(batch),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`Bulk write failed (batch ${batchNum}): ${response.status} ${errorText}`);
+		}
+
 		written += batch.length;
-
-		logger.debug(`Batch ${batchNum}/${totalBatches} written successfully`);
+		logger.debug(`Bulk batch ${batchNum}/${totalBatches} written successfully`);
 	}
+
+	logger.debug(`Wrote ${written} entries to KV successfully`);
 
 	return written;
 }
 
 /**
- * Delete decisions from KV in batches
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * Delete decisions from KV using bulk API
+ * @param {string} accountId - Cloudflare account ID
+ * @param {string} namespaceId - KV namespace ID
+ * @param {string} apiToken - Cloudflare API token
  * @param {string[]} keys - Keys to delete
  * @returns {Promise<number>} Number of entries deleted
  */
-export async function batchDeleteStringBasedDecisions(kvNamespace, keys) {
+export async function batchDeleteStringBasedDecisions(accountId, namespaceId, apiToken, keys) {
 	if (!keys || keys.length === 0) {
 		logger.debug('No keys to delete from KV');
 		return 0;
@@ -59,25 +88,37 @@ export async function batchDeleteStringBasedDecisions(kvNamespace, keys) {
 
 	let deleted = 0;
 
-	// Process in batches of BATCH_SIZE
+	logger.debug(`Deleting ${keys.length} keys from KV using bulk API`);
+
+	// Process in batches of BATCH_SIZE (10,000 max per bulk request)
 	for (let i = 0; i < keys.length; i += BATCH_SIZE) {
 		const batch = keys.slice(i, i + BATCH_SIZE);
 		const batchNum = Math.floor(i / BATCH_SIZE) + 1;
 		const totalBatches = Math.ceil(keys.length / BATCH_SIZE);
 
-		logger.debug(`Deleting batch ${batchNum}/${totalBatches}`, {
+		logger.debug(`Deleting bulk batch ${batchNum}/${totalBatches}`, {
 			batchSize: batch.length,
 			totalKeys: keys.length,
 		});
 
-		// Delete each key in the batch
-		const promises = batch.map((key) => kvNamespace.delete(key));
+		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk`;
 
-		await Promise.all(promises);
+		const response = await fetch(url, {
+			method: 'DELETE',
+			headers: buildApiHeaders(apiToken),
+			body: JSON.stringify(batch),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`Bulk delete failed (batch ${batchNum}): ${response.status} ${errorText}`);
+		}
+
 		deleted += batch.length;
-
-		logger.debug(`Batch ${batchNum}/${totalBatches} deleted successfully`);
+		logger.debug(`Bulk batch ${batchNum}/${totalBatches} deleted successfully`);
 	}
+
+	logger.debug(`Deleted ${deleted} keys from KV successfully`);
 
 	return deleted;
 }
@@ -116,33 +157,57 @@ export async function writeIpRanges(kvNamespace, ranges) {
 }
 
 /**
- * Get multiple keys from KV (for checking existing decisions)
- * Note: KV doesn't have a native batch get, so we do individual gets in parallel
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * Get multiple keys from KV using bulk API
+ * @param {string} accountId - Cloudflare account ID
+ * @param {string} namespaceId - KV namespace ID
+ * @param {string} apiToken - Cloudflare API token
  * @param {string[]} keys - Keys to fetch
  * @returns {Promise<Map<string, string>>} Map of key -> value for existing entries
  */
-export async function batchGetStringBasedDecisions(kvNamespace, keys) {
+export async function batchGetStringBasedDecisions(accountId, namespaceId, apiToken, keys) {
 	if (!keys || keys.length === 0) {
 		return new Map();
 	}
 
-	logger.debug(`Fetching ${keys.length} keys (ip, as or country) from KV`);
+	logger.debug(`Fetching ${keys.length} keys (ip, as or country) from KV using bulk API`);
 
-	// Fetch all keys in parallel
-	const promises = keys.map(async (key) => {
-		const value = await kvNamespace.get(key);
-		return { key, value };
-	});
-
-	const results = await Promise.all(promises);
-
-	// Build map of existing entries
 	const existingMap = new Map();
-	for (const { key, value } of results) {
-		if (value !== null) {
-			existingMap.set(key, value);
+
+	// Process in batches of BATCH_SIZE (10,000 max per bulk request)
+	for (let i = 0; i < keys.length; i += BATCH_SIZE) {
+		const batch = keys.slice(i, i + BATCH_SIZE);
+		const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+		const totalBatches = Math.ceil(keys.length / BATCH_SIZE);
+
+		logger.debug(`Fetching bulk batch ${batchNum}/${totalBatches}`, {
+			batchSize: batch.length,
+			totalKeys: keys.length,
+		});
+
+		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values`;
+
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: buildApiHeaders(apiToken),
+			body: JSON.stringify(batch),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`Bulk get failed (batch ${batchNum}): ${response.status} ${errorText}`);
 		}
+
+		const results = await response.json();
+
+		// Build map of existing entries
+		// API returns array of {key, value} objects
+		for (const item of results) {
+			if (item.value !== null) {
+				existingMap.set(item.key, item.value);
+			}
+		}
+
+		logger.debug(`Bulk batch ${batchNum}/${totalBatches} fetched successfully`);
 	}
 
 	logger.debug(`Found ${existingMap.size} existing entries in KV out of ${keys.length} requested`);

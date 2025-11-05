@@ -43,6 +43,21 @@ export default {
 				return;
 			}
 
+			if (!env.CF_ACCOUNT_ID) {
+				logger.error('CF_ACCOUNT_ID environment variable is not set');
+				return;
+			}
+
+			if (!env.CF_KV_NAMESPACE_ID) {
+				logger.error('CF_KV_NAMESPACE_ID environment variable is not set');
+				return;
+			}
+
+			if (!env.CF_API_TOKEN) {
+				logger.error('CF_API_TOKEN secret is not set (required for bulk KV operations)');
+				return;
+			}
+
 			const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
 
 			// Determine if this is the first fetch
@@ -84,38 +99,63 @@ export default {
 
 			// Step 1: Get existing IP_RANGES from KV
 			const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
-			// Step 2: Get all string-based keys (IP, AS, Country) that we need to check
-			const allStringKeys = [
-				...decisions.new
-					.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-					.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-				...decisions.deleted
-					.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-					.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-			];
 
-			// Remove duplicates
-			const uniqueStringKeys = [...new Set(allStringKeys)];
+			// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
+			let existingStringDecisions = new Map();
 
-			// Step 3: Fetch existing string decisions from KV (batch)
-			const existingStringDecisions = await batchGetStringBasedDecisions(env.CROWDSECCFBOUNCERNS, uniqueStringKeys);
-			// Step 4: Process new decisions
+			if (!isFirst) {
+				// On incremental updates, check existing values to avoid redundant writes
+				logger.debug('Incremental update: checking existing decisions in KV');
+				const allStringKeys = [
+					...decisions.new
+						.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+						.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+					...decisions.deleted
+						.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+						.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+				];
+
+				// Remove duplicates
+				const uniqueStringKeys = [...new Set(allStringKeys)];
+
+				// Fetch existing string decisions from KV using bulk API
+				existingStringDecisions = await batchGetStringBasedDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					uniqueStringKeys
+				);
+			} else {
+				logger.debug('First run: skipping existence check (KV is empty)');
+			}
+
+			// Step 3: Process new decisions
 			const newProcessed = processNewDecisions(decisions.new, existingStringDecisions, existingRanges);
-			// Step 5: Process deleted decisions
+			// Step 4: Process deleted decisions
 			const deletedProcessed = processDeletedDecisions(decisions.deleted, existingStringDecisions, existingRanges);
-			// Step 6: Merge ranges (deletions already applied in step 5, now adding new ranges)
+			// Step 5: Merge ranges (deletions already applied in step 4, now adding new ranges)
 			const finalRanges = mergeRanges(deletedProcessed.updatedRanges, newProcessed.jsonEntries);
-			// Step 7: Write new/updated string decisions (IP, AS, Country) to KV
+			// Step 6: Write new/updated string decisions (IP, AS, Country) to KV using bulk API
 			if (newProcessed.stringEntries.length > 0) {
 				logger.info('Writing string-based decisions to KV...', { count: newProcessed.stringEntries.length });
-				await batchWriteStringBasedDecisions(env.CROWDSECCFBOUNCERNS, newProcessed.stringEntries);
+				await batchWriteStringBasedDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					newProcessed.stringEntries
+				);
 			}
-			// Step 8: Delete string decisions from KV
+			// Step 7: Delete string decisions from KV using bulk API
 			if (deletedProcessed.stringKeysToDelete.length > 0) {
 				logger.info('Deleting string decisions from KV...', { count: deletedProcessed.stringKeysToDelete.length });
-				await batchDeleteStringBasedDecisions(env.CROWDSECCFBOUNCERNS, deletedProcessed.stringKeysToDelete);
+				await batchDeleteStringBasedDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					deletedProcessed.stringKeysToDelete
+				);
 			}
-			// Step 9: Update IP_RANGES if changed
+			// Step 8: Update IP_RANGES if changed
 			if (hasRangesChanged(existingRanges, finalRanges)) {
 				logger.info('IP_RANGES changed, updating KV...');
 				await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);

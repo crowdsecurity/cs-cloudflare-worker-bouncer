@@ -284,6 +284,16 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 		"LAPI_KEY": cf.WorkerSecretTextBinding{
 			Text: crowdSecConfig.CrowdSecLAPIKey,
 		},
+		// Cloudflare API credentials for bulk KV operations
+		"CF_ACCOUNT_ID": cf.WorkerPlainTextBinding{
+			Text: m.AccountCfg.ID,
+		},
+		"CF_KV_NAMESPACE_ID": cf.WorkerPlainTextBinding{
+			Text: m.NamespaceID,
+		},
+		"CF_API_TOKEN": cf.WorkerSecretTextBinding{
+			Text: m.AccountCfg.Token,
+		},
 	}
 
 	// Only add filter bindings if they have values (Cloudflare doesn't allow empty text bindings)

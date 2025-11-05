@@ -6027,20 +6027,35 @@ function hasRangesChanged(oldRanges, newRanges) {
 /**
  * Cloudflare KV Adapter
  * Handles batch read/write/delete operations for Cloudflare KV store
+ * Uses Cloudflare REST API bulk endpoints to minimize operation count
  */
 
 
 
-const BATCH_SIZE = 10000; // Cloudflare KV limit for batch operations
+const BATCH_SIZE = 10000; // Cloudflare KV limit for bulk operations
 const IP_RANGES_KEY = 'IP_RANGES';
 
 /**
- * Write decisions to KV in batches
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * Build headers for Cloudflare API requests
+ * @param {string} apiToken - Cloudflare API token
+ * @returns {Object} Headers object
+ */
+function buildApiHeaders(apiToken) {
+	return {
+		'Authorization': `Bearer ${apiToken}`,
+		'Content-Type': 'application/json',
+	};
+}
+
+/**
+ * Write decisions to KV using bulk API
+ * @param {string} accountId - Cloudflare account ID
+ * @param {string} namespaceId - KV namespace ID
+ * @param {string} apiToken - Cloudflare API token
  * @param {import('../types.js').KVEntry[]} entries - Entries to write
  * @returns {Promise<number>} Number of entries written
  */
-async function batchWriteStringBasedDecisions(kvNamespace, entries) {
+async function batchWriteStringBasedDecisions(accountId, namespaceId, apiToken, entries) {
 	if (!entries || entries.length === 0) {
 		logger.debug('No entries to write to KV');
 		return 0;
@@ -6048,36 +6063,50 @@ async function batchWriteStringBasedDecisions(kvNamespace, entries) {
 
 	let written = 0;
 
-	// Process in batches of BATCH_SIZE
+	logger.debug(`Writing ${entries.length} entries to KV using bulk API`);
+
+	// Process in batches of BATCH_SIZE (10,000 max per bulk request)
 	for (let i = 0; i < entries.length; i += BATCH_SIZE) {
 		const batch = entries.slice(i, i + BATCH_SIZE);
 		const batchNum = Math.floor(i / BATCH_SIZE) + 1;
 		const totalBatches = Math.ceil(entries.length / BATCH_SIZE);
 
-		logger.debug(`Writing batch ${batchNum}/${totalBatches}`, {
+		logger.debug(`Writing bulk batch ${batchNum}/${totalBatches}`, {
 			batchSize: batch.length,
 			totalEntries: entries.length,
 		});
 
-		// Write each entry in the batch
-		const promises = batch.map((entry) => kvNamespace.put(entry.key, entry.value));
+		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk`;
 
-		await Promise.all(promises);
+		const response = await fetch(url, {
+			method: 'PUT',
+			headers: buildApiHeaders(apiToken),
+			body: JSON.stringify(batch),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`Bulk write failed (batch ${batchNum}): ${response.status} ${errorText}`);
+		}
+
 		written += batch.length;
-
-		logger.debug(`Batch ${batchNum}/${totalBatches} written successfully`);
+		logger.debug(`Bulk batch ${batchNum}/${totalBatches} written successfully`);
 	}
+
+	logger.debug(`Wrote ${written} entries to KV successfully`);
 
 	return written;
 }
 
 /**
- * Delete decisions from KV in batches
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * Delete decisions from KV using bulk API
+ * @param {string} accountId - Cloudflare account ID
+ * @param {string} namespaceId - KV namespace ID
+ * @param {string} apiToken - Cloudflare API token
  * @param {string[]} keys - Keys to delete
  * @returns {Promise<number>} Number of entries deleted
  */
-async function batchDeleteStringBasedDecisions(kvNamespace, keys) {
+async function batchDeleteStringBasedDecisions(accountId, namespaceId, apiToken, keys) {
 	if (!keys || keys.length === 0) {
 		logger.debug('No keys to delete from KV');
 		return 0;
@@ -6085,25 +6114,37 @@ async function batchDeleteStringBasedDecisions(kvNamespace, keys) {
 
 	let deleted = 0;
 
-	// Process in batches of BATCH_SIZE
+	logger.debug(`Deleting ${keys.length} keys from KV using bulk API`);
+
+	// Process in batches of BATCH_SIZE (10,000 max per bulk request)
 	for (let i = 0; i < keys.length; i += BATCH_SIZE) {
 		const batch = keys.slice(i, i + BATCH_SIZE);
 		const batchNum = Math.floor(i / BATCH_SIZE) + 1;
 		const totalBatches = Math.ceil(keys.length / BATCH_SIZE);
 
-		logger.debug(`Deleting batch ${batchNum}/${totalBatches}`, {
+		logger.debug(`Deleting bulk batch ${batchNum}/${totalBatches}`, {
 			batchSize: batch.length,
 			totalKeys: keys.length,
 		});
 
-		// Delete each key in the batch
-		const promises = batch.map((key) => kvNamespace.delete(key));
+		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk`;
 
-		await Promise.all(promises);
+		const response = await fetch(url, {
+			method: 'DELETE',
+			headers: buildApiHeaders(apiToken),
+			body: JSON.stringify(batch),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`Bulk delete failed (batch ${batchNum}): ${response.status} ${errorText}`);
+		}
+
 		deleted += batch.length;
-
-		logger.debug(`Batch ${batchNum}/${totalBatches} deleted successfully`);
+		logger.debug(`Bulk batch ${batchNum}/${totalBatches} deleted successfully`);
 	}
+
+	logger.debug(`Deleted ${deleted} keys from KV successfully`);
 
 	return deleted;
 }
@@ -6142,33 +6183,57 @@ async function writeIpRanges(kvNamespace, ranges) {
 }
 
 /**
- * Get multiple keys from KV (for checking existing decisions)
- * Note: KV doesn't have a native batch get, so we do individual gets in parallel
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * Get multiple keys from KV using bulk API
+ * @param {string} accountId - Cloudflare account ID
+ * @param {string} namespaceId - KV namespace ID
+ * @param {string} apiToken - Cloudflare API token
  * @param {string[]} keys - Keys to fetch
  * @returns {Promise<Map<string, string>>} Map of key -> value for existing entries
  */
-async function batchGetStringBasedDecisions(kvNamespace, keys) {
+async function batchGetStringBasedDecisions(accountId, namespaceId, apiToken, keys) {
 	if (!keys || keys.length === 0) {
 		return new Map();
 	}
 
-	logger.debug(`Fetching ${keys.length} keys (ip, as or country) from KV`);
+	logger.debug(`Fetching ${keys.length} keys (ip, as or country) from KV using bulk API`);
 
-	// Fetch all keys in parallel
-	const promises = keys.map(async (key) => {
-		const value = await kvNamespace.get(key);
-		return { key, value };
-	});
-
-	const results = await Promise.all(promises);
-
-	// Build map of existing entries
 	const existingMap = new Map();
-	for (const { key, value } of results) {
-		if (value !== null) {
-			existingMap.set(key, value);
+
+	// Process in batches of BATCH_SIZE (10,000 max per bulk request)
+	for (let i = 0; i < keys.length; i += BATCH_SIZE) {
+		const batch = keys.slice(i, i + BATCH_SIZE);
+		const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+		const totalBatches = Math.ceil(keys.length / BATCH_SIZE);
+
+		logger.debug(`Fetching bulk batch ${batchNum}/${totalBatches}`, {
+			batchSize: batch.length,
+			totalKeys: keys.length,
+		});
+
+		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values`;
+
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: buildApiHeaders(apiToken),
+			body: JSON.stringify(batch),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`Bulk get failed (batch ${batchNum}): ${response.status} ${errorText}`);
 		}
+
+		const results = await response.json();
+
+		// Build map of existing entries
+		// API returns array of {key, value} objects
+		for (const item of results) {
+			if (item.value !== null) {
+				existingMap.set(item.key, item.value);
+			}
+		}
+
+		logger.debug(`Bulk batch ${batchNum}/${totalBatches} fetched successfully`);
 	}
 
 	logger.debug(`Found ${existingMap.size} existing entries in KV out of ${keys.length} requested`);
@@ -6216,6 +6281,21 @@ async function batchGetStringBasedDecisions(kvNamespace, keys) {
 				return;
 			}
 
+			if (!env.CF_ACCOUNT_ID) {
+				logger.error('CF_ACCOUNT_ID environment variable is not set');
+				return;
+			}
+
+			if (!env.CF_KV_NAMESPACE_ID) {
+				logger.error('CF_KV_NAMESPACE_ID environment variable is not set');
+				return;
+			}
+
+			if (!env.CF_API_TOKEN) {
+				logger.error('CF_API_TOKEN secret is not set (required for bulk KV operations)');
+				return;
+			}
+
 			const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
 
 			// Determine if this is the first fetch
@@ -6257,38 +6337,63 @@ async function batchGetStringBasedDecisions(kvNamespace, keys) {
 
 			// Step 1: Get existing IP_RANGES from KV
 			const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
-			// Step 2: Get all string-based keys (IP, AS, Country) that we need to check
-			const allStringKeys = [
-				...decisions.new
-					.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-					.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-				...decisions.deleted
-					.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-					.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-			];
 
-			// Remove duplicates
-			const uniqueStringKeys = [...new Set(allStringKeys)];
+			// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
+			let existingStringDecisions = new Map();
 
-			// Step 3: Fetch existing string decisions from KV (batch)
-			const existingStringDecisions = await batchGetStringBasedDecisions(env.CROWDSECCFBOUNCERNS, uniqueStringKeys);
-			// Step 4: Process new decisions
+			if (!isFirst) {
+				// On incremental updates, check existing values to avoid redundant writes
+				logger.debug('Incremental update: checking existing decisions in KV');
+				const allStringKeys = [
+					...decisions.new
+						.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+						.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+					...decisions.deleted
+						.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+						.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+				];
+
+				// Remove duplicates
+				const uniqueStringKeys = [...new Set(allStringKeys)];
+
+				// Fetch existing string decisions from KV using bulk API
+				existingStringDecisions = await batchGetStringBasedDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					uniqueStringKeys
+				);
+			} else {
+				logger.debug('First run: skipping existence check (KV is empty)');
+			}
+
+			// Step 3: Process new decisions
 			const newProcessed = processNewDecisions(decisions.new, existingStringDecisions, existingRanges);
-			// Step 5: Process deleted decisions
+			// Step 4: Process deleted decisions
 			const deletedProcessed = processDeletedDecisions(decisions.deleted, existingStringDecisions, existingRanges);
-			// Step 6: Merge ranges (deletions already applied in step 5, now adding new ranges)
+			// Step 5: Merge ranges (deletions already applied in step 4, now adding new ranges)
 			const finalRanges = mergeRanges(deletedProcessed.updatedRanges, newProcessed.jsonEntries);
-			// Step 7: Write new/updated string decisions (IP, AS, Country) to KV
+			// Step 6: Write new/updated string decisions (IP, AS, Country) to KV using bulk API
 			if (newProcessed.stringEntries.length > 0) {
 				logger.info('Writing string-based decisions to KV...', { count: newProcessed.stringEntries.length });
-				await batchWriteStringBasedDecisions(env.CROWDSECCFBOUNCERNS, newProcessed.stringEntries);
+				await batchWriteStringBasedDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					newProcessed.stringEntries
+				);
 			}
-			// Step 8: Delete string decisions from KV
+			// Step 7: Delete string decisions from KV using bulk API
 			if (deletedProcessed.stringKeysToDelete.length > 0) {
 				logger.info('Deleting string decisions from KV...', { count: deletedProcessed.stringKeysToDelete.length });
-				await batchDeleteStringBasedDecisions(env.CROWDSECCFBOUNCERNS, deletedProcessed.stringKeysToDelete);
+				await batchDeleteStringBasedDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					deletedProcessed.stringKeysToDelete
+				);
 			}
-			// Step 9: Update IP_RANGES if changed
+			// Step 8: Update IP_RANGES if changed
 			if (hasRangesChanged(existingRanges, finalRanges)) {
 				logger.info('IP_RANGES changed, updating KV...');
 				await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
