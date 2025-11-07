@@ -12,6 +12,8 @@ import {
 	getIpRanges,
 	writeIpRanges,
 	batchGetStringBasedDecisions,
+	shouldReset,
+	resetAllDecisions,
 } from './adapters/cloudflare-kv.js';
 
 export default {
@@ -60,6 +62,19 @@ export default {
 
 			const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
 
+			// Check if reset is requested
+			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
+			if (resetRequested) {
+				logger.info('RESET requested: clearing all decision keys from KV...');
+				await resetAllDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					env.CROWDSECCFBOUNCERNS
+				);
+				logger.info('KV reset completed, proceeding with fresh decision sync');
+			}
+
 			// Determine if this is the first fetch
 			const isFirst = await isFirstFetch(env.CROWDSECCFBOUNCERNS);
 			logger.info('Fetch type determined', { isFirstFetch: isFirst });
@@ -76,12 +91,6 @@ export default {
 				scenariosNotContaining,
 				origins,
 			});
-
-			// Mark cache as warmed after first successful fetch
-			if (isFirst) {
-				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-				logger.info('Cache marked as warmed after first fetch');
-			}
 
 			// Log summary
 			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -160,6 +169,12 @@ export default {
 				logger.info('IP_RANGES changed, updating KV...');
 				await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
 			}
+
+            // Step 9: Mark cache as warmed after first successful fetch
+            if (isFirst) {
+                await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+                logger.info('Cache marked as warmed after first fetch');
+            }
 
 			// Final summary
 			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);

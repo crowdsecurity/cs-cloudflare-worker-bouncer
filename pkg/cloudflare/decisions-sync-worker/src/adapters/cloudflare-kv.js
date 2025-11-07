@@ -8,6 +8,9 @@ import logger from '../utils/logger.js';
 
 const BATCH_SIZE = 10000; // Cloudflare KV limit for bulk operations
 const IP_RANGES_KEY = 'IP_RANGES';
+const RESET_KEY = 'RESET';
+// Keys to preserve during reset
+const PRESERVED_KEYS = ['BAN_TEMPLATE', 'TURNSTILE_CONFIG'];
 
 /**
  * Build headers for Cloudflare API requests
@@ -213,4 +216,94 @@ export async function batchGetStringBasedDecisions(accountId, namespaceId, apiTo
 	logger.debug(`Found ${existingMap.size} existing entries in KV out of ${keys.length} requested`);
 
 	return existingMap;
+}
+
+/**
+ * Check if reset is requested
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * @returns {Promise<boolean>} True if RESET key exists and is set to 'true'
+ */
+export async function shouldReset(kvNamespace) {
+	try {
+		const resetValue = await kvNamespace.get(RESET_KEY);
+		return resetValue === 'true';
+	} catch (error) {
+		logger.error('Failed to check RESET key', { error: error.message });
+		return false;
+	}
+}
+
+/**
+ * List all keys in KV namespace using Cloudflare API
+ * @param {string} accountId - Cloudflare account ID
+ * @param {string} namespaceId - KV namespace ID
+ * @param {string} apiToken - Cloudflare API token
+ * @returns {Promise<string[]>} Array of all key names in the namespace
+ */
+export async function listAllKeys(accountId, namespaceId, apiToken) {
+	const allKeys = [];
+	let cursor = null;
+
+	logger.debug('Listing all keys in KV namespace...');
+
+	do {
+		const url = cursor
+			? `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/keys?cursor=${cursor}`
+			: `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/keys`;
+
+		const response = await fetch(url, {
+			method: 'GET',
+			headers: buildApiHeaders(apiToken),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			throw new Error(`Failed to list KV keys: ${response.status} ${errorText}`);
+		}
+
+		const data = await response.json();
+
+		if (data.result && data.result.length > 0) {
+			allKeys.push(...data.result.map((item) => item.name));
+		}
+
+		cursor = data.result_info?.cursor || null;
+	} while (cursor);
+
+	logger.debug(`Listed ${allKeys.length} total keys in KV namespace`);
+
+	return allKeys;
+}
+
+/**
+ * Reset all decision keys in KV while preserving BAN_TEMPLATE and TURNSTILE_CONFIG
+ * @param {string} accountId - Cloudflare account ID
+ * @param {string} namespaceId - KV namespace ID
+ * @param {string} apiToken - Cloudflare API token
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace (for direct operations)
+ * @returns {Promise<void>}
+ */
+export async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) {
+	logger.info('Starting KV reset: deleting all decision keys...');
+
+	// Step 1: List all keys in KV
+	const allKeys = await listAllKeys(accountId, namespaceId, apiToken);
+
+	// Step 2: Filter keys to delete (all except preserved keys and RESET itself)
+	const keysToDelete = allKeys.filter(
+		(key) => !PRESERVED_KEYS.includes(key) && key !== RESET_KEY
+	);
+
+	logger.info(`Found ${keysToDelete.length} keys to delete (preserving ${PRESERVED_KEYS.join(', ')})`);
+
+	// Step 3: Delete all decision keys using bulk operations
+	if (keysToDelete.length > 0) {
+		await batchDeleteStringBasedDecisions(accountId, namespaceId, apiToken, keysToDelete);
+	}
+
+	// Step 4: Set RESET to false
+	await kvNamespace.put(RESET_KEY, 'false');
+	logger.info('RESET key set to false');
+
+	logger.info('KV reset completed successfully');
 }
