@@ -3,8 +3,8 @@ module github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer
 go 1.25.2
 
 require (
-	github.com/crowdsecurity/crowdsec v1.7.2
-	github.com/crowdsecurity/go-cs-bouncer v0.0.18
+	github.com/crowdsecurity/crowdsec v1.7.3
+	github.com/crowdsecurity/go-cs-bouncer v0.0.19
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/sirupsen/logrus v1.9.3
