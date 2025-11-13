@@ -5824,6 +5824,16 @@ async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 		throw new Error(`LAPI request failed with status ${response.status}: ${errorText}`);
 	}
 
+	// Handle HTTP 204 No Content (LAPI has no decisions - need to delete all from KV)
+	if (response.status === 204) {
+		logger.info('LAPI returned 204 No Content: LAPI has no decisions, will clear KV');
+		return {
+			new: [],
+			deleted: [],
+			deleteAll: true, // Signal to main sync logic to reset KV and exit
+		};
+	}
+
 	const data = await response.json();
 
 	// Validate response structure
@@ -6431,6 +6441,23 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 				newDecisions: decisions.new.length,
 				deletedDecisions: decisions.deleted.length,
 			});
+
+			// Handle HTTP 204 (LAPI has no decisions - delete all from KV)
+			if (decisions.deleteAll) {
+				logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
+				await resetAllDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					env.CROWDSECCFBOUNCERNS
+				);
+                // No need to handle WARMED_UP flag as there is no decisions at all
+				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+				logger.info('KV cleared successfully (LAPI has no decisions)', {
+					totalDuration: `${finalDuration}s`,
+				});
+				return; // Exit early - no further sync needed
+			}
 
 			// ====================
 			// SYNC TO KV STORE

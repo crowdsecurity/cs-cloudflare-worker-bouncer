@@ -151,6 +151,16 @@ export async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 		throw new Error(`LAPI request failed with status ${response.status}: ${errorText}`);
 	}
 
+	// Handle HTTP 204 No Content (LAPI has no decisions - need to delete all from KV)
+	if (response.status === 204) {
+		logger.info('LAPI returned 204 No Content: LAPI has no decisions, will clear KV');
+		return {
+			new: [],
+			deleted: [],
+			deleteAll: true, // Signal to main sync logic to reset KV and exit
+		};
+	}
+
 	const data = await response.json();
 
 	// Validate response structure
