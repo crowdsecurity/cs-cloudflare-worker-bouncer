@@ -6,7 +6,8 @@
 
 import logger from '../utils/logger.js';
 
-const BATCH_SIZE = 10000; // Cloudflare KV limit for bulk operations
+const BATCH_SIZE = 10000; // Cloudflare KV limit for bulk write/delete operations
+const BATCH_SIZE_GET = 100; // Cloudflare KV limit for bulk get operations
 const IP_RANGES_KEY = 'IP_RANGES';
 const RESET_KEY = 'RESET';
 // Keys to preserve during reset
@@ -176,23 +177,23 @@ export async function batchGetStringBasedDecisions(accountId, namespaceId, apiTo
 
 	const existingMap = new Map();
 
-	// Process in batches of BATCH_SIZE (10,000 max per bulk request)
-	for (let i = 0; i < keys.length; i += BATCH_SIZE) {
-		const batch = keys.slice(i, i + BATCH_SIZE);
-		const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-		const totalBatches = Math.ceil(keys.length / BATCH_SIZE);
+	// Process in batches of BATCH_SIZE_GET (100 max per bulk get request)
+	for (let i = 0; i < keys.length; i += BATCH_SIZE_GET) {
+		const batch = keys.slice(i, i + BATCH_SIZE_GET);
+		const batchNum = Math.floor(i / BATCH_SIZE_GET) + 1;
+		const totalBatches = Math.ceil(keys.length / BATCH_SIZE_GET);
 
 		logger.debug(`Fetching bulk batch ${batchNum}/${totalBatches}`, {
 			batchSize: batch.length,
 			totalKeys: keys.length,
 		});
 
-		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values`;
+		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk/get`;
 
 		const response = await fetch(url, {
 			method: 'POST',
 			headers: buildApiHeaders(apiToken),
-			body: JSON.stringify(batch),
+			body: JSON.stringify({ keys: batch }),
 		});
 
 		if (!response.ok) {
@@ -200,13 +201,15 @@ export async function batchGetStringBasedDecisions(accountId, namespaceId, apiTo
 			throw new Error(`Bulk get failed (batch ${batchNum}): ${response.status} ${errorText}`);
 		}
 
-		const results = await response.json();
+		const data = await response.json();
 
 		// Build map of existing entries
-		// API returns array of {key, value} objects
-		for (const item of results) {
-			if (item.value !== null) {
-				existingMap.set(item.key, item.value);
+		// API returns: {success: true, result: {values: {key1: value1, key2: value2}}}
+		if (data.result && data.result.values) {
+			for (const [key, value] of Object.entries(data.result.values)) {
+				if (value !== null) {
+					existingMap.set(key, value);
+				}
 			}
 		}
 
