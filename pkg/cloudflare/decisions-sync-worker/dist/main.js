@@ -5680,17 +5680,17 @@ function error(message, context = {}) {
 
 
 const USER_AGENT = 'cloudflare-worker-bouncer/v1.0.0';
-const WARMUP_KEY = 'WARMUP';
+const WARMED_UP_KEY = 'WARMED_UP';
 const SUPPORTED_SCOPES = ['ip', 'range', 'as', 'country'];
 
 /**
- * Check if this is the first fetch by looking for the WARMUP flag in KV
+ * Check if this is the first fetch by looking for the WARMED_UP flag in KV
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
  * @returns {Promise<boolean>} True if this is the first fetch
  */
 async function isFirstFetch(kvNamespace) {
-	const warmupFlag = await kvNamespace.get(WARMUP_KEY);
-	return !warmupFlag;
+	const warmedUpFlag = await kvNamespace.get(WARMED_UP_KEY);
+	return !warmedUpFlag;
 }
 
 /**
@@ -5698,7 +5698,7 @@ async function isFirstFetch(kvNamespace) {
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
  */
 async function markAsWarmed(kvNamespace) {
-	await kvNamespace.put(WARMUP_KEY, 'true');
+	await kvNamespace.put(WARMED_UP_KEY, 'true');
 	logger.debug('Cache marked as warmed');
 }
 
