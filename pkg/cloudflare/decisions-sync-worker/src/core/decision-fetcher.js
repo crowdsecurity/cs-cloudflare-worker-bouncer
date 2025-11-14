@@ -135,7 +135,7 @@ export async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 	const params = buildQueryParams(options);
 	const fullUrl = `${lapiUrl}/v1/decisions/stream?${params.toString()}`;
 
-	logger.debug('Fetching decisions from LAPI', { url: fullUrl, startup: options.startup });
+	logger.debug('Fetching decisions from LAPI', { url: fullUrl });
 
 	const response = await fetch(fullUrl, {
 		method: 'GET',

@@ -54,6 +54,7 @@ export async function batchWriteStringBasedDecisions(accountId, namespaceId, api
 			totalEntries: entries.length,
 		});
 
+        // See https://developers.cloudflare.com/api/resources/kv/subresources/namespaces/methods/bulk_update/
 		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk`;
 
 		const response = await fetch(url, {
@@ -105,10 +106,11 @@ export async function batchDeleteStringBasedDecisions(accountId, namespaceId, ap
 			totalKeys: keys.length,
 		});
 
-		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk`;
+        // See https://developers.cloudflare.com/api/resources/kv/subresources/namespaces/methods/bulk_delete/
+		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk/delete`;
 
 		const response = await fetch(url, {
-			method: 'DELETE',
+			method: 'POST',
 			headers: buildApiHeaders(apiToken),
 			body: JSON.stringify(batch),
 		});
@@ -187,7 +189,7 @@ export async function batchGetStringBasedDecisions(accountId, namespaceId, apiTo
 			batchSize: batch.length,
 			totalKeys: keys.length,
 		});
-
+        // See https://developers.cloudflare.com/api/resources/kv/subresources/namespaces/methods/bulk_get/
 		const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/bulk/get`;
 
 		const response = await fetch(url, {
@@ -250,6 +252,7 @@ export async function listAllKeys(accountId, namespaceId, apiToken) {
 	logger.debug('Listing all keys in KV namespace...');
 
 	do {
+        // See https://developers.cloudflare.com/api/resources/kv/subresources/namespaces/subresources/keys/methods/list/
 		const url = cursor
 			? `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/keys?cursor=${cursor}`
 			: `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/keys`;
