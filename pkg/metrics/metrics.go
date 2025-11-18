@@ -28,13 +28,13 @@ var TotalBlockedRequests = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: BlockedRequestMetricName,
 	Help: "Total number of blocked requests",
 }, []string{"origin", "ip_type", "remediation", "account"})
-var LastBlockedRequestValue map[string]float64 = make(map[string]float64)
+var LastBlockedRequestValue = make(map[string]float64)
 
 var TotalProcessedRequests = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: ProcessedRequestMetricName,
 	Help: "Total number of processed requests",
 }, []string{"ip_type", "account"})
-var LastProcessedRequestValue map[string]float64 = make(map[string]float64)
+var LastProcessedRequestValue = make(map[string]float64)
 
 var TotalActiveDecisions = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: ActiveDecisionsMetricName,
