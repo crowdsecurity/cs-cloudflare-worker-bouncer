@@ -36,6 +36,7 @@ type ZoneConfig struct {
 	DefaultAction   string          `yaml:"default_action,omitempty"`
 	RoutesToProtect []string        `yaml:"routes_to_protect,omitempty"`
 	Turnstile       TurnstileConfig `yaml:"turnstile,omitempty"`
+	FailOpen        bool            `yaml:"fail_open,omitempty"` // This should probably be per route, but this would break backwards compatibility
 	Domain          string          `yaml:"-"`
 }
 
