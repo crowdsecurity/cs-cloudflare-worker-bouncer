@@ -257,6 +257,10 @@ func deployInfraForManagers(g *errgroup.Group, cfManagers []*cf.CloudflareAccoun
 				if err := manager.DeployDecisionsSyncWorker(crowdSecConfig, cronSchedule); err != nil {
 					return fmt.Errorf("unable to deploy decisions sync worker: %w for account %s", err, manager.AccountCfg.Name)
 				}
+				// Setup Turnstile widgets (without rotation, as there's no long-running process)
+				if _, err := manager.SetupTurnstile(); err != nil {
+					return fmt.Errorf("unable to setup turnstile: %w for account %s", err, manager.AccountCfg.Name)
+				}
 			}
 
 			return nil

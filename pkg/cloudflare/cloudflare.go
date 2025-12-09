@@ -770,18 +770,28 @@ func (m *CloudflareAccountManager) CreateTurnstileWidgets() (map[string]WidgetTo
 	return widgetTokenCfgByDomain, nil
 }
 
-// Creates the turnstile widgets and writes the widget tokens to KV.
-// It runs infinitely, rotating the secret keys every configured interval.
-func (m *CloudflareAccountManager) HandleTurnstile() error {
-	widgetTokenCfgByDomainLock := sync.Mutex{}
-	// Create the tokens
+// SetupTurnstile creates Turnstile widgets and writes the config to KV.
+// This is used during setup (including autonomous mode) and returns immediately.
+func (m *CloudflareAccountManager) SetupTurnstile() (map[string]WidgetTokenCfg, error) {
 	widgetTokenCfgByDomain, err := m.CreateTurnstileWidgets()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := m.writeWidgetCfgToKV(m.Ctx, widgetTokenCfgByDomain); err != nil {
-		return nil
+		return nil, err
+	}
+
+	return widgetTokenCfgByDomain, nil
+}
+
+// HandleTurnstile creates Turnstile widgets and starts the secret key rotation loop.
+// This requires a long-running process and blocks until the context is canceled.
+func (m *CloudflareAccountManager) HandleTurnstile() error {
+	widgetTokenCfgByDomainLock := sync.Mutex{}
+	widgetTokenCfgByDomain, err := m.SetupTurnstile()
+	if err != nil {
+		return err
 	}
 
 	// Start the rotators
