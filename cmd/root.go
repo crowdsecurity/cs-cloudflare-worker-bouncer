@@ -209,7 +209,7 @@ func getConfigFromPath(configPath string) (*cfg.BouncerConfig, error) {
 func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConfig) ([]*cf.CloudflareAccountManager, error) {
 	cfManagers := make([]*cf.CloudflareAccountManager, 0, len(config.Accounts))
 	for _, accountCfg := range config.Accounts {
-		manager, err := cf.NewCloudflareManager(ctx, accountCfg, &config.Worker, config.IgnoreBindingErrorsOnDeploy)
+		manager, err := cf.NewCloudflareManager(ctx, accountCfg, &config.Worker)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create cloudflare manager: %w", err)
 		}
@@ -262,32 +262,6 @@ func deployInfraForManagers(g *errgroup.Group, cfManagers []*cf.CloudflareAccoun
 			return nil
 		})
 	}
-}
-
-func startPrometheusServer(g *errgroup.Group, ctx context.Context, conf *cfg.BouncerConfig, mHandler *metricsHandler) {
-	if !conf.PrometheusConfig.Enabled {
-		return
-	}
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
-	server := &http.Server{
-		Addr:    net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort),
-		Handler: mux,
-	}
-	g.Go(func() error {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			return err
-		}
-		return nil
-	})
-	g.Go(func() error {
-		<-ctx.Done()
-		log.Info("Shutting down Prometheus HTTP server")
-		// Use a fresh context for shutdown since ctx is already canceled
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		return server.Shutdown(shutdownCtx)
-	})
 }
 
 // ExecuteOptions holds configuration options for the Execute function.
@@ -413,7 +387,12 @@ func Execute(opts ExecuteOptions) error {
 
 	prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, metrics.CloudflareAPICallsByAccount, metrics.TotalKeysByAccount,
 		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests)
-	startPrometheusServer(g, ctx, conf, &mHandler)
+	if conf.PrometheusConfig.Enabled {
+		g.Go(func() error {
+			http.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
+			return http.ListenAndServe(net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort), nil)
+		})
+	}
 
 	// Process decisions from CrowdSec LAPI
 	g.Go(func() error {
