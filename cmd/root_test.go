@@ -305,7 +305,10 @@ func TestBouncer(t *testing.T) {
 
 	// generate config
 	configPath := "/tmp/crowdsec-cloudflare-worker-bouncer.yaml"
-	if err := Execute(&cloudflareToken, &configPath, nil, nil, nil, nil, nil, nil); err != nil {
+	if err := Execute(ExecuteOptions{
+		ConfigTokens:     &cloudflareToken,
+		ConfigOutputPath: &configPath,
+	}); err != nil {
 		t.Fatal(err)
 	}
 

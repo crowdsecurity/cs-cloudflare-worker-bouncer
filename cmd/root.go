@@ -218,39 +218,93 @@ func CloudflareManagersFromConfig(ctx context.Context, config cfg.CloudflareConf
 	return cfManagers, nil
 }
 
-func Execute(configTokens *string, configOutputPath *string, configPath *string, ver *bool, testConfig *bool, showConfig *bool, deleteOnly *bool, setupOnly *bool) error {
-	if ver != nil && *ver {
+func handleConfigTokens(configTokens, configOutputPath, configPath string) error {
+	cfgTokenString, err := cfg.ConfigTokens(configTokens, configPath)
+	if err != nil {
+		return err
+	}
+	if configOutputPath != "" {
+		err := os.WriteFile(configOutputPath, []byte(cfgTokenString), 0o664)
+		if err != nil {
+			return err
+		}
+		log.Printf("Config successfully generated in %s", configOutputPath)
+	} else {
+		fmt.Fprint(os.Stdout, cfgTokenString)
+	}
+	return nil
+}
+
+func deployInfraForManagers(g *errgroup.Group, cfManagers []*cf.CloudflareAccountManager, deleteOnly, setupAutonomous bool, crowdSecConfig cfg.CrowdSecConfig, cronSchedule string) {
+	for _, cfManager := range cfManagers {
+		manager := cfManager
+		g.Go(func() error {
+			err := manager.CleanUpExistingWorkers(true)
+			if err != nil {
+				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.Name)
+			}
+			if deleteOnly {
+				return nil
+			}
+			if err := manager.DeployInfra(); err != nil {
+				return fmt.Errorf("unable to deploy infra: %w for account %s", err, manager.AccountCfg.Name)
+			}
+			log.Infof("Successfully deployed infra for account %s", manager.AccountCfg.Name)
+
+			// Deploy decisions sync worker if autonomous setup (-S flag)
+			if setupAutonomous {
+				log.Infof("Autonomous setup mode, deploying decisions sync worker for account %s", manager.AccountCfg.Name)
+				if err := manager.DeployDecisionsSyncWorker(crowdSecConfig, cronSchedule); err != nil {
+					return fmt.Errorf("unable to deploy decisions sync worker: %w for account %s", err, manager.AccountCfg.Name)
+				}
+				// Setup Turnstile widgets (without rotation, as there's no long-running process)
+				if _, err := manager.SetupTurnstile(); err != nil {
+					return fmt.Errorf("unable to setup turnstile: %w for account %s", err, manager.AccountCfg.Name)
+				}
+			}
+
+			return nil
+		})
+	}
+}
+
+// ExecuteOptions holds configuration options for the Execute function.
+type ExecuteOptions struct {
+	ConfigTokens     *string
+	ConfigOutputPath *string
+	ConfigPath       *string
+	Ver              *bool
+	TestConfig       *bool
+	ShowConfig       *bool
+	DeleteOnly       *bool
+	SetupOnly        *bool
+	SetupAutonomous  *bool
+}
+
+func Execute(opts ExecuteOptions) error {
+	if opts.Ver != nil && *opts.Ver {
 		fmt.Fprint(os.Stdout, version.FullString())
 		return nil
 	}
 
-	if configPath == nil || *configPath == "" {
-		configPath = new(string)
-		*configPath = DEFAULT_CONFIG_PATH
+	if opts.ConfigPath == nil || *opts.ConfigPath == "" {
+		opts.ConfigPath = new(string)
+		*opts.ConfigPath = DEFAULT_CONFIG_PATH
 	}
 
-	if configTokens != nil && *configTokens != "" {
-		cfgTokenString, err := cfg.ConfigTokens(*configTokens, *configPath)
-		if err != nil {
-			return err
+	if opts.ConfigTokens != nil && *opts.ConfigTokens != "" {
+		outputPath := ""
+		if opts.ConfigOutputPath != nil {
+			outputPath = *opts.ConfigOutputPath
 		}
-		if configOutputPath != nil && *configOutputPath != "" {
-			err := os.WriteFile(*configOutputPath, []byte(cfgTokenString), 0o664)
-			if err != nil {
-				return err
-			}
-			log.Printf("Config successfully generated in %s", *configOutputPath)
-		} else {
-			fmt.Fprint(os.Stdout, cfgTokenString)
-		}
-		return nil
+		return handleConfigTokens(*opts.ConfigTokens, outputPath, *opts.ConfigPath)
 	}
 
-	conf, err := getConfigFromPath(*configPath)
+	conf, err := getConfigFromPath(*opts.ConfigPath)
 	if err != nil {
 		return err
 	}
-	if showConfig != nil && *showConfig {
+	if opts.ShowConfig != nil && *opts.ShowConfig {
 		fmt.Fprintf(os.Stdout, "%+v", conf)
 		return nil
 	}
@@ -271,13 +325,13 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 		CAPath:   conf.CrowdSecConfig.CAPath,
 	}
 
-	if (testConfig != nil && *testConfig) || (setupOnly == nil || !*setupOnly) || (deleteOnly == nil || !*deleteOnly) {
+	if (opts.TestConfig != nil && *opts.TestConfig) || (opts.SetupOnly == nil || !*opts.SetupOnly) || (opts.DeleteOnly == nil || !*opts.DeleteOnly) {
 		if err := csLAPI.Init(); err != nil {
 			return fmt.Errorf("unable to initialize crowdsec bouncer: %w", err)
 		}
 	}
 
-	if testConfig != nil && *testConfig {
+	if opts.TestConfig != nil && *opts.TestConfig {
 		log.Info("config is valid")
 		return nil
 	}
@@ -288,31 +342,18 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 	if err != nil {
 		return err
 	}
-	for _, cfManager := range cfManagers {
-		manager := cfManager
-		g.Go(func() error {
-			err := manager.CleanUpExistingWorkers(true)
-			if err != nil {
-				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.Name)
-			}
-			if deleteOnly != nil && *deleteOnly {
-				return nil
-			}
-			if err := manager.DeployInfra(); err != nil {
-				return fmt.Errorf("unable to deploy infra: %w for account %s", err, manager.AccountCfg.Name)
-			}
-			log.Infof("Successfully deployed infra for account %s", manager.AccountCfg.Name)
-			return nil
-		})
-	}
+
+	isDeleteOnly := opts.DeleteOnly != nil && *opts.DeleteOnly
+	isSetupAutonomous := opts.SetupAutonomous != nil && *opts.SetupAutonomous
+	deployInfraForManagers(g, cfManagers, isDeleteOnly, isSetupAutonomous, conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker.Cron)
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	if deleteOnly != nil && *deleteOnly {
+	if opts.DeleteOnly != nil && *opts.DeleteOnly {
 		return nil
 	}
 	log.Info("Successfully deployed infra for all accounts")
-	if setupOnly != nil && *setupOnly {
+	if (opts.SetupOnly != nil && *opts.SetupOnly) || (opts.SetupAutonomous != nil && *opts.SetupAutonomous) {
 		return nil
 	}
 
@@ -333,10 +374,6 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 
 	g.Go(func() error {
 		return HandleSignals(ctx)
-	})
-
-	g.Go(func() error {
-		return csLAPI.Run(ctx)
 	})
 
 	mHandler := metricsHandler{
@@ -360,6 +397,14 @@ func Execute(configTokens *string, configOutputPath *string, configPath *string,
 			return http.ListenAndServe(net.JoinHostPort(conf.PrometheusConfig.ListenAddress, conf.PrometheusConfig.ListenPort), nil)
 		})
 	}
+
+	// Process decisions from CrowdSec LAPI
+	g.Go(func() error {
+		if err := csLAPI.Run(ctx); err != nil {
+			return fmt.Errorf("crowdsec bouncer error: %w", err)
+		}
+		return errors.New("crowdsec bouncer stopped")
+	})
 
 	for {
 		select {

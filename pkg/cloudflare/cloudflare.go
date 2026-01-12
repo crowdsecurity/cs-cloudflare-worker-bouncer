@@ -25,6 +25,9 @@ import (
 //go:embed worker/dist/main.js
 var workerScript string
 
+//go:embed decisions-sync-worker/dist/main.js
+var decisionsSyncWorkerScript string
+
 //go:embed metrics.sql
 var sqlCreateTableStatement string
 
@@ -53,6 +56,7 @@ type cloudflareAPI interface {
 	RotateTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, param cf.RotateTurnstileWidgetParams) (cf.TurnstileWidget, error)
 	SetWorkersSecret(ctx context.Context, rc *cf.ResourceContainer, params cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error)
 	UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
+	UpdateWorkerCronTriggers(ctx context.Context, rc *cf.ResourceContainer, params cf.UpdateWorkerCronTriggersParams) ([]cf.WorkerCronTrigger, error)
 	WriteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.WriteWorkersKVEntriesParams) (cf.Response, error)
 	CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error)
 	DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error
@@ -255,6 +259,87 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	return zg.Wait()
 }
 
+// DeployDecisionsSyncWorker deploys the autonomous decisions sync worker.
+// This worker runs on a cron schedule and syncs decisions from CrowdSec LAPI to Cloudflare KV.
+func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.CrowdSecConfig, cronSchedule string) error {
+	m.logger.Infof("Deploying decisions sync worker %s with cron schedule: %s", m.Worker.DecisionsSyncScriptName, cronSchedule)
+
+	// Build scenario filters
+	includeScenarios := strings.Join(crowdSecConfig.IncludeScenariosContaining, ",")
+	excludeScenarios := strings.Join(crowdSecConfig.ExcludeScenariosContaining, ",")
+	origins := strings.Join(crowdSecConfig.OnlyIncludeDecisionsFrom, ",")
+
+	// Create bindings for the sync worker
+	bindings := map[string]cf.WorkerBinding{
+		m.Worker.KVNameSpaceName: cf.WorkerKvNamespaceBinding{NamespaceID: m.NamespaceID},
+		"LAPI_URL": cf.WorkerPlainTextBinding{
+			Text: crowdSecConfig.CrowdSecLAPIUrl,
+		},
+		"LAPI_KEY": cf.WorkerSecretTextBinding{
+			Text: crowdSecConfig.CrowdSecLAPIKey,
+		},
+		// Cloudflare API credentials for bulk KV operations
+		"CF_ACCOUNT_ID": cf.WorkerPlainTextBinding{
+			Text: m.AccountCfg.ID,
+		},
+		"CF_KV_NAMESPACE_ID": cf.WorkerPlainTextBinding{
+			Text: m.NamespaceID,
+		},
+		"CF_API_TOKEN": cf.WorkerSecretTextBinding{
+			Text: m.AccountCfg.Token,
+		},
+	}
+
+	// Only add filter bindings if they have values (Cloudflare doesn't allow empty text bindings)
+	if includeScenarios != "" {
+		bindings["INCLUDE_SCENARIOS"] = cf.WorkerPlainTextBinding{
+			Text: includeScenarios,
+		}
+	}
+	if excludeScenarios != "" {
+		bindings["EXCLUDE_SCENARIOS"] = cf.WorkerPlainTextBinding{
+			Text: excludeScenarios,
+		}
+	}
+	if origins != "" {
+		bindings["ONLY_INCLUDE_ORIGINS"] = cf.WorkerPlainTextBinding{
+			Text: origins,
+		}
+	}
+
+	// Upload the decisions sync worker
+	workerParams := cf.CreateWorkerParams{
+		Script:             decisionsSyncWorkerScript,
+		ScriptName:         m.Worker.DecisionsSyncScriptName,
+		Bindings:           bindings,
+		Module:             true,
+		Logpush:            m.Worker.Logpush,
+		Tags:               m.Worker.Tags,
+		CompatibilityDate:  m.Worker.CompatibilityDate,
+		CompatibilityFlags: m.Worker.CompatibilityFlags,
+	}
+
+	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), workerParams)
+	if err != nil {
+		return fmt.Errorf("failed to upload decisions sync worker: %w", err)
+	}
+	m.logger.Tracef("Decisions sync worker: %+v", worker)
+
+	// Deploy cron trigger for the decisions sync worker
+	m.logger.Infof("Deploying cron trigger for decisions sync worker: %s", cronSchedule)
+	cronTriggers, err := m.api.UpdateWorkerCronTriggers(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.UpdateWorkerCronTriggersParams{
+		ScriptName: m.Worker.DecisionsSyncScriptName,
+		Crons:      []cf.WorkerCronTrigger{{Cron: cronSchedule}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to deploy cron trigger for decisions sync worker: %w", err)
+	}
+	m.logger.Tracef("Cron triggers: %+v", cronTriggers)
+	m.logger.Infof("Successfully deployed decisions sync worker %s with cron: %s", m.Worker.DecisionsSyncScriptName, cronSchedule)
+
+	return nil
+}
+
 func (m *CloudflareAccountManager) updateMetrics() {
 	totalKVPairs := 1 // one for ActionsByDomain KV pair
 	for _, zone := range m.AccountCfg.ZoneConfigs {
@@ -273,11 +358,7 @@ func (m *CloudflareAccountManager) updateMetrics() {
 	metrics.TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
 }
 
-// This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
-// It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
-func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
-	m.logger.Infof("Cleaning up existing workers")
-
+func (m *CloudflareAccountManager) cleanupTurnstileWidgets() error {
 	m.logger.Debug("Listing existing turnstile widgets")
 	widgets, _, err := m.api.ListTurnstileWidgets(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListTurnstileWidgetParams{})
 	if err != nil {
@@ -296,7 +377,10 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 		}
 	}
 	m.logger.Debug("Done cleaning up existing turnstile widgets")
+	return nil
+}
 
+func (m *CloudflareAccountManager) cleanupWorkerRoutes() error {
 	for _, zone := range m.AccountCfg.ZoneConfigs {
 		zoneLogger := m.logger.WithFields(log.Fields{"zone": zone.Domain})
 		zoneLogger.Debugf("Listing worker routes")
@@ -318,9 +402,12 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 			}
 		}
 	}
+	return nil
+}
 
+func (m *CloudflareAccountManager) cleanupWorkerScripts() error {
 	m.logger.Debugf("Attempting to delete worker script %s", m.Worker.ScriptName)
-	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
+	err := m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
 		ScriptName: m.Worker.ScriptName,
 	})
 	if err != nil {
@@ -334,6 +421,25 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 		m.logger.Debugf("Deleted worker script %s", m.Worker.ScriptName)
 	}
 
+	// Clean up decisions sync worker if it exists
+	m.logger.Debugf("Attempting to delete decisions sync worker script %s", m.Worker.DecisionsSyncScriptName)
+	err = m.api.DeleteWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.DeleteWorkerParams{
+		ScriptName: m.Worker.DecisionsSyncScriptName,
+	})
+	if err != nil {
+		m.logger.Debugf("Received error while deleting decisions sync worker script %s: %s (type: %s)", m.Worker.DecisionsSyncScriptName, err, fmt.Sprintf("%T", err))
+		var notFoundErr *cf.NotFoundError
+		if !errors.As(err, &notFoundErr) {
+			return err
+		}
+		m.logger.Debugf("Didn't find decisions sync worker script %s", m.Worker.DecisionsSyncScriptName)
+	} else {
+		m.logger.Debugf("Deleted decisions sync worker script %s", m.Worker.DecisionsSyncScriptName)
+	}
+	return nil
+}
+
+func (m *CloudflareAccountManager) cleanupKVNamespaces() error {
 	m.logger.Debugf("Listing worker KV Namespaces")
 	kvNamespaces, _, err := m.api.ListWorkersKVNamespaces(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListWorkersKVNamespacesParams{})
 	if err != nil {
@@ -352,31 +458,63 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 			m.logger.Debugf("Done deleting worker KV Namespace with ID %s", kvNamespace.ID)
 		}
 	}
+	return nil
+}
 
-	if m.hasD1Access || start {
-		m.logger.Debugf("Listing D1 DBs")
-		dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
+func (m *CloudflareAccountManager) cleanupD1Databases(start bool) error {
+	if !m.hasD1Access && !start {
+		return nil
+	}
 
-		if err != nil {
-			if !start {
-				return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
-			}
-			dbs = []cf.D1Database{}
+	m.logger.Debugf("Listing D1 DBs")
+	dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
+
+	if err != nil {
+		if !start {
+			return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
 		}
+		dbs = []cf.D1Database{}
+	}
 
-		m.logger.Tracef("dbs: %+v", dbs)
+	m.logger.Tracef("dbs: %+v", dbs)
 
-		for _, db := range dbs {
-			m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
-			if db.Name == m.Worker.D1DBName {
-				m.logger.Debugf("Deleting D1 DB %s", db.UUID)
-				err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
-				if err != nil {
-					return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
-				}
-				m.logger.Debugf("Deleted D1 DB %s", db.UUID)
+	for _, db := range dbs {
+		m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
+		if db.Name == m.Worker.D1DBName {
+			m.logger.Debugf("Deleting D1 DB %s", db.UUID)
+			err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
+			if err != nil {
+				return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
 			}
+			m.logger.Debugf("Deleted D1 DB %s", db.UUID)
 		}
+	}
+	return nil
+}
+
+// This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
+// It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
+func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
+	m.logger.Infof("Cleaning up existing workers")
+
+	if err := m.cleanupTurnstileWidgets(); err != nil {
+		return err
+	}
+
+	if err := m.cleanupWorkerRoutes(); err != nil {
+		return err
+	}
+
+	if err := m.cleanupWorkerScripts(); err != nil {
+		return err
+	}
+
+	if err := m.cleanupKVNamespaces(); err != nil {
+		return err
+	}
+
+	if err := m.cleanupD1Databases(start); err != nil {
+		return err
 	}
 
 	m.logger.Info("Done cleaning up existing workers")
@@ -632,18 +770,28 @@ func (m *CloudflareAccountManager) CreateTurnstileWidgets() (map[string]WidgetTo
 	return widgetTokenCfgByDomain, nil
 }
 
-// Creates the turnstile widgets and writes the widget tokens to KV.
-// It runs infinitely, rotating the secret keys every configured interval.
-func (m *CloudflareAccountManager) HandleTurnstile() error {
-	widgetTokenCfgByDomainLock := sync.Mutex{}
-	// Create the tokens
+// SetupTurnstile creates Turnstile widgets and writes the config to KV.
+// This is used during setup (including autonomous mode) and returns immediately.
+func (m *CloudflareAccountManager) SetupTurnstile() (map[string]WidgetTokenCfg, error) {
 	widgetTokenCfgByDomain, err := m.CreateTurnstileWidgets()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := m.writeWidgetCfgToKV(m.Ctx, widgetTokenCfgByDomain); err != nil {
-		return nil
+		return nil, err
+	}
+
+	return widgetTokenCfgByDomain, nil
+}
+
+// HandleTurnstile creates Turnstile widgets and starts the secret key rotation loop.
+// This requires a long-running process and blocks until the context is canceled.
+func (m *CloudflareAccountManager) HandleTurnstile() error {
+	widgetTokenCfgByDomainLock := sync.Mutex{}
+	widgetTokenCfgByDomain, err := m.SetupTurnstile()
+	if err != nil {
+		return err
 	}
 
 	// Start the rotators

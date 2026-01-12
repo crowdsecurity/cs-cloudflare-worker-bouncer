@@ -1,0 +1,20 @@
+{
+  "name": "decisions-sync-worker",
+  "version": "1.0.0",
+  "description": "CrowdSec Autonomous Decisions Sync Worker",
+  "source": "src/index.js",
+  "main": "src/index.js",
+  "type": "module",
+  "devDependencies": {
+    "webpack": "^5.99.5",
+    "webpack-cli": "5.1.4"
+  },
+  "scripts": {
+    "build": "webpack --config webpack.config.cjs"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "node-polyfill-webpack-plugin": "2.0.1"
+  }
+}
