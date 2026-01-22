@@ -270,17 +270,22 @@ export default {
 
     await incrementMetrics("processed", ipType)
 
+    if (typeof env.ACTIONS_BY_DOMAIN === "string") {
+      env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN)
+    }
+    const zoneForThisRequest = getZoneFromReqURL(request.url, env.ACTIONS_BY_DOMAIN);
+    if (!zoneForThisRequest) {
+      console.log("No zone found for this request")
+      return fetch(request)
+    }else {
+      console.log("Zone for this request is " + zoneForThisRequest)
+    }
 
     let remediation = await getRemediationForRequest(request, env)
     if (remediation === null) {
       console.log("No remediation found for request")
       return fetch(request)
     }
-    if (typeof env.ACTIONS_BY_DOMAIN === "string") {
-      env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN)
-    }
-    const zoneForThisRequest = getZoneFromReqURL(request.url, env.ACTIONS_BY_DOMAIN);
-    console.log("Zone for this request is " + zoneForThisRequest)
     remediation = getSupportedActionForZone(remediation, env.ACTIONS_BY_DOMAIN[zoneForThisRequest])
     console.log("Remediation for request is " + remediation)
     switch (remediation) {
