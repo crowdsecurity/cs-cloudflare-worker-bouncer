@@ -66,7 +66,7 @@ require (
 
 require (
 	github.com/cloudflare/cloudflare-go v0.116.0
-	github.com/crowdsecurity/go-cs-lib v0.0.24
+	github.com/crowdsecurity/go-cs-lib v0.0.25
 	github.com/google/go-querystring v1.2.0 // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
