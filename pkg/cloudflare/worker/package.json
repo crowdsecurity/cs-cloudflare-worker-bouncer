@@ -17,7 +17,7 @@
     "@tsndr/cloudflare-worker-jwt": "3.1.4",
     "cookie": "^1.0.2",
     "ipaddr.js": "2.2.0",
-    "jsonwebtoken": "9.0.2",
+    "jsonwebtoken": "9.0.3",
     "node-polyfill-webpack-plugin": "2.0.1"
   }
 }
