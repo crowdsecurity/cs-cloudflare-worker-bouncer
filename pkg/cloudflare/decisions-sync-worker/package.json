@@ -15,6 +15,6 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "node-polyfill-webpack-plugin": "2.0.1"
+    "node-polyfill-webpack-plugin": "4.1.0"
   }
 }
