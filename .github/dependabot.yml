@@ -7,12 +7,12 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
-    open-pull-requests-limit: 0
 
   - package-ecosystem: "npm"
-    directory: "/pkg/cloudflare/worker/"
+    directories:
+     - "/pkg/cloudflare/worker/"
+     - "/pkg/cloudflare/decisions-sync-worker/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 0
     
 ## open-pull-requests-limit: 0 will only create security updates default
