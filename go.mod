@@ -3,11 +3,11 @@ module github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer
 go 1.25.5
 
 require (
-	github.com/crowdsecurity/crowdsec v1.7.4
-	github.com/crowdsecurity/go-cs-bouncer v0.0.20
+	github.com/crowdsecurity/crowdsec v1.7.6
+	github.com/crowdsecurity/go-cs-bouncer v0.0.21
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
-	github.com/sirupsen/logrus v1.9.3
+	github.com/sirupsen/logrus v1.9.4
 	github.com/whuang8/redactrus v1.0.2
 	golang.org/x/sync v0.19.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
@@ -60,7 +60,6 @@ require (
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/tomb.v2 v2.0.0-20161208151619-d5d1b5820637 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
 
