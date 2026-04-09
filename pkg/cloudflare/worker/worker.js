@@ -264,9 +264,11 @@ export default {
       }
 
       // Check for decision against the country of the request
-      const clientCountry = request.cf.country.toLowerCase();
-      if (clientCountry !== null) {
-        value = await getFromKV(env.CROWDSECCFBOUNCERNS, clientCountry);
+      if (request.cf.country !== null) {
+        value = await getFromKV(
+          env.CROWDSECCFBOUNCERNS,
+          request.cf.country.toLowerCase(),
+        );
         if (value !== null) {
           return value;
         }
