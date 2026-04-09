@@ -292,10 +292,13 @@ export default {
           VALUES (1, ?, ?, ?, ?)
           ON CONFLICT(metric_name, origin, remediation_type, ip_type) DO UPDATE SET val=val+1
         `;
-
-        await env.CROWDSECCFBOUNCERDB.prepare(query)
-          .bind(...parameters)
-          .run();
+        try {
+          await env.CROWDSECCFBOUNCERDB.prepare(query)
+            .bind(...parameters)
+            .run();
+        } catch (error) {
+          console.error("Error incrementing metrics:", error);
+        }
       }
     };
 
