@@ -93,6 +93,15 @@ const writeToKV = async (kv, key, value) => {
 
 export default {
   async fetch(request, env, ctx) {
+    try {
+      return await this._handleFetch(request, env, ctx);
+    } catch (error) {
+      console.error("Unhandled error in worker, passing through to origin:", error);
+      return fetch(request);
+    }
+  },
+
+  async _handleFetch(request, env, ctx) {
     const doBan = async () => {
       return new Response(
         await getFromKV(env.CROWDSECCFBOUNCERNS, "BAN_TEMPLATE"),
@@ -120,7 +129,12 @@ export default {
       }
       if (typeof turnstileCfg === "string") {
         console.log("Converting turnstile config to JSON");
-        turnstileCfg = JSON.parse(turnstileCfg);
+        try {
+          turnstileCfg = JSON.parse(turnstileCfg);
+        } catch (e) {
+          console.error("Failed to parse turnstile config:", e);
+          return fetch(request);
+        }
         writeToKV(env.CROWDSECCFBOUNCERNS, "TURNSTILE_CONFIG", turnstileCfg);
       }
 
@@ -147,7 +161,13 @@ export default {
         console.log("jwt is invalid");
       }
       if (request.method === "POST") {
-        const formBody = await request.clone().formData();
+        let formBody;
+        try {
+          formBody = await request.clone().formData();
+        } catch (e) {
+          console.error("Failed to parse form data:", e);
+          return fetch(request);
+        }
         if (formBody.get("cf-turnstile-response")) {
           console.log("Handling turnstile post");
           return await handleTurnstilePost(
@@ -241,10 +261,21 @@ export default {
         "IP_RANGES",
       );
       if (typeof actionByIPRange === "string") {
-        actionByIPRange = JSON.parse(actionByIPRange);
+        try {
+          actionByIPRange = JSON.parse(actionByIPRange);
+        } catch (e) {
+          console.error("Failed to parse IP_RANGES:", e);
+          actionByIPRange = null;
+        }
       }
       if (actionByIPRange !== null) {
-        const clientIPAddr = ipaddr.parse(clientIP);
+        let clientIPAddr;
+        try {
+          clientIPAddr = ipaddr.parse(clientIP);
+        } catch (e) {
+          console.error("Failed to parse client IP for range matching:", e);
+          return null;
+        }
         for (const [range, action] of Object.entries(actionByIPRange)) {
           try {
             if (clientIPAddr.match(ipaddr.parseCIDR(range))) {
@@ -257,14 +288,16 @@ export default {
         }
       }
       // Check for decision against the AS
-      const clientASN = request.cf.asn.toString();
-      value = await getFromKV(env.CROWDSECCFBOUNCERNS, clientASN);
-      if (value !== null) {
-        return value;
+      if (request.cf && request.cf.asn) {
+        const clientASN = request.cf.asn.toString();
+        value = await getFromKV(env.CROWDSECCFBOUNCERNS, clientASN);
+        if (value !== null) {
+          return value;
+        }
       }
 
       // Check for decision against the country of the request
-      if (request.cf.country !== null) {
+      if (request.cf && request.cf.country) {
         value = await getFromKV(
           env.CROWDSECCFBOUNCERNS,
           request.cf.country.toLowerCase(),
@@ -305,7 +338,18 @@ export default {
     };
 
     const clientIP = request.headers.get("CF-Connecting-IP");
-    const ipType = ipaddr.parse(clientIP).kind();
+    if (!clientIP) {
+      console.log("No CF-Connecting-IP header found, passing through");
+      return fetch(request);
+    }
+
+    let ipType;
+    try {
+      ipType = ipaddr.parse(clientIP).kind();
+    } catch (e) {
+      console.error("Failed to parse client IP:", clientIP, e);
+      return fetch(request);
+    }
 
     await incrementMetrics("processed", ipType);
 
@@ -315,12 +359,21 @@ export default {
       return fetch(request);
     }
     if (typeof env.ACTIONS_BY_DOMAIN === "string") {
-      env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
+      try {
+        env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
+      } catch (e) {
+        console.error("Failed to parse ACTIONS_BY_DOMAIN:", e);
+        return fetch(request);
+      }
     }
     const zoneForThisRequest = getZoneFromReqURL(
       request.url,
       env.ACTIONS_BY_DOMAIN,
     );
+    if (!zoneForThisRequest || !env.ACTIONS_BY_DOMAIN[zoneForThisRequest]) {
+      console.log("No matching zone found for request URL, passing through");
+      return fetch(request);
+    }
     console.log("Zone for this request is " + zoneForThisRequest);
     remediation = getSupportedActionForZone(
       remediation,
