@@ -96,7 +96,10 @@ export default {
     try {
       return await this._handleFetch(request, env, ctx);
     } catch (error) {
-      console.error("Unhandled error in worker, passing through to origin:", error);
+      console.error(
+        "Unhandled error in worker, passing through to origin:",
+        error,
+      );
       return fetch(request);
     }
   },
@@ -351,7 +354,7 @@ export default {
       return fetch(request);
     }
 
-    await incrementMetrics("processed", ipType);
+    ctx.waitUntil(incrementMetrics("processed", ipType));
 
     let remediation = await getRemediationForRequest(request, env);
     if (remediation === null) {
@@ -382,10 +385,12 @@ export default {
     console.log("Remediation for request is " + remediation);
     switch (remediation) {
       case "ban":
-        await incrementMetrics("dropped", ipType, "crowdsec", "ban");
+        ctx.waitUntil(incrementMetrics("dropped", ipType, "crowdsec", "ban"));
         return env.LOG_ONLY === "true" ? fetch(request) : await doBan();
       case "captcha":
-        await incrementMetrics("dropped", ipType, "crowdsec", "captcha");
+        ctx.waitUntil(
+          incrementMetrics("dropped", ipType, "crowdsec", "captcha"),
+        );
         return env.LOG_ONLY === "true"
           ? fetch(request)
           : await doCaptcha(env, zoneForThisRequest);
