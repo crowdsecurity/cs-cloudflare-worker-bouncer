@@ -40,3 +40,13 @@ var TotalActiveDecisions = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: ActiveDecisionsMetricName,
 	Help: "Total number of active decisions",
 }, []string{"origin", "ip_type", "scope", "account"})
+
+var TotalErrors = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "crowdsec_cloudflare_worker_bouncer_errors",
+	Help: "Total number of requests that threw an exception in the worker",
+}, []string{"ip_type", "account"})
+
+var AverageLatencyMs = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "crowdsec_cloudflare_worker_bouncer_avg_latency_ms",
+	Help: "Average request processing latency in milliseconds",
+}, []string{"account", "metric_name", "ip_type", "remediation"})

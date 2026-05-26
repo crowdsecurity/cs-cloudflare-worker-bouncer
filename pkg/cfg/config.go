@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,6 +21,21 @@ import (
 var (
 	VarNameForActionsByDomain = "ACTIONS_BY_DOMAIN"
 	ErrEmptyConfig            = errors.New("empty config")
+)
+
+// validAccountName / validAnalyticsDataset enforce that values interpolated into
+// the AE SQL query cannot break out of a ClickHouse string literal or identifier
+// context. Rejecting at config load eliminates the need for runtime escaping.
+var (
+	validAccountName      = regexp.MustCompile(`^[\p{L}\p{N} ._\-()&+@:,]*$`)
+	validAnalyticsDataset = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`)
+)
+
+// KVWorkerBindingName and AEWorkerBindingName are the worker env binding names hardcoded in the
+// compiled worker JS. They must not be changed without also updating the worker source.
+const (
+	KVWorkerBindingName = "CROWDSECCFBOUNCERNS"
+	AEWorkerBindingName = "CROWDSECCFBOUNCER_AE"
 )
 
 type TurnstileConfig struct {
@@ -50,15 +67,27 @@ type AccountConfig struct {
 // YAML struct derived from cloudflare.CreateWorkerParams
 // https://github.com/cloudflare/cloudflare-go/blob/056b65c6e956a7119d0d89b27a659ea63b1c0506/workers.go#L24
 type CloudflareWorkerCreateParams struct {
-	ScriptName              string   `yaml:"script_name"`
-	Logpush                 *bool    `yaml:"logpush"`
-	Tags                    []string `yaml:"tags"`
-	CompatibilityDate       string   `yaml:"compatibility_date"`
-	CompatibilityFlags      []string `yaml:"compatibility_flags"`
-	LogOnly                 bool     `yaml:"log_only"`
-	KVNameSpaceName         string   `yaml:"-"` // Currently hardcoded string in worker code but may allow customization in future
-	D1DBName                string   `yaml:"-"` // Hardcoded, internal implementation detail for metrics support
-	DecisionsSyncScriptName string   `yaml:"-"` // Hardcoded, internal implementation detail for autonomous mode
+	ScriptName              string                     `yaml:"script_name"`
+	Logpush                 *bool                      `yaml:"logpush"`
+	Tags                    []string                   `yaml:"tags"`
+	CompatibilityDate       string                     `yaml:"compatibility_date"`
+	CompatibilityFlags      []string                   `yaml:"compatibility_flags"`
+	LogOnly                 bool                       `yaml:"log_only"`
+	KVNameSpaceName         string                     `yaml:"kv_namespace_name,omitempty"`          // CF resource title used for create/delete lookup; change when sharing a Cloudflare account with another bouncer instance
+	AnalyticsDataset        string                     `yaml:"analytics_dataset,omitempty"`          // CF Analytics Engine dataset name for metrics
+	DecisionsSyncScriptName string                     `yaml:"decisions_sync_script_name,omitempty"` // CF worker script name; change when sharing a Cloudflare account with another bouncer instance
+	Observability           *WorkerObservabilityConfig `yaml:"observability,omitempty"`              // Workers Observability (logs + traces); nil = skip
+}
+
+type WorkerObservabilityConfig struct {
+	Enabled          *bool               `yaml:"enabled"`
+	HeadSamplingRate *float64            `yaml:"head_sampling_rate"`
+	Traces           *WorkerTracesConfig `yaml:"traces,omitempty"`
+}
+
+type WorkerTracesConfig struct {
+	Enabled          *bool    `yaml:"enabled"`
+	HeadSamplingRate *float64 `yaml:"head_sampling_rate"`
 }
 
 func (w *CloudflareWorkerCreateParams) setDefaults() {
@@ -68,29 +97,29 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 	if w.KVNameSpaceName == "" {
 		w.KVNameSpaceName = "CROWDSECCFBOUNCERNS"
 	}
-	if w.D1DBName == "" {
-		w.D1DBName = "CROWDSECCFBOUNCERDB"
+	if w.AnalyticsDataset == "" {
+		w.AnalyticsDataset = "crowdsec_cloudflare_bouncer"
 	}
 	if w.DecisionsSyncScriptName == "" {
 		w.DecisionsSyncScriptName = "crowdsec-decisions-sync-worker"
 	}
 }
 
-func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, id string, varActionsForZoneByDomain []byte, dbID string) cloudflare.CreateWorkerParams {
+func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, id string, varActionsForZoneByDomain []byte, accountName string) cloudflare.CreateWorkerParams {
 	bindings := map[string]cloudflare.WorkerBinding{
-		w.KVNameSpaceName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: id},
+		KVWorkerBindingName: cloudflare.WorkerKvNamespaceBinding{NamespaceID: id},
 		VarNameForActionsByDomain: cloudflare.WorkerPlainTextBinding{
 			Text: string(varActionsForZoneByDomain),
 		},
 		"LOG_ONLY": cloudflare.WorkerPlainTextBinding{
 			Text: fmt.Sprintf("%t", w.LogOnly),
 		},
-	}
-
-	if dbID != "" {
-		bindings[w.D1DBName] = cloudflare.WorkerD1DatabaseBinding{
-			DatabaseID: dbID,
-		}
+		AEWorkerBindingName: cloudflare.WorkerAnalyticsEngineBinding{
+			Dataset: w.AnalyticsDataset,
+		},
+		"ACCOUNT_NAME": cloudflare.WorkerPlainTextBinding{
+			Text: accountName,
+		},
 	}
 	return cloudflare.CreateWorkerParams{
 		Script:             workerScript,
@@ -178,7 +207,8 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 	validAction := map[string]bool{"captcha": true, "ban": true}
 	validChoiceMsg := "valid choices are either of 'ban', 'captcha'"
 
-	for _, account := range config.CloudflareConfig.Accounts {
+	for i := range config.CloudflareConfig.Accounts {
+		account := &config.CloudflareConfig.Accounts[i]
 		if _, ok := accountIDSet[account.ID]; ok {
 			return nil, fmt.Errorf("the account '%s' is duplicated", account.ID)
 		}
@@ -188,8 +218,17 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 			return nil, fmt.Errorf("the account '%s' is missing token", account.ID)
 		}
 
+		// Mirror the worker's `env.ACCOUNT_NAME || "default"` fallback: an empty
+		// name would query `index1 = ''` and never match what the worker writes.
+		if account.Name == "" {
+			account.Name = "default"
+		}
+		if !validAccountName.MatchString(account.Name) {
+			return nil, fmt.Errorf("account '%s' has invalid account_name %q: permitted characters are letters, digits, spaces, and . _ - ( ) & + @ : ,", account.ID, account.Name)
+		}
+
 		for _, zone := range account.ZoneConfigs {
-			if !stringSliceContains(zone.Actions, zone.DefaultAction) {
+			if !slices.Contains(zone.Actions, zone.DefaultAction) {
 				zone.Actions = append(zone.Actions, zone.DefaultAction)
 			}
 			if len(zone.Actions) == 0 {
@@ -210,16 +249,23 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 		}
 	}
 	config.CloudflareConfig.Worker.setDefaults() // set defaults for worker
-	return config, nil
-}
 
-func stringSliceContains(slice []string, t string) bool {
-	for _, item := range slice {
-		if item == t {
-			return true
+	if !validAnalyticsDataset.MatchString(config.CloudflareConfig.Worker.AnalyticsDataset) {
+		return nil, fmt.Errorf("invalid analytics_dataset %q: must match %s", config.CloudflareConfig.Worker.AnalyticsDataset, validAnalyticsDataset.String())
+	}
+
+	if obs := config.CloudflareConfig.Worker.Observability; obs != nil {
+		if r := obs.HeadSamplingRate; r != nil && (*r < 0 || *r > 1) {
+			return nil, fmt.Errorf("observability head_sampling_rate must be between 0 and 1, got %f", *r)
+		}
+		if obs.Traces != nil {
+			if r := obs.Traces.HeadSamplingRate; r != nil && (*r < 0 || *r > 1) {
+				return nil, fmt.Errorf("observability traces head_sampling_rate must be between 0 and 1, got %f", *r)
+			}
 		}
 	}
-	return false
+
+	return config, nil
 }
 
 func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[string]cloudflare.Account) string {
@@ -249,11 +295,26 @@ func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[
 	if strings.Contains(l, "turnstile:") {
 		return `Turnstile must be enabled if captcha action is used.`
 	}
+	if strings.Contains(l, "kv_namespace_name:") {
+		return `KV namespace title used to create/locate the decision store; change when running multiple bouncers on the same Cloudflare account`
+	}
+	if strings.Contains(l, "decisions_sync_script_name:") {
+		return `Decisions sync worker script name; change when running multiple bouncers on the same Cloudflare account`
+	}
 	if strings.Contains(l, "decisions_sync_worker:") {
 		return `Configuration for autonomous decisions sync worker`
 	}
 	if strings.Contains(l, "cron:") {
 		return `Cron schedule for syncing decisions (e.g., "*/5 * * * *" for every 5 minutes)`
+	}
+	if strings.Contains(l, "analytics_dataset:") {
+		return `Workers Analytics Engine dataset name that the worker writes metric data points to`
+	}
+	if strings.Contains(l, "observability:") {
+		return `Workers Observability (logs/traces) configuration; omit to leave Cloudflare defaults in place`
+	}
+	if strings.Contains(l, "head_sampling_rate:") {
+		return `Sampling rate for head-based observability (0.0 to 1.0)`
 	}
 	return ""
 }
@@ -280,7 +341,7 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 	accountByID := make(map[string]cloudflare.Account)
 	accountIDXByID := make(map[string]int)
 	ctx := context.Background()
-	for _, token := range strings.Split(tokens, ",") {
+	for token := range strings.SplitSeq(tokens, ",") {
 		api, err := cloudflare.NewWithAPIToken(token)
 		if err != nil {
 			return "", fmt.Errorf("failed to create cloudflare api client: %w", err)
@@ -296,9 +357,19 @@ func ConfigTokens(tokens string, baseConfigPath string) (string, error) {
 		for _, account := range accounts {
 			accountByID[account.ID] = account
 			if _, ok := accountIDXByID[account.ID]; !ok {
+				// The Cloudflare-supplied account name flows into the AE SQL
+				// query, so it must satisfy validAccountName. A name that
+				// doesn't (e.g. "O'Brien") would generate a config that
+				// NewConfig rejects on the next startup — fall back to the
+				// account ID, which is always a safe identifier.
+				name := strings.Replace(account.Name, "'s Account", "", -1)
+				if !validAccountName.MatchString(name) {
+					log.Warnf("Cloudflare account name %q contains unsupported characters; using account ID %q as account_name", account.Name, account.ID)
+					name = account.ID
+				}
 				accountConfigs = append(accountConfigs, AccountConfig{
 					ID:          account.ID,
-					Name:        strings.Replace(account.Name, "'s Account", "", -1),
+					Name:        name,
 					ZoneConfigs: make([]*ZoneConfig, 0),
 					Token:       token,
 					BanTemplate: "",
