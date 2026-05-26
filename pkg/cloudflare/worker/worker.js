@@ -138,7 +138,16 @@ export default {
           console.error("Failed to parse turnstile config:", e);
           return fetch(request);
         }
-        writeToKV(env.CROWDSECCFBOUNCERNS, "TURNSTILE_CONFIG", turnstileCfg);
+        // ctx.waitUntil keeps the KV put alive after we return the response;
+        // otherwise the Workers runtime cancels the unawaited Promise and the
+        // normalised TURNSTILE_CONFIG never lands.
+        ctx.waitUntil(
+          writeToKV(
+            env.CROWDSECCFBOUNCERNS,
+            "TURNSTILE_CONFIG",
+            JSON.stringify(turnstileCfg),
+          ),
+        );
       }
 
       if (!turnstileCfg[zoneForThisRequest]) {
@@ -312,31 +321,22 @@ export default {
       return null;
     };
 
-    const incrementMetrics = async (
+    const writeMetricEvent = (
       metricName,
       ipType,
       origin,
-      remediation_type,
+      remediationType,
+      latencyMs,
     ) => {
-      if (env.CROWDSECCFBOUNCERDB !== undefined) {
-        let parameters = [
-          metricName,
-          origin || "",
-          remediation_type || "",
-          ipType,
-        ];
-        let query = `
-          INSERT INTO metrics (val, metric_name, origin, remediation_type, ip_type)
-          VALUES (1, ?, ?, ?, ?)
-          ON CONFLICT(metric_name, origin, remediation_type, ip_type) DO UPDATE SET val=val+1
-        `;
-        try {
-          await env.CROWDSECCFBOUNCERDB.prepare(query)
-            .bind(...parameters)
-            .run();
-        } catch (error) {
-          console.error("Error incrementing metrics:", error);
-        }
+      if (!env.CROWDSECCFBOUNCER_AE) return;
+      try {
+        env.CROWDSECCFBOUNCER_AE.writeDataPoint({
+          indexes: [env.ACCOUNT_NAME || "default"],
+          blobs: [metricName, ipType, origin || "", remediationType || ""],
+          doubles: [1, latencyMs || 0],
+        });
+      } catch (e) {
+        console.error("AE write failed:", e);
       }
     };
 
@@ -354,48 +354,75 @@ export default {
       return fetch(request);
     }
 
-    ctx.waitUntil(incrementMetrics("processed", ipType));
+    const start = Date.now();
+    let metricOrigin = "";
+    let metricRemediation = "";
+    let blocked = false;
+    let errored = false;
 
-    let remediation = await getRemediationForRequest(request, env);
-    if (remediation === null) {
-      console.log("No remediation found for request");
-      return fetch(request);
-    }
-    if (typeof env.ACTIONS_BY_DOMAIN === "string") {
-      try {
-        env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
-      } catch (e) {
-        console.error("Failed to parse ACTIONS_BY_DOMAIN:", e);
+    try {
+      let remediation = await getRemediationForRequest(request, env);
+      if (remediation === null) {
+        console.log("No remediation found for request");
         return fetch(request);
       }
-    }
-    const zoneForThisRequest = getZoneFromReqURL(
-      request.url,
-      env.ACTIONS_BY_DOMAIN,
-    );
-    if (!zoneForThisRequest || !env.ACTIONS_BY_DOMAIN[zoneForThisRequest]) {
-      console.log("No matching zone found for request URL, passing through");
-      return fetch(request);
-    }
-    console.log("Zone for this request is " + zoneForThisRequest);
-    remediation = getSupportedActionForZone(
-      remediation,
-      env.ACTIONS_BY_DOMAIN[zoneForThisRequest],
-    );
-    console.log("Remediation for request is " + remediation);
-    switch (remediation) {
-      case "ban":
-        ctx.waitUntil(incrementMetrics("dropped", ipType, "crowdsec", "ban"));
-        return env.LOG_ONLY === "true" ? fetch(request) : await doBan();
-      case "captcha":
-        ctx.waitUntil(
-          incrementMetrics("dropped", ipType, "crowdsec", "captcha"),
-        );
-        return env.LOG_ONLY === "true"
-          ? fetch(request)
-          : await doCaptcha(env, zoneForThisRequest);
-      default:
+      if (typeof env.ACTIONS_BY_DOMAIN === "string") {
+        try {
+          env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
+        } catch (e) {
+          console.error("Failed to parse ACTIONS_BY_DOMAIN:", e);
+          return fetch(request);
+        }
+      }
+      const zoneForThisRequest = getZoneFromReqURL(
+        request.url,
+        env.ACTIONS_BY_DOMAIN,
+      );
+      if (!zoneForThisRequest || !env.ACTIONS_BY_DOMAIN[zoneForThisRequest]) {
+        console.log("No matching zone found for request URL, passing through");
         return fetch(request);
+      }
+      console.log("Zone for this request is " + zoneForThisRequest);
+      remediation = getSupportedActionForZone(
+        remediation,
+        env.ACTIONS_BY_DOMAIN[zoneForThisRequest],
+      );
+      console.log("Remediation for request is " + remediation);
+      switch (remediation) {
+        case "ban":
+          blocked = true;
+          metricOrigin = "crowdsec";
+          metricRemediation = "ban";
+          return env.LOG_ONLY === "true" ? fetch(request) : await doBan();
+        case "captcha":
+          blocked = true;
+          metricOrigin = "crowdsec";
+          metricRemediation = "captcha";
+          return env.LOG_ONLY === "true"
+            ? fetch(request)
+            : await doCaptcha(env, zoneForThisRequest);
+        default:
+          return fetch(request);
+      }
+    } catch (e) {
+      // Record the error metric, then re-throw so the outer fetch() wrapper
+      // catches and passes the request through to origin (per #95).
+      errored = true;
+      throw e;
+    } finally {
+      const latencyMs = Date.now() - start;
+      writeMetricEvent("processed", ipType, "", "", latencyMs);
+      if (errored) {
+        writeMetricEvent("error", ipType, "", "", latencyMs);
+      } else if (blocked) {
+        writeMetricEvent(
+          "dropped",
+          ipType,
+          metricOrigin,
+          metricRemediation,
+          latencyMs,
+        );
+      }
     }
   },
 };
