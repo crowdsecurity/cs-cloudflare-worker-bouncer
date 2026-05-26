@@ -7075,6 +7075,8 @@ const getSupportedActionForZone = (action, actionsForDomain) => {
   return actionsForDomain["default_action"];
 };
 
+const TURNSTILE_VERIFY_TIMEOUT_MS = 5000;
+
 const handleTurnstilePost = async (
   request,
   body,
@@ -7091,12 +7093,31 @@ const handleTurnstilePost = async (
   formData.append("remoteip", ip);
 
   const url = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
-  const result = await fetch(url, {
-    body: formData,
-    method: "POST",
-  });
 
-  const outcome = await result.json();
+  // If Turnstile siteverify hangs or errors, we can't decide — fail open to
+  // origin rather than block a user whose captcha submission we couldn't
+  // verify because Cloudflare's own verification API is unavailable.
+  let outcome;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      TURNSTILE_VERIFY_TIMEOUT_MS,
+    );
+    try {
+      const result = await fetch(url, {
+        body: formData,
+        method: "POST",
+        signal: controller.signal,
+      });
+      outcome = await result.json();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch (e) {
+    console.error("Turnstile siteverify unavailable, passing to origin:", e);
+    return fetch(request);
+  }
 
   if (!outcome.success) {
     console.log("Invalid captcha solution");
@@ -7156,7 +7177,20 @@ const writeToKV = async (kv, key, value) => {
         "Unhandled error in worker, passing through to origin:",
         error,
       );
-      return fetch(request);
+      // Defensive double-wrap: if the origin pass-through itself throws (e.g.
+      // origin is unreachable), return a synthetic 502 so the runtime doesn't
+      // surface a 1101 "Worker threw exception" page on top of an existing
+      // outage. Either way the request fails; this just keeps the failure
+      // owned by the bouncer's contract instead of leaking implementation.
+      try {
+        return await fetch(request);
+      } catch (passthroughError) {
+        console.error(
+          "Origin pass-through also failed:",
+          passthroughError,
+        );
+        return new Response("", { status: 502 });
+      }
     }
   },
 
