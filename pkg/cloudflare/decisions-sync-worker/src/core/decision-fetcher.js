@@ -8,6 +8,10 @@ import logger from '../utils/logger.js';
 
 const USER_AGENT = 'cloudflare-worker-bouncer/v1.0.0';
 const WARMED_UP_KEY = 'WARMED_UP';
+const SYNC_LOCK_KEY = 'SYNC_IN_PROGRESS';
+// TTL backstop in case a sync crashes before releaseSyncLock runs; without
+// this, a stuck lock would block every subsequent cron run.
+const SYNC_LOCK_TTL_SECONDS = 300;
 const SUPPORTED_SCOPES = ['ip', 'range', 'as', 'country'];
 
 /**
@@ -21,12 +25,46 @@ export async function isFirstFetch(kvNamespace) {
 }
 
 /**
- * Mark the cache as warmed up (first fetch completed)
+ * Mark the cache as warmed up. MUST only be called after a sync has fully
+ * written all decisions to KV — calling it before commits a half-empty KV
+ * to "warmed" state, causing the next run to do an incremental fetch that
+ * never backfills the missed decisions (silent enforcement gap).
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
  */
 export async function markAsWarmed(kvNamespace) {
 	await kvNamespace.put(WARMED_UP_KEY, 'true');
 	logger.debug('Cache marked as warmed');
+}
+
+/**
+ * Try to acquire the sync lock. Returns true if acquired, false if another
+ * sync is already running. Caller MUST call releaseSyncLock in a finally
+ * block. The TTL is a backstop only — do not rely on it for normal release.
+ *
+ * NOTE: Workers KV has no atomic put-if-absent, so this is a best-effort
+ * advisory lock. A small race window exists between get() and put() where
+ * two near-simultaneous invocations can both observe `existing === null`
+ * and both proceed. With a 5-minute cron interval it's unlikely; LAPI's
+ * own rate limiting is the actual safety net against a sync storm.
+ *
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * @returns {Promise<boolean>} True if the lock was acquired
+ */
+export async function tryAcquireSyncLock(kvNamespace) {
+	const existing = await kvNamespace.get(SYNC_LOCK_KEY);
+	if (existing) {
+		return false;
+	}
+	await kvNamespace.put(SYNC_LOCK_KEY, 'true', { expirationTtl: SYNC_LOCK_TTL_SECONDS });
+	return true;
+}
+
+/**
+ * Release the sync lock acquired via tryAcquireSyncLock.
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ */
+export async function releaseSyncLock(kvNamespace) {
+	await kvNamespace.delete(SYNC_LOCK_KEY);
 }
 
 /**
