@@ -1,11 +1,13 @@
 package cf
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -28,14 +30,22 @@ var workerScript string
 //go:embed decisions-sync-worker/dist/main.js
 var decisionsSyncWorkerScript string
 
-//go:embed metrics.sql
-var sqlCreateTableStatement string
-
 const (
 	WidgetName            = "crowdsec-cloudflare-worker-bouncer-widget"
 	TurnstileConfigKey    = "TURNSTILE_CONFIG"
 	VarNameForBanTemplate = "BAN_TEMPLATE"
 	IpRangeKeyName        = "IP_RANGES"
+
+	// metricsPollLookback is how far back the AE metrics cursor reaches when
+	// the manager is freshly constructed, so the first poll covers any AE
+	// data points written between bouncer start and the first push cycle.
+	metricsPollLookback = 2 * time.Minute
+
+	// aeIngestionLag is how far in the past windowEnd lands relative to wall
+	// clock, so the [start, end) window only covers AE rows that have had time
+	// to index. Without this, the cursor advances past unindexed rows that
+	// arrive seconds late and the corresponding metrics are dropped forever.
+	aeIngestionLag = 10 * time.Second
 )
 
 type cloudflareAPI interface {
@@ -49,6 +59,7 @@ type cloudflareAPI interface {
 	DeleteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.DeleteWorkersKVEntriesParams) (cf.Response, error)
 	DeleteWorkersKVNamespace(ctx context.Context, rc *cf.ResourceContainer, namespaceID string) (cf.Response, error)
 	ListTurnstileWidgets(ctx context.Context, rc *cf.ResourceContainer, params cf.ListTurnstileWidgetParams) ([]cf.TurnstileWidget, *cf.ResultInfo, error)
+	ListWorkerBindings(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkerBindingsParams) (cf.WorkerBindingListResponse, error)
 	ListWorkerRoutes(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkerRoutesParams) (cf.WorkerRoutesResponse, error)
 	ListWorkersKVNamespaces(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkersKVNamespacesParams) ([]cf.WorkersKVNamespace, *cf.ResultInfo, error)
 	ListWorkersSecrets(ctx context.Context, rc *cf.ResourceContainer, params cf.ListWorkersSecretsParams) (cf.WorkersListSecretsResponse, error)
@@ -58,10 +69,6 @@ type cloudflareAPI interface {
 	UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
 	UpdateWorkerCronTriggers(ctx context.Context, rc *cf.ResourceContainer, params cf.UpdateWorkerCronTriggersParams) ([]cf.WorkerCronTrigger, error)
 	WriteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.WriteWorkersKVEntriesParams) (cf.Response, error)
-	CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error)
-	DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error
-	ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
-	QueryD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error)
 }
 
 type CloudflareAccountManager struct {
@@ -71,12 +78,14 @@ type CloudflareAccountManager struct {
 	logger                *log.Entry
 	hasIPRangeKV          bool
 	NamespaceID           string
-	DatabaseID            string
 	KVPairByDecisionValue map[string]cf.WorkersKVPair
 	ipRangeKVPair         cf.WorkersKVPair
 	ActionByIPRange       map[string]string
 	Worker                *cfg.CloudflareWorkerCreateParams
-	hasD1Access           bool
+	httpClient            *http.Client
+	lastMetricsPoll       time.Time
+	metricsMu             sync.Mutex
+	cumulativeMetrics     map[string]float64
 }
 
 // This function creates a new instance of the CloudflareAccountManager struct,
@@ -113,6 +122,12 @@ func NewCloudflareManager(ctx context.Context, accountCfg cfg.AccountConfig, wor
 		ipRangeKVPair:   cf.WorkersKVPair{Key: IpRangeKeyName, Value: "{}"},
 		ActionByIPRange: make(map[string]string),
 		Worker:          worker,
+		httpClient: &http.Client{
+			Transport: &CloudflareManagerHTTPTransport{accountName: accountCfg.Name},
+			Timeout:   30 * time.Second,
+		},
+		lastMetricsPoll:   time.Now().UTC().Add(-metricsPollLookback).Truncate(time.Second),
+		cumulativeMetrics: make(map[string]float64),
 	}, nil
 }
 
@@ -148,6 +163,83 @@ type ActionsForZone struct {
 	DefaultAction    string   `json:"default_action"`
 }
 
+// enableWorkerObservability PATCHes the script-settings API to enable Workers
+// Observability (logs + traces). This is a direct HTTP call because cloudflare-go
+// v0.116.0 does not expose the observability field.
+func (m *CloudflareAccountManager) enableWorkerObservability(scriptName string) error {
+	obsCfg := m.Worker.Observability
+	if obsCfg == nil {
+		return nil
+	}
+
+	enabled := true
+	if obsCfg.Enabled != nil {
+		enabled = *obsCfg.Enabled
+	}
+
+	samplingRate := 1.0
+	if obsCfg.HeadSamplingRate != nil {
+		samplingRate = *obsCfg.HeadSamplingRate
+	}
+
+	type tracesPayload struct {
+		Enabled          bool    `json:"enabled"`
+		HeadSamplingRate float64 `json:"head_sampling_rate"`
+	}
+	type obsPayload struct {
+		Enabled          bool          `json:"enabled"`
+		HeadSamplingRate float64       `json:"head_sampling_rate"`
+		Traces           tracesPayload `json:"traces"`
+	}
+
+	// Default traces to match top-level settings; override if explicitly configured
+	traces := tracesPayload{Enabled: enabled, HeadSamplingRate: samplingRate}
+	if obsCfg.Traces != nil {
+		if obsCfg.Traces.Enabled != nil {
+			traces.Enabled = *obsCfg.Traces.Enabled
+		}
+		if obsCfg.Traces.HeadSamplingRate != nil {
+			traces.HeadSamplingRate = *obsCfg.Traces.HeadSamplingRate
+		}
+	}
+
+	payload, err := json.Marshal(struct {
+		Observability obsPayload `json:"observability"`
+	}{Observability: obsPayload{
+		Enabled:          enabled,
+		HeadSamplingRate: samplingRate,
+		Traces:           traces,
+	}})
+	if err != nil {
+		return fmt.Errorf("failed to marshal observability payload: %w", err)
+	}
+
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/workers/scripts/%s/script-settings",
+		m.AccountCfg.ID, scriptName)
+
+	req, err := http.NewRequestWithContext(m.Ctx, http.MethodPatch, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("failed to create observability request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+m.AccountCfg.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("observability settings request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("observability settings HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	m.logger.Infof("Configured observability for %s (logs=%t/%.2f, traces=%t/%.2f)",
+		scriptName, enabled, samplingRate, traces.Enabled, traces.HeadSamplingRate)
+	return nil
+}
+
 // Creates a new Cloudflare Workers KV namespace, uploads a new worker script, and binds the worker to one or more routes for
 // each zone configuration in the account. The method also creates a JSON-encoded string of supported actions for each zone
 // and binds it to the worker.
@@ -164,35 +256,6 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	}
 	m.logger.Tracef("KVNS: %+v", kvNSResp)
 	m.NamespaceID = kvNSResp.Result.ID
-
-	//Create the database
-	m.logger.Info("Creating D1 Database for metrics")
-
-	databaseResp, err := m.api.CreateD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateD1DatabaseParams{
-		Name: m.Worker.D1DBName,
-	})
-
-	//This could probably be a check on a more specific error, but because metrics are not critical, we just log the error and continue
-	if err != nil {
-		m.logger.Warnf("Error while creating D1 DB: %s. Remediation component won't be able to send metrics to crowdsec. Make sure your token has the proper permissions.", err)
-		m.hasD1Access = false
-	} else {
-		m.hasD1Access = true
-	}
-
-	if m.hasD1Access {
-		m.DatabaseID = databaseResp.UUID
-
-		_, err = m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
-			DatabaseID: m.DatabaseID,
-			SQL:        sqlCreateTableStatement,
-			Parameters: []string{},
-		})
-
-		if err != nil {
-			return fmt.Errorf("error while creating D1 DB table, make sure your token has the proper permissions: %w", err)
-		}
-	}
 
 	var banTemplate []byte
 	if m.AccountCfg.BanTemplate != "" {
@@ -228,11 +291,18 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 
 	m.logger.Infof("Creating worker %s", m.Worker.ScriptName)
 
-	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.Worker.CreateWorkerParams(workerScript, kvNSResp.Result.ID, varActionsForZoneByDomain, m.DatabaseID))
+	worker, err := m.api.UploadWorker(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), m.Worker.CreateWorkerParams(workerScript, kvNSResp.Result.ID, varActionsForZoneByDomain, m.AccountCfg.Name))
 	m.logger.Tracef("Worker: %+v", worker)
 
 	if err != nil {
 		return err
+	}
+
+	if err := m.enableWorkerObservability(m.Worker.ScriptName); err != nil {
+		// Observability is a developer-experience feature; a misconfiguration
+		// (rate-limit, wrong scope on the token) shouldn't fail the whole deploy
+		// after the worker is already live. Log and continue.
+		m.logger.Warnf("Could not enable observability for %s: %s — deploy will continue without it", m.Worker.ScriptName, err)
 	}
 
 	zg := errgroup.Group{}
@@ -271,7 +341,7 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 
 	// Create bindings for the sync worker
 	bindings := map[string]cf.WorkerBinding{
-		m.Worker.KVNameSpaceName: cf.WorkerKvNamespaceBinding{NamespaceID: m.NamespaceID},
+		cfg.KVWorkerBindingName: cf.WorkerKvNamespaceBinding{NamespaceID: m.NamespaceID},
 		"LAPI_URL": cf.WorkerPlainTextBinding{
 			Text: crowdSecConfig.CrowdSecLAPIUrl,
 		},
@@ -324,6 +394,12 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 		return fmt.Errorf("failed to upload decisions sync worker: %w", err)
 	}
 	m.logger.Tracef("Decisions sync worker: %+v", worker)
+
+	if err := m.enableWorkerObservability(m.Worker.DecisionsSyncScriptName); err != nil {
+		// See note above the bouncer-worker observability call: this is a
+		// non-fatal DX feature; log and continue.
+		m.logger.Warnf("Could not enable observability for %s: %s — deploy will continue without it", m.Worker.DecisionsSyncScriptName, err)
+	}
 
 	// Deploy cron trigger for the decisions sync worker
 	m.logger.Infof("Deploying cron trigger for decisions sync worker: %s", cronSchedule)
@@ -439,54 +515,99 @@ func (m *CloudflareAccountManager) cleanupWorkerScripts() error {
 	return nil
 }
 
-func (m *CloudflareAccountManager) cleanupKVNamespaces() error {
+// findBoundKVNamespaceIDs inspects this instance's worker scripts and returns
+// the set of KV namespace IDs bound under cfg.KVWorkerBindingName. Used to
+// positively identify which namespaces belong to this instance before
+// teardown — without it, two instances sharing a Cloudflare account with the
+// same kv_namespace_name would each delete the other's live KV on teardown.
+// Must be called BEFORE cleanupWorkerScripts; once the script is gone, the
+// binding lookup returns a NotFoundError.
+func (m *CloudflareAccountManager) findBoundKVNamespaceIDs() map[string]struct{} {
+	ids := map[string]struct{}{}
+	scriptNames := []string{m.Worker.ScriptName, m.Worker.DecisionsSyncScriptName}
+	for _, scriptName := range scriptNames {
+		if scriptName == "" {
+			continue
+		}
+		resp, err := m.api.ListWorkerBindings(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListWorkerBindingsParams{
+			ScriptName: scriptName,
+		})
+		if err != nil {
+			var notFoundErr *cf.NotFoundError
+			if errors.As(err, &notFoundErr) {
+				m.logger.Debugf("Worker script %q not deployed; no bindings to inspect", scriptName)
+				continue
+			}
+			m.logger.Warnf("Could not list bindings for worker %q: %s — KV cleanup will fall back to title match for this script", scriptName, err)
+			continue
+		}
+		for _, b := range resp.BindingList {
+			if b.Name != cfg.KVWorkerBindingName {
+				continue
+			}
+			kvBinding, ok := b.Binding.(cf.WorkerKvNamespaceBinding)
+			if !ok || kvBinding.NamespaceID == "" {
+				continue
+			}
+			ids[kvBinding.NamespaceID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+// cleanupKVNamespaces deletes the KV namespaces belonging to this instance.
+// boundIDs (from findBoundKVNamespaceIDs) is the authoritative source: when
+// non-empty, ONLY those exact namespace IDs are deleted, so two instances
+// sharing the same kv_namespace_name can safely tear down independently.
+// When empty (worker script never deployed, or binding lookup failed), this
+// falls back to title-match — and logs a warning enumerating exactly which
+// namespaces are about to be deleted, so an operator notices a collision.
+func (m *CloudflareAccountManager) cleanupKVNamespaces(boundIDs map[string]struct{}) error {
 	m.logger.Debugf("Listing worker KV Namespaces")
 	kvNamespaces, _, err := m.api.ListWorkersKVNamespaces(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListWorkersKVNamespacesParams{})
 	if err != nil {
 		return err
 	}
 	m.logger.Tracef("kvNamespaces: %+v", kvNamespaces)
-	m.logger.Debugf("Done listing worker KV Namespaces")
 
-	for _, kvNamespace := range kvNamespaces {
-		if kvNamespace.Title == m.Worker.KVNameSpaceName {
-			m.logger.Debugf("Deleting worker KV Namespace with ID %s", kvNamespace.ID)
-			_, err := m.api.DeleteWorkersKVNamespace(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), kvNamespace.ID)
-			if err != nil {
+	if len(boundIDs) > 0 {
+		for _, kv := range kvNamespaces {
+			if _, attributed := boundIDs[kv.ID]; !attributed {
+				continue
+			}
+			m.logger.Infof("Deleting KV namespace %q (id: %s, attributed via worker binding)", kv.Title, kv.ID)
+			if _, err := m.api.DeleteWorkersKVNamespace(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), kv.ID); err != nil {
 				return err
 			}
-			m.logger.Debugf("Done deleting worker KV Namespace with ID %s", kvNamespace.ID)
 		}
-	}
-	return nil
-}
-
-func (m *CloudflareAccountManager) cleanupD1Databases(start bool) error {
-	if !m.hasD1Access && !start {
 		return nil
 	}
 
-	m.logger.Debugf("Listing D1 DBs")
-	dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
-
-	if err != nil {
-		if !start {
-			return fmt.Errorf("error while listing D1 DBs, make sure your token has the proper permissions: %w", err)
+	// Title-match fallback: collisions with another instance sharing the same
+	// kv_namespace_name are catastrophic (cross-instance KV wipe), so log
+	// loudly before deleting.
+	var titleMatches []cf.WorkersKVNamespace
+	for _, kv := range kvNamespaces {
+		if kv.Title == m.Worker.KVNameSpaceName {
+			titleMatches = append(titleMatches, kv)
 		}
-		dbs = []cf.D1Database{}
 	}
-
-	m.logger.Tracef("dbs: %+v", dbs)
-
-	for _, db := range dbs {
-		m.logger.Debugf("Checking D1 DB %s vs %s", db.Name, m.Worker.D1DBName)
-		if db.Name == m.Worker.D1DBName {
-			m.logger.Debugf("Deleting D1 DB %s", db.UUID)
-			err = m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID)
-			if err != nil {
-				return fmt.Errorf("error while deleting D1 DB %s, make sure your token has the proper permissions: %w", db.UUID, err)
-			}
-			m.logger.Debugf("Deleted D1 DB %s", db.UUID)
+	if len(titleMatches) == 0 {
+		return nil
+	}
+	matchIDs := make([]string, 0, len(titleMatches))
+	for _, kv := range titleMatches {
+		matchIDs = append(matchIDs, kv.ID)
+	}
+	m.logger.Warnf(
+		"No worker bindings available to attribute KV namespace ownership; falling back to title match. "+
+			"About to delete %d namespace(s) titled %q: %v. "+
+			"If another bouncer instance shares this account, ensure its kv_namespace_name is unique.",
+		len(titleMatches), m.Worker.KVNameSpaceName, matchIDs)
+	for _, kv := range titleMatches {
+		m.logger.Infof("Deleting KV namespace %q (id: %s, attributed via title match)", kv.Title, kv.ID)
+		if _, err := m.api.DeleteWorkersKVNamespace(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), kv.ID); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -494,8 +615,13 @@ func (m *CloudflareAccountManager) cleanupD1Databases(start bool) error {
 
 // This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
 // It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
-func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
+func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 	m.logger.Infof("Cleaning up existing workers")
+
+	// Capture KV namespace IDs from the live worker bindings BEFORE deleting
+	// the worker scripts — once the script is gone, the binding lookup 404s
+	// and cleanupKVNamespaces falls back to title-match (cross-instance risk).
+	boundKVIDs := m.findBoundKVNamespaceIDs()
 
 	if err := m.cleanupTurnstileWidgets(); err != nil {
 		return err
@@ -509,11 +635,7 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 		return err
 	}
 
-	if err := m.cleanupKVNamespaces(); err != nil {
-		return err
-	}
-
-	if err := m.cleanupD1Databases(start); err != nil {
+	if err := m.cleanupKVNamespaces(boundKVIDs); err != nil {
 		return err
 	}
 
@@ -837,66 +959,148 @@ func (m *CloudflareAccountManager) HandleTurnstile() error {
 	return g.Wait()
 }
 
-func (m *CloudflareAccountManager) UpdateMetrics() error {
-	m.logger.Debug("Getting metrics")
-	if !m.hasD1Access {
-		m.logger.Debug("No D1 access, skipping metrics update")
-		return nil
-	}
-	resp, err := m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
-		DatabaseID: m.DatabaseID,
-		SQL:        "SELECT * FROM metrics",
-		Parameters: []string{},
-	})
-	if err != nil {
-		return err
-	}
-	m.logger.Tracef("resp: %+v", resp)
+// aeQueryMeta describes a column returned by the Analytics Engine SQL API.
+type aeQueryMeta struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
 
-	for _, r := range resp {
-		if r.Success == nil || !*r.Success {
-			m.logger.Warnf("Query failed: %+v", r)
+// aeQueryResult represents the JSON response from the Analytics Engine SQL API.
+type aeQueryResult struct {
+	Meta []aeQueryMeta    `json:"meta"`
+	Data []map[string]any `json:"data"`
+	Rows int              `json:"rows"`
+}
+
+func (m *CloudflareAccountManager) queryAnalyticsEngine(query string) (*aeQueryResult, error) {
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/analytics_engine/sql", m.AccountCfg.ID)
+
+	req, err := http.NewRequestWithContext(m.Ctx, http.MethodPost, url, strings.NewReader(query))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AE request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+m.AccountCfg.Token)
+	req.Header.Set("Content-Type", "text/plain")
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("AE query failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read AE response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("AE query returned HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result aeQueryResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse AE response: %w", err)
+	}
+	return &result, nil
+}
+
+func (m *CloudflareAccountManager) UpdateMetrics() error {
+	m.metricsMu.Lock()
+	defer m.metricsMu.Unlock()
+
+	m.logger.Debug("Getting metrics from Analytics Engine")
+
+	// AE only supports second-precision toDateTime. Query the half-open window
+	// [lastMetricsPoll, windowEnd) and advance the cursor to windowEnd so every
+	// second is counted exactly once. windowEnd lags wall-clock by
+	// aeIngestionLag so we don't read across the AE indexing boundary — rows
+	// arriving late within that window land in the next poll instead of being
+	// stepped over and lost forever.
+	windowEnd := time.Now().UTC().Add(-aeIngestionLag).Truncate(time.Second)
+
+	// AE field mapping (must match writeMetricEvent in worker.js):
+	//   blob1 = metric_name, blob2 = ip_type, blob3 = origin, blob4 = remediation_type
+	//   double1 = count (1), double2 = latency_ms
+	// AnalyticsDataset and AccountCfg.Name are allowlist-validated at config load.
+	query := fmt.Sprintf(`SELECT
+		blob1 AS metric_name,
+		blob2 AS ip_type,
+		blob3 AS origin,
+		blob4 AS remediation_type,
+		SUM(_sample_interval * double1) AS val,
+		AVG(double2) AS avg_latency_ms
+	FROM %s
+	WHERE timestamp >= toDateTime('%s')
+		AND timestamp < toDateTime('%s')
+		AND index1 = '%s'
+	GROUP BY metric_name, ip_type, origin, remediation_type
+	FORMAT JSON`,
+		m.Worker.AnalyticsDataset,
+		m.lastMetricsPoll.Format("2006-01-02 15:04:05"),
+		windowEnd.Format("2006-01-02 15:04:05"),
+		m.AccountCfg.Name,
+	)
+
+	result, err := m.queryAnalyticsEngine(query)
+	if err != nil {
+		return fmt.Errorf("unable to query Analytics Engine: %w", err)
+	}
+	m.lastMetricsPoll = windowEnd
+	m.logger.Tracef("AE result: %+v", result)
+
+	for _, row := range result.Data {
+		metricName, ok := row["metric_name"].(string)
+		if !ok {
+			m.logger.Warnf("Invalid metric_name type in AE response: %T", row["metric_name"])
 			continue
 		}
-		for _, data := range r.Results {
-			switch data["metric_name"] {
-			case "processed":
-				val, ok := data["val"].(float64)
-				if !ok {
-					m.logger.Warnf("Invalid value for processed metric: %+v", data)
-					continue
-				}
-				ipType, ok := data["ip_type"].(string)
-				if !ok {
-					m.logger.Warnf("Invalid value for ip_type: %+v", data)
-					continue
-				}
-				metrics.TotalProcessedRequests.With(prometheus.Labels{"ip_type": ipType, "account": m.AccountCfg.Name}).Set(val)
-			case "dropped":
-				val, ok := data["val"].(float64)
-				if !ok {
-					m.logger.Warnf("Invalid value for dropped metric: %+v", data)
-					continue
-				}
-				origin, ok := data["origin"].(string)
-				if !ok {
-					m.logger.Warnf("Invalid value for origin: %+v", data)
-					continue
-				}
-				ipType, ok := data["ip_type"].(string)
-				if !ok {
-					m.logger.Warnf("Invalid value for ip_type: %+v", data)
-					continue
-				}
-				remediation, ok := data["remediation_type"].(string)
-				if !ok {
-					m.logger.Warnf("Invalid value for remediation: %+v", data)
-					continue
-				}
-				metrics.TotalBlockedRequests.With(prometheus.Labels{"origin": origin, "remediation": remediation, "ip_type": ipType, "account": m.AccountCfg.Name}).Set(val)
-			default:
-				m.logger.Warnf("Unknown metric: %+v", data)
-			}
+		val, ok := row["val"].(float64)
+		if !ok {
+			m.logger.Warnf("Invalid val type in AE response for metric %s: %T", metricName, row["val"])
+			continue
+		}
+		var ipType, origin, remediation string
+		if v, ok := row["ip_type"].(string); ok {
+			ipType = v
+		}
+		if v, ok := row["origin"].(string); ok {
+			origin = v
+		}
+		if v, ok := row["remediation_type"].(string); ok {
+			remediation = v
+		}
+
+		switch metricName {
+		case "processed":
+			key := "processed:" + ipType + ":" + m.AccountCfg.Name
+			m.cumulativeMetrics[key] += val
+			metrics.TotalProcessedRequests.With(prometheus.Labels{
+				"ip_type": ipType, "account": m.AccountCfg.Name,
+			}).Set(m.cumulativeMetrics[key])
+		case "dropped":
+			key := "dropped:" + origin + ":" + remediation + ":" + ipType + ":" + m.AccountCfg.Name
+			m.cumulativeMetrics[key] += val
+			metrics.TotalBlockedRequests.With(prometheus.Labels{
+				"origin": origin, "remediation": remediation,
+				"ip_type": ipType, "account": m.AccountCfg.Name,
+			}).Set(m.cumulativeMetrics[key])
+		case "error":
+			key := "error:" + ipType + ":" + m.AccountCfg.Name
+			m.cumulativeMetrics[key] += val
+			metrics.TotalErrors.With(prometheus.Labels{
+				"ip_type": ipType, "account": m.AccountCfg.Name,
+			}).Set(m.cumulativeMetrics[key])
+		default:
+			m.logger.Warnf("Unknown metric from AE: %s", metricName)
+		}
+
+		if latency, ok := row["avg_latency_ms"].(float64); ok {
+			metrics.AverageLatencyMs.With(prometheus.Labels{
+				"account":     m.AccountCfg.Name,
+				"metric_name": metricName,
+				"ip_type":     ipType,
+				"remediation": remediation,
+			}).Set(latency)
 		}
 	}
 

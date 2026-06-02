@@ -7075,6 +7075,8 @@ const getSupportedActionForZone = (action, actionsForDomain) => {
   return actionsForDomain["default_action"];
 };
 
+const TURNSTILE_VERIFY_TIMEOUT_MS = 5000;
+
 const handleTurnstilePost = async (
   request,
   body,
@@ -7091,12 +7093,31 @@ const handleTurnstilePost = async (
   formData.append("remoteip", ip);
 
   const url = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
-  const result = await fetch(url, {
-    body: formData,
-    method: "POST",
-  });
 
-  const outcome = await result.json();
+  // If Turnstile siteverify hangs or errors, we can't decide — fail open to
+  // origin rather than block a user whose captcha submission we couldn't
+  // verify because Cloudflare's own verification API is unavailable.
+  let outcome;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      TURNSTILE_VERIFY_TIMEOUT_MS,
+    );
+    try {
+      const result = await fetch(url, {
+        body: formData,
+        method: "POST",
+        signal: controller.signal,
+      });
+      outcome = await result.json();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch (e) {
+    console.error("Turnstile siteverify unavailable, passing to origin:", e);
+    return fetch(request);
+  }
 
   if (!outcome.success) {
     console.log("Invalid captcha solution");
@@ -7156,7 +7177,20 @@ const writeToKV = async (kv, key, value) => {
         "Unhandled error in worker, passing through to origin:",
         error,
       );
-      return fetch(request);
+      // Defensive double-wrap: if the origin pass-through itself throws (e.g.
+      // origin is unreachable), return a synthetic 502 so the runtime doesn't
+      // surface a 1101 "Worker threw exception" page on top of an existing
+      // outage. Either way the request fails; this just keeps the failure
+      // owned by the bouncer's contract instead of leaking implementation.
+      try {
+        return await fetch(request);
+      } catch (passthroughError) {
+        console.error(
+          "Origin pass-through also failed:",
+          passthroughError,
+        );
+        return new Response("", { status: 502 });
+      }
     }
   },
 
@@ -7194,7 +7228,16 @@ const writeToKV = async (kv, key, value) => {
           console.error("Failed to parse turnstile config:", e);
           return fetch(request);
         }
-        writeToKV(env.CROWDSECCFBOUNCERNS, "TURNSTILE_CONFIG", turnstileCfg);
+        // ctx.waitUntil keeps the KV put alive after we return the response;
+        // otherwise the Workers runtime cancels the unawaited Promise and the
+        // normalised TURNSTILE_CONFIG never lands.
+        ctx.waitUntil(
+          writeToKV(
+            env.CROWDSECCFBOUNCERNS,
+            "TURNSTILE_CONFIG",
+            JSON.stringify(turnstileCfg),
+          ),
+        );
       }
 
       if (!turnstileCfg[zoneForThisRequest]) {
@@ -7368,31 +7411,22 @@ const writeToKV = async (kv, key, value) => {
       return null;
     };
 
-    const incrementMetrics = async (
+    const writeMetricEvent = (
       metricName,
       ipType,
       origin,
-      remediation_type,
+      remediationType,
+      latencyMs,
     ) => {
-      if (env.CROWDSECCFBOUNCERDB !== undefined) {
-        let parameters = [
-          metricName,
-          origin || "",
-          remediation_type || "",
-          ipType,
-        ];
-        let query = `
-          INSERT INTO metrics (val, metric_name, origin, remediation_type, ip_type)
-          VALUES (1, ?, ?, ?, ?)
-          ON CONFLICT(metric_name, origin, remediation_type, ip_type) DO UPDATE SET val=val+1
-        `;
-        try {
-          await env.CROWDSECCFBOUNCERDB.prepare(query)
-            .bind(...parameters)
-            .run();
-        } catch (error) {
-          console.error("Error incrementing metrics:", error);
-        }
+      if (!env.CROWDSECCFBOUNCER_AE) return;
+      try {
+        env.CROWDSECCFBOUNCER_AE.writeDataPoint({
+          indexes: [env.ACCOUNT_NAME || "default"],
+          blobs: [metricName, ipType, origin || "", remediationType || ""],
+          doubles: [1, latencyMs || 0],
+        });
+      } catch (e) {
+        console.error("AE write failed:", e);
       }
     };
 
@@ -7410,48 +7444,75 @@ const writeToKV = async (kv, key, value) => {
       return fetch(request);
     }
 
-    ctx.waitUntil(incrementMetrics("processed", ipType));
+    const start = Date.now();
+    let metricOrigin = "";
+    let metricRemediation = "";
+    let blocked = false;
+    let errored = false;
 
-    let remediation = await getRemediationForRequest(request, env);
-    if (remediation === null) {
-      console.log("No remediation found for request");
-      return fetch(request);
-    }
-    if (typeof env.ACTIONS_BY_DOMAIN === "string") {
-      try {
-        env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
-      } catch (e) {
-        console.error("Failed to parse ACTIONS_BY_DOMAIN:", e);
+    try {
+      let remediation = await getRemediationForRequest(request, env);
+      if (remediation === null) {
+        console.log("No remediation found for request");
         return fetch(request);
       }
-    }
-    const zoneForThisRequest = getZoneFromReqURL(
-      request.url,
-      env.ACTIONS_BY_DOMAIN,
-    );
-    if (!zoneForThisRequest || !env.ACTIONS_BY_DOMAIN[zoneForThisRequest]) {
-      console.log("No matching zone found for request URL, passing through");
-      return fetch(request);
-    }
-    console.log("Zone for this request is " + zoneForThisRequest);
-    remediation = getSupportedActionForZone(
-      remediation,
-      env.ACTIONS_BY_DOMAIN[zoneForThisRequest],
-    );
-    console.log("Remediation for request is " + remediation);
-    switch (remediation) {
-      case "ban":
-        ctx.waitUntil(incrementMetrics("dropped", ipType, "crowdsec", "ban"));
-        return env.LOG_ONLY === "true" ? fetch(request) : await doBan();
-      case "captcha":
-        ctx.waitUntil(
-          incrementMetrics("dropped", ipType, "crowdsec", "captcha"),
-        );
-        return env.LOG_ONLY === "true"
-          ? fetch(request)
-          : await doCaptcha(env, zoneForThisRequest);
-      default:
+      if (typeof env.ACTIONS_BY_DOMAIN === "string") {
+        try {
+          env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
+        } catch (e) {
+          console.error("Failed to parse ACTIONS_BY_DOMAIN:", e);
+          return fetch(request);
+        }
+      }
+      const zoneForThisRequest = getZoneFromReqURL(
+        request.url,
+        env.ACTIONS_BY_DOMAIN,
+      );
+      if (!zoneForThisRequest || !env.ACTIONS_BY_DOMAIN[zoneForThisRequest]) {
+        console.log("No matching zone found for request URL, passing through");
         return fetch(request);
+      }
+      console.log("Zone for this request is " + zoneForThisRequest);
+      remediation = getSupportedActionForZone(
+        remediation,
+        env.ACTIONS_BY_DOMAIN[zoneForThisRequest],
+      );
+      console.log("Remediation for request is " + remediation);
+      switch (remediation) {
+        case "ban":
+          blocked = true;
+          metricOrigin = "crowdsec";
+          metricRemediation = "ban";
+          return env.LOG_ONLY === "true" ? fetch(request) : await doBan();
+        case "captcha":
+          blocked = true;
+          metricOrigin = "crowdsec";
+          metricRemediation = "captcha";
+          return env.LOG_ONLY === "true"
+            ? fetch(request)
+            : await doCaptcha(env, zoneForThisRequest);
+        default:
+          return fetch(request);
+      }
+    } catch (e) {
+      // Record the error metric, then re-throw so the outer fetch() wrapper
+      // catches and passes the request through to origin (per #95).
+      errored = true;
+      throw e;
+    } finally {
+      const latencyMs = Date.now() - start;
+      writeMetricEvent("processed", ipType, "", "", latencyMs);
+      if (errored) {
+        writeMetricEvent("error", ipType, "", "", latencyMs);
+      } else if (blocked) {
+        writeMetricEvent(
+          "dropped",
+          ipType,
+          metricOrigin,
+          metricRemediation,
+          latencyMs,
+        );
+      }
     }
   },
 });

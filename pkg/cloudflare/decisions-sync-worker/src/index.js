@@ -4,7 +4,13 @@
  */
 
 import logger from './utils/logger.js';
-import { isFirstFetch, markAsWarmed, fetchDecisionsStream } from './core/decision-fetcher.js';
+import {
+	isFirstFetch,
+	markAsWarmed,
+	fetchDecisionsStream,
+	tryAcquireSyncLock,
+	releaseSyncLock,
+} from './core/decision-fetcher.js';
 import { processNewDecisions, processDeletedDecisions, mergeRanges, hasRangesChanged } from './core/decision-processor.js';
 import {
 	batchWriteStringBasedDecisions,
@@ -62,146 +68,168 @@ export default {
 
 			const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
 
-			// Check if reset is requested
-			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
-			if (resetRequested) {
-				logger.info('RESET requested: clearing all decision keys from KV...');
-				await resetAllDecisions(
-					env.CF_ACCOUNT_ID,
-					env.CF_KV_NAMESPACE_ID,
-					env.CF_API_TOKEN,
-					env.CROWDSECCFBOUNCERNS
-				);
-				logger.info('KV reset completed, proceeding with fresh decision sync');
+			// Acquire the sync lock so an overlapping cron tick (or a manual run
+			// while a previous one is still in flight) doesn't fan out into a
+			// full-sync storm against LAPI. Released in finally below; TTL is
+			// only a backstop for a hard crash.
+			const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
+			if (!lockAcquired) {
+				logger.info('Sync already in progress, skipping this run');
+				return;
 			}
 
-			// Determine if this is the first fetch
-			const isFirst = await isFirstFetch(env.CROWDSECCFBOUNCERNS);
-			logger.info('Fetch type determined', { isFirstFetch: isFirst });
+			try {
+				// Check if reset is requested
+				const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
+				if (resetRequested) {
+					logger.info('RESET requested: clearing all decision keys from KV...');
+					await resetAllDecisions(
+						env.CF_ACCOUNT_ID,
+						env.CF_KV_NAMESPACE_ID,
+						env.CF_API_TOKEN,
+						env.CROWDSECCFBOUNCERNS
+					);
+					logger.info('KV reset completed, proceeding with fresh decision sync');
+				}
 
-			// Parse optional filter configuration
-			const scenariosContaining = env.INCLUDE_SCENARIOS ? env.INCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
-			const scenariosNotContaining = env.EXCLUDE_SCENARIOS ? env.EXCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
-			const origins = env.ONLY_INCLUDE_ORIGINS ? env.ONLY_INCLUDE_ORIGINS.split(',').map((s) => s.trim()) : [];
+				// Determine if this is the first fetch
+				const isFirst = await isFirstFetch(env.CROWDSECCFBOUNCERNS);
+				logger.info('Fetch type determined', { isFirstFetch: isFirst });
 
-			// Fetch decisions from LAPI
-			const decisions = await fetchDecisionsStream(lapiUrl, env.LAPI_KEY, {
-				startup: isFirst,
-				scenariosContaining,
-				scenariosNotContaining,
-				origins,
-			});
+				// Parse optional filter configuration
+				const scenariosContaining = env.INCLUDE_SCENARIOS ? env.INCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
+				const scenariosNotContaining = env.EXCLUDE_SCENARIOS ? env.EXCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
+				const origins = env.ONLY_INCLUDE_ORIGINS ? env.ONLY_INCLUDE_ORIGINS.split(',').map((s) => s.trim()) : [];
 
-			// Log summary
-			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-			logger.info('Decision stream completed successfully', {
-				duration: `${duration}s`,
-				newDecisions: decisions.new.length,
-				deletedDecisions: decisions.deleted.length,
-			});
-
-			// Handle HTTP 204 (LAPI has no decisions - delete all from KV)
-			if (decisions.deleteAll) {
-				logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
-				await resetAllDecisions(
-					env.CF_ACCOUNT_ID,
-					env.CF_KV_NAMESPACE_ID,
-					env.CF_API_TOKEN,
-					env.CROWDSECCFBOUNCERNS
-				);
-                // No need to handle WARMED_UP flag as there is no decisions at all
-				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-				logger.info('KV cleared successfully (LAPI has no decisions)', {
-					totalDuration: `${finalDuration}s`,
+				// Fetch decisions from LAPI
+				const decisions = await fetchDecisionsStream(lapiUrl, env.LAPI_KEY, {
+					startup: isFirst,
+					scenariosContaining,
+					scenariosNotContaining,
+					origins,
 				});
-				return; // Exit early - no further sync needed
+
+				// Log summary
+				const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+				logger.info('Decision stream completed successfully', {
+					duration: `${duration}s`,
+					newDecisions: decisions.new.length,
+					deletedDecisions: decisions.deleted.length,
+				});
+
+				// Handle HTTP 204 (LAPI has no decisions - delete all from KV)
+				if (decisions.deleteAll) {
+					logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
+					await resetAllDecisions(
+						env.CF_ACCOUNT_ID,
+						env.CF_KV_NAMESPACE_ID,
+						env.CF_API_TOKEN,
+						env.CROWDSECCFBOUNCERNS
+					);
+					// Safe to mark warmed here: KV is now in its intended empty state,
+					// so a crash at this point doesn't leave decisions unwritten.
+					if (isFirst) {
+						await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+						logger.info('Cache marked as warmed (LAPI has no decisions)');
+					}
+					const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+					logger.info('KV cleared successfully (LAPI has no decisions)', {
+						totalDuration: `${finalDuration}s`,
+					});
+					return; // Exit early - no further sync needed
+				}
+
+				// ====================
+				// SYNC TO KV STORE
+				// ====================
+
+				logger.info('Starting KV sync...');
+
+				// Step 1: Get existing IP_RANGES from KV
+				const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
+
+				// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
+				let existingStringDecisions = new Map();
+
+				if (!isFirst) {
+					// On incremental updates, check existing values to avoid redundant writes
+					logger.debug('Incremental update: checking existing decisions in KV');
+					const allStringKeys = [
+						...decisions.new
+							.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+							.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+						...decisions.deleted
+							.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+							.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+					];
+
+					// Remove duplicates
+					const uniqueStringKeys = [...new Set(allStringKeys)];
+
+					// Fetch existing string decisions from KV using bulk API
+					existingStringDecisions = await batchGetStringBasedDecisions(
+						env.CF_ACCOUNT_ID,
+						env.CF_KV_NAMESPACE_ID,
+						env.CF_API_TOKEN,
+						uniqueStringKeys
+					);
+				} else {
+					logger.debug('First run: skipping existence check (KV is empty)');
+				}
+
+				// Step 3: Process new decisions
+				const newProcessed = processNewDecisions(decisions.new, existingStringDecisions, existingRanges);
+				// Step 4: Process deleted decisions
+				const deletedProcessed = processDeletedDecisions(decisions.deleted, existingStringDecisions, existingRanges);
+				// Step 5: Merge ranges (deletions already applied in step 4, now adding new ranges)
+				const finalRanges = mergeRanges(deletedProcessed.updatedRanges, newProcessed.jsonEntries);
+				// Step 6: Write new/updated string decisions (IP, AS, Country) to KV using bulk API
+				if (newProcessed.stringEntries.length > 0) {
+					logger.info('Writing string-based decisions to KV...', { count: newProcessed.stringEntries.length });
+					await batchWriteStringBasedDecisions(
+						env.CF_ACCOUNT_ID,
+						env.CF_KV_NAMESPACE_ID,
+						env.CF_API_TOKEN,
+						newProcessed.stringEntries
+					);
+				}
+				// Step 7: Delete string decisions from KV using bulk API
+				if (deletedProcessed.stringKeysToDelete.length > 0) {
+					logger.info('Deleting string decisions from KV...', { count: deletedProcessed.stringKeysToDelete.length });
+					await batchDeleteStringBasedDecisions(
+						env.CF_ACCOUNT_ID,
+						env.CF_KV_NAMESPACE_ID,
+						env.CF_API_TOKEN,
+						deletedProcessed.stringKeysToDelete
+					);
+				}
+				// Step 8: Update IP_RANGES if changed
+				if (hasRangesChanged(existingRanges, finalRanges)) {
+					logger.info('IP_RANGES changed, updating KV...');
+					await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
+				}
+
+				// Step 9: Mark cache as warmed ONLY after all KV writes have succeeded.
+				// If this runs before the writes, a mid-sync crash leaves WARMED_UP=true
+				// with an empty KV, and the next run does an incremental fetch that
+				// never backfills the missed decisions — a silent enforcement gap.
+				if (isFirst) {
+					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+					logger.info('Cache marked as warmed (first sync complete)');
+				}
+
+				// Final summary
+				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+
+				logger.info('KV sync completed successfully', {
+					totalDuration: `${finalDuration}s`,
+					stringWritten: newProcessed.stringEntries.length,
+					stringDeleted: deletedProcessed.stringKeysToDelete.length,
+					rangesCount: Object.keys(finalRanges).length,
+				});
+			} finally {
+				await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
 			}
-
-			// ====================
-			// SYNC TO KV STORE
-			// ====================
-
-			logger.info('Starting KV sync...');
-
-			// Step 1: Get existing IP_RANGES from KV
-			const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
-
-			// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
-			let existingStringDecisions = new Map();
-
-			if (!isFirst) {
-				// On incremental updates, check existing values to avoid redundant writes
-				logger.debug('Incremental update: checking existing decisions in KV');
-				const allStringKeys = [
-					...decisions.new
-						.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-						.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-					...decisions.deleted
-						.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-						.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-				];
-
-				// Remove duplicates
-				const uniqueStringKeys = [...new Set(allStringKeys)];
-
-				// Fetch existing string decisions from KV using bulk API
-				existingStringDecisions = await batchGetStringBasedDecisions(
-					env.CF_ACCOUNT_ID,
-					env.CF_KV_NAMESPACE_ID,
-					env.CF_API_TOKEN,
-					uniqueStringKeys
-				);
-			} else {
-				logger.debug('First run: skipping existence check (KV is empty)');
-			}
-
-			// Step 3: Process new decisions
-			const newProcessed = processNewDecisions(decisions.new, existingStringDecisions, existingRanges);
-			// Step 4: Process deleted decisions
-			const deletedProcessed = processDeletedDecisions(decisions.deleted, existingStringDecisions, existingRanges);
-			// Step 5: Merge ranges (deletions already applied in step 4, now adding new ranges)
-			const finalRanges = mergeRanges(deletedProcessed.updatedRanges, newProcessed.jsonEntries);
-			// Step 6: Write new/updated string decisions (IP, AS, Country) to KV using bulk API
-			if (newProcessed.stringEntries.length > 0) {
-				logger.info('Writing string-based decisions to KV...', { count: newProcessed.stringEntries.length });
-				await batchWriteStringBasedDecisions(
-					env.CF_ACCOUNT_ID,
-					env.CF_KV_NAMESPACE_ID,
-					env.CF_API_TOKEN,
-					newProcessed.stringEntries
-				);
-			}
-			// Step 7: Delete string decisions from KV using bulk API
-			if (deletedProcessed.stringKeysToDelete.length > 0) {
-				logger.info('Deleting string decisions from KV...', { count: deletedProcessed.stringKeysToDelete.length });
-				await batchDeleteStringBasedDecisions(
-					env.CF_ACCOUNT_ID,
-					env.CF_KV_NAMESPACE_ID,
-					env.CF_API_TOKEN,
-					deletedProcessed.stringKeysToDelete
-				);
-			}
-			// Step 8: Update IP_RANGES if changed
-			if (hasRangesChanged(existingRanges, finalRanges)) {
-				logger.info('IP_RANGES changed, updating KV...');
-				await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
-			}
-
-            // Step 9: Mark cache as warmed after first successful fetch
-            if (isFirst) {
-                await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-                logger.info('Cache marked as warmed after first fetch');
-            }
-
-			// Final summary
-			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-
-			logger.info('KV sync completed successfully', {
-				totalDuration: `${finalDuration}s`,
-				stringWritten: newProcessed.stringEntries.length,
-				stringDeleted: deletedProcessed.stringKeysToDelete.length,
-				rangesCount: Object.keys(finalRanges).length,
-			});
 		} catch (error) {
 			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
 			logger.error('Decision sync failed', {

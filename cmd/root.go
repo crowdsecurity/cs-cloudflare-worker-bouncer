@@ -138,16 +138,12 @@ func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics
 	}
 }
 
-func (m *metricsHandler) computeMetricsHandler(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		for _, manager := range m.cfManagers {
-			err := manager.UpdateMetrics()
-			if err != nil {
-				log.Errorf("unable to update metrics for account %s: %s", manager.AccountCfg.Name, err)
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
+// computeMetricsHandler is a pass-through. UpdateMetrics is driven solely by
+// metricsUpdater on the csbouncer push schedule; polling AE from the scrape
+// path too would give two callers one shared lastMetricsPoll cursor and couple
+// scrape latency to AE API latency.
+func (*metricsHandler) computeMetricsHandler(next http.Handler) http.Handler {
+	return next
 }
 
 func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx context.Context) {
@@ -158,7 +154,7 @@ func cleanUp(managers []*cf.CloudflareAccountManager, c context.CancelFunc, ctx 
 		manager := m
 		manager.Ctx = context.Background()
 		g.Go(func() error {
-			return manager.CleanUpExistingWorkers(false)
+			return manager.CleanUpExistingWorkers()
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -239,7 +235,7 @@ func deployInfraForManagers(g *errgroup.Group, cfManagers []*cf.CloudflareAccoun
 	for _, cfManager := range cfManagers {
 		manager := cfManager
 		g.Go(func() error {
-			err := manager.CleanUpExistingWorkers(true)
+			err := manager.CleanUpExistingWorkers()
 			if err != nil {
 				return fmt.Errorf("unable to cleanup existing workers: %w for account %s", err, manager.AccountCfg.Name)
 			}
@@ -390,7 +386,8 @@ func Execute(opts ExecuteOptions) error {
 	})
 
 	prometheus.MustRegister(csbouncer.TotalLAPICalls, csbouncer.TotalLAPIError, metrics.CloudflareAPICallsByAccount, metrics.TotalKeysByAccount,
-		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests)
+		metrics.TotalActiveDecisions, metrics.TotalBlockedRequests, metrics.TotalProcessedRequests, metrics.AverageLatencyMs,
+		metrics.TotalErrors)
 	if conf.PrometheusConfig.Enabled {
 		g.Go(func() error {
 			http.Handle("/metrics", mHandler.computeMetricsHandler(promhttp.Handler()))
