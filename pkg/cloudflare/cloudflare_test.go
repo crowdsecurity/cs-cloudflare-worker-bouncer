@@ -116,10 +116,6 @@ func resetMetrics() {
 // --- Mock cloudflareAPI ---
 
 type mockCFAPI struct {
-	listD1DatabasesFn  func(context.Context, *cf.ResourceContainer, cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
-	deleteD1DatabaseFn func(context.Context, *cf.ResourceContainer, string) error
-	deleteD1Calls      []string
-
 	// KV cleanup hooks (A-2 multi-instance teardown safety)
 	listWorkerBindingsFn       func(context.Context, *cf.ResourceContainer, cf.ListWorkerBindingsParams) (cf.WorkerBindingListResponse, error)
 	listWorkersKVNamespacesFn  func(context.Context, *cf.ResourceContainer, cf.ListWorkersKVNamespacesParams) ([]cf.WorkersKVNamespace, *cf.ResultInfo, error)
@@ -197,20 +193,6 @@ func (*mockCFAPI) UpdateWorkerCronTriggers(_ context.Context, _ *cf.ResourceCont
 func (*mockCFAPI) WriteWorkersKVEntries(_ context.Context, _ *cf.ResourceContainer, _ cf.WriteWorkersKVEntriesParams) (cf.Response, error) {
 	return cf.Response{}, nil
 }
-func (m *mockCFAPI) ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
-	if m.listD1DatabasesFn != nil {
-		return m.listD1DatabasesFn(ctx, rc, params)
-	}
-	return nil, nil, nil
-}
-func (m *mockCFAPI) DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error {
-	m.deleteD1Calls = append(m.deleteD1Calls, databaseID)
-	if m.deleteD1DatabaseFn != nil {
-		return m.deleteD1DatabaseFn(ctx, rc, databaseID)
-	}
-	return nil
-}
-
 // ============================================================
 // Group 1: queryAnalyticsEngine
 // ============================================================
@@ -584,90 +566,7 @@ func TestUpdateMetrics_MissingLatency_NoError(t *testing.T) {
 }
 
 // ============================================================
-// Group 3: cleanupLegacyD1Databases
-// ============================================================
-
-func TestCleanupLegacyD1_FindsAndDeletes(t *testing.T) {
-	mock := &mockCFAPI{
-		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, _ cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
-			return []cf.D1Database{
-				{UUID: "db-legacy", Name: "CROWDSECCFBOUNCERDB"},
-				{UUID: "db-other", Name: "unrelated-database"},
-			}, nil, nil
-		},
-	}
-
-	m := newTestManager()
-	m.api = mock
-	m.cleanupLegacyD1Databases()
-
-	if len(mock.deleteD1Calls) != 1 {
-		t.Fatalf("expected 1 delete call, got %d", len(mock.deleteD1Calls))
-	}
-	if mock.deleteD1Calls[0] != "db-legacy" {
-		t.Errorf("deleted %q, want db-legacy", mock.deleteD1Calls[0])
-	}
-}
-
-func TestCleanupLegacyD1_NoneFound(t *testing.T) {
-	mock := &mockCFAPI{
-		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, _ cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
-			return []cf.D1Database{
-				{UUID: "db-other", Name: "unrelated-database"},
-			}, nil, nil
-		},
-	}
-
-	m := newTestManager()
-	m.api = mock
-	m.cleanupLegacyD1Databases()
-
-	if len(mock.deleteD1Calls) != 0 {
-		t.Errorf("expected 0 delete calls, got %d", len(mock.deleteD1Calls))
-	}
-}
-
-func TestCleanupLegacyD1_ListError(t *testing.T) {
-	mock := &mockCFAPI{
-		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, _ cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
-			return nil, nil, errors.New("permission denied")
-		},
-	}
-
-	m := newTestManager()
-	m.api = mock
-	// Should not panic or propagate error
-	m.cleanupLegacyD1Databases()
-
-	if len(mock.deleteD1Calls) != 0 {
-		t.Error("should not attempt deletes after list error")
-	}
-}
-
-func TestCleanupLegacyD1_DeleteError(t *testing.T) {
-	mock := &mockCFAPI{
-		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, _ cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
-			return []cf.D1Database{
-				{UUID: "db-legacy", Name: "CROWDSECCFBOUNCERDB"},
-			}, nil, nil
-		},
-		deleteD1DatabaseFn: func(_ context.Context, _ *cf.ResourceContainer, _ string) error {
-			return errors.New("delete failed")
-		},
-	}
-
-	m := newTestManager()
-	m.api = mock
-	// Should warn but not panic
-	m.cleanupLegacyD1Databases()
-
-	if len(mock.deleteD1Calls) != 1 {
-		t.Error("should have attempted delete despite failure")
-	}
-}
-
-// ============================================================
-// Group 4: cleanupKVNamespaces — multi-instance teardown safety
+// Group 3: cleanupKVNamespaces — multi-instance teardown safety
 // ============================================================
 
 // When two bouncer instances share a Cloudflare account with the same

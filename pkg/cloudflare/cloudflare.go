@@ -69,10 +69,6 @@ type cloudflareAPI interface {
 	UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
 	UpdateWorkerCronTriggers(ctx context.Context, rc *cf.ResourceContainer, params cf.UpdateWorkerCronTriggersParams) ([]cf.WorkerCronTrigger, error)
 	WriteWorkersKVEntries(ctx context.Context, rc *cf.ResourceContainer, params cf.WriteWorkersKVEntriesParams) (cf.Response, error)
-	// Legacy D1 methods — retained for one release cycle to clean up orphaned D1 databases
-	// from pre-Analytics-Engine versions. Remove after next release.
-	DeleteD1Database(ctx context.Context, rc *cf.ResourceContainer, databaseID string) error
-	ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
 }
 
 type CloudflareAccountManager struct {
@@ -617,32 +613,9 @@ func (m *CloudflareAccountManager) cleanupKVNamespaces(boundIDs map[string]struc
 	return nil
 }
 
-// cleanupLegacyD1Databases removes D1 databases from pre-Analytics-Engine versions.
-// This is a one-release migration shim — remove after the next release.
-func (m *CloudflareAccountManager) cleanupLegacyD1Databases() {
-	m.logger.Debug("Checking for legacy D1 databases to clean up")
-	dbs, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{})
-	if err != nil {
-		m.logger.Debugf("Could not list D1 databases (token may lack D1:Edit scope): %s", err)
-		return
-	}
-
-	legacyName := "CROWDSECCFBOUNCERDB"
-	for _, db := range dbs {
-		if db.Name == legacyName {
-			m.logger.Infof("Deleting legacy D1 database %s (%s)", db.Name, db.UUID)
-			if err := m.api.DeleteD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), db.UUID); err != nil {
-				m.logger.Warnf("Failed to delete legacy D1 database %s: %s (delete manually via Cloudflare dashboard)", db.UUID, err)
-			} else {
-				m.logger.Infof("Deleted legacy D1 database %s", db.UUID)
-			}
-		}
-	}
-}
-
 // This function checks and destroys the cloudflare infrastructure which could have been deployed by the worker in past.
 // It checks this, by matching the names of the KV namespaces, worker scripts, worker routes and turnstile widgets with the names used by the worker.
-func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
+func (m *CloudflareAccountManager) CleanUpExistingWorkers() error {
 	m.logger.Infof("Cleaning up existing workers")
 
 	// Capture KV namespace IDs from the live worker bindings BEFORE deleting
@@ -664,12 +637,6 @@ func (m *CloudflareAccountManager) CleanUpExistingWorkers(start bool) error {
 
 	if err := m.cleanupKVNamespaces(boundKVIDs); err != nil {
 		return err
-	}
-
-	// Migration shim: clean up D1 databases from pre-Analytics-Engine versions.
-	// Remove this block after one release cycle.
-	if start {
-		m.cleanupLegacyD1Databases()
 	}
 
 	m.logger.Info("Done cleaning up existing workers")
