@@ -1,6 +1,6 @@
 module github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer
 
-go 1.25.5
+go 1.26.3
 
 require (
 	github.com/crowdsecurity/crowdsec v1.7.4
