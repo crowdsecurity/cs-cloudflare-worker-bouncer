@@ -16,7 +16,6 @@ import (
 	"github.com/crowdsecurity/crowdsec/pkg/apiclient"
 	"github.com/crowdsecurity/crowdsec/pkg/models"
 	csbouncer "github.com/crowdsecurity/go-cs-bouncer"
-	"github.com/crowdsecurity/go-cs-lib/ptr"
 	"github.com/crowdsecurity/go-cs-lib/version"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -66,8 +65,8 @@ func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics
 
 	met.Metrics = append(met.Metrics, &models.DetailedMetrics{
 		Meta: &models.MetricsMeta{
-			UtcNowTimestamp:   ptr.Of(time.Now().Unix()),
-			WindowSizeSeconds: ptr.Of(int64(updateInterval.Seconds())),
+			UtcNowTimestamp:   new(time.Now().Unix()),
+			WindowSizeSeconds: new(int64(updateInterval.Seconds())),
 		},
 		Items: make([]*models.MetricsDetailItem, 0),
 	})
@@ -85,15 +84,15 @@ func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics
 				remediation := getLabelValue(labels, "remediation")
 				log.Debugf("Sending active decisions for %s %s %s %s| current value: %f", origin, ipType, remediation, account, value)
 				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
-					Name:  ptr.Of("active_decisions"),
-					Value: ptr.Of(value),
+					Name:  new("active_decisions"),
+					Value: new(value),
 					Labels: map[string]string{
 						"origin":      origin,
 						"ip_type":     ipType,
 						"account":     account,
 						"remediation": remediation,
 					},
-					Unit: ptr.Of("ip"),
+					Unit: new("ip"),
 				})
 			case metrics.BlockedRequestMetricName:
 				labels := metric.GetLabel()
@@ -105,15 +104,15 @@ func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics
 				key := origin + ipType + account + remediation
 				log.Debugf("Sending dropped bytes for %s %s %s %s %f | current value: %f | previous value: %f\n", origin, ipType, remediation, account, value-metrics.LastBlockedRequestValue[key], value, metrics.LastBlockedRequestValue[key])
 				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
-					Name:  ptr.Of("dropped"),
-					Value: ptr.Of(value - metrics.LastBlockedRequestValue[key]),
+					Name:  new("dropped"),
+					Value: new(value - metrics.LastBlockedRequestValue[key]),
 					Labels: map[string]string{
 						"origin":      origin,
 						"ip_type":     ipType,
 						"account":     account,
 						"remediation": remediation,
 					},
-					Unit: ptr.Of("request"),
+					Unit: new("request"),
 				})
 				metrics.LastBlockedRequestValue[key] = value
 			case metrics.ProcessedRequestMetricName:
@@ -124,13 +123,13 @@ func (m *metricsHandler) metricsUpdater(met *models.RemediationComponentsMetrics
 				key := ipType + account
 				log.Debugf("Sending processed packets for %s %s %f | current value: %f | previous value: %f\n", ipType, account, value-metrics.LastProcessedRequestValue[key], value, metrics.LastProcessedRequestValue[key])
 				met.Metrics[0].Items = append(met.Metrics[0].Items, &models.MetricsDetailItem{
-					Name:  ptr.Of("processed"),
-					Value: ptr.Of(value - metrics.LastProcessedRequestValue[key]),
+					Name:  new("processed"),
+					Value: new(value - metrics.LastProcessedRequestValue[key]),
 					Labels: map[string]string{
 						"ip_type": ipType,
 						"account": account,
 					},
-					Unit: ptr.Of("request"),
+					Unit: new("request"),
 				})
 				metrics.LastProcessedRequestValue[key] = value
 			}

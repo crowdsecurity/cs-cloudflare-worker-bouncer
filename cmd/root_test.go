@@ -19,10 +19,6 @@ import (
 	cf "github.com/crowdsecurity/crowdsec-cloudflare-worker-bouncer/pkg/cloudflare"
 )
 
-func PtrTo[T any](v T) *T {
-	return &v
-}
-
 func apiFromManager(m *cf.CloudflareAccountManager) (*cloudflare.API, error) {
 	return cloudflare.NewWithAPIToken(m.AccountCfg.Token)
 }
@@ -358,34 +354,34 @@ func TestBouncer(t *testing.T) {
 			}
 			decisions := []*models.Decision{
 				{
-					Scenario: PtrTo("crowdsecurity/http-probing"),
-					Type:     PtrTo("captcha"),
-					Value:    PtrTo("1.2.3.4"),
-					Scope:    PtrTo("ip"),
+					Scenario: new("crowdsecurity/http-probing"),
+					Type:     new("captcha"),
+					Value:    new("1.2.3.4"),
+					Scope:    new("ip"),
 				},
 				{
-					Scenario: PtrTo("crowdsecurity/http-probing"),
-					Type:     PtrTo("ban"),
-					Value:    PtrTo("1.2.3.4"),
-					Scope:    PtrTo("ip"),
+					Scenario: new("crowdsecurity/http-probing"),
+					Type:     new("ban"),
+					Value:    new("1.2.3.4"),
+					Scope:    new("ip"),
 				},
 				{
-					Scenario: PtrTo("crowdsecurity/http-probing"),
-					Type:     PtrTo("captcha"),
-					Value:    PtrTo("1.2.3.0/24"),
-					Scope:    PtrTo("range"),
+					Scenario: new("crowdsecurity/http-probing"),
+					Type:     new("captcha"),
+					Value:    new("1.2.3.0/24"),
+					Scope:    new("range"),
 				},
 				{
-					Scenario: PtrTo("crowdsecurity/http-probing"),
-					Type:     PtrTo("captcha"),
-					Value:    PtrTo("1234"),
-					Scope:    PtrTo("as"),
+					Scenario: new("crowdsecurity/http-probing"),
+					Type:     new("captcha"),
+					Value:    new("1234"),
+					Scope:    new("as"),
 				},
 				{
-					Scenario: PtrTo("crowdsecurity/http-probing"),
-					Type:     PtrTo("captcha"),
-					Value:    PtrTo("CN"),
-					Scope:    PtrTo("country"),
+					Scenario: new("crowdsecurity/http-probing"),
+					Type:     new("captcha"),
+					Value:    new("CN"),
+					Scope:    new("country"),
 				},
 			}
 			// insert decisions
