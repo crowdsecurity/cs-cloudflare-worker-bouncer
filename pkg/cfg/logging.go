@@ -68,7 +68,7 @@ func (c *LoggingConfig) setDefaults() {
 	}
 
 	if c.CompressLogs == nil {
-		c.CompressLogs = ptr.Of(true)
+		c.CompressLogs = new(true)
 	}
 }
 
