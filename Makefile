@@ -80,6 +80,10 @@ build: clean binary
 lint:
 	golangci-lint run
 
+.PHONY: test
+test:
+	@$(GOTEST) $(LD_OPTS) ./...
+
 .PHONY: end-to-end-test
 end-to-end-test:
 	@$(GOTEST) $(LD_OPTS) ./cmd/
