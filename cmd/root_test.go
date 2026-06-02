@@ -267,7 +267,7 @@ func TestBouncer(t *testing.T) {
 	logrus.AddHook(rh)
 	var cloudflareToken = os.Getenv("CLOUDFLARE_TOKEN")
 	if cloudflareToken == "" {
-		t.Fatal("CLOUDFLARE_TOKEN not set")
+		t.Skip("CLOUDFLARE_TOKEN not set")
 	}
 	api, err := cloudflare.NewWithAPIToken(cloudflareToken)
 	if err != nil {
