@@ -7,6 +7,18 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    groups:
+      gomod-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      gomod-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "npm"
     directories:
@@ -14,5 +26,34 @@ updates:
      - "/pkg/cloudflare/decisions-sync-worker/"
     schedule:
       interval: "weekly"
-    
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      npm-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      actions-minor:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
 ## open-pull-requests-limit: 0 will only create security updates default
