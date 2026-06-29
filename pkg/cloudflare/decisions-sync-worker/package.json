@@ -6,8 +6,8 @@
   "main": "src/index.js",
   "type": "module",
   "devDependencies": {
-    "webpack": "^5.107.2",
-    "webpack-cli": "7.0.3"
+    "webpack": "^5.108.1",
+    "webpack-cli": "7.1.0"
   },
   "scripts": {
     "build": "webpack --config webpack.config.cjs"
