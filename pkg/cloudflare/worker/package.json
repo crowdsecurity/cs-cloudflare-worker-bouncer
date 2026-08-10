@@ -6,7 +6,7 @@
   "main": "worker.js",
   "devDependencies": {
     "webpack": "^5.99.5",
-    "webpack-cli": "7.0.3"
+    "webpack-cli": "7.2.2"
   },
   "scripts": {
     "build": "webpack --config webpack.config.js"
@@ -14,9 +14,9 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@tsndr/cloudflare-worker-jwt": "3.2.1",
+    "@tsndr/cloudflare-worker-jwt": "3.2.2",
     "cookie": "^1.0.2",
-    "ipaddr.js": "2.4.0",
+    "ipaddr.js": "2.5.0",
     "jsonwebtoken": "9.0.3",
     "node-polyfill-webpack-plugin": "4.1.0"
   }
