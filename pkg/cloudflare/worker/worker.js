@@ -294,11 +294,17 @@ export default {
     };
 
     const getRemediationForRequest = async (request, env) => {
+      const sourceIP = request.headers.get("CF-Connecting-IP");
+
       console.log("Checking for decision against the IP");
-      const clientIP = request.headers.get("CF-Connecting-IP");
-      let value = await getFromKV(env.CROWDSECCFBOUNCERNS, clientIP);
-      if (value !== null) {
-        return value;
+      const actionForIP = await getFromKV(env.CROWDSECCFBOUNCERNS, sourceIP);
+      if (actionForIP !== null) {
+        return {
+          sourceIP,
+          remediationAction: actionForIP,
+          scope: "IP",
+          scopeValue: sourceIP,
+        };
       }
 
       console.log("Checking for decision against the IP ranges");
@@ -315,17 +321,22 @@ export default {
         }
       }
       if (actionByIPRange !== null) {
-        let clientIPAddr;
+        let sourceIPAddr;
         try {
-          clientIPAddr = ipaddr.parse(clientIP);
+          sourceIPAddr = ipaddr.parse(sourceIP);
         } catch (e) {
           console.error("Failed to parse client IP for range matching:", e);
           return null;
         }
         for (const [range, action] of Object.entries(actionByIPRange)) {
           try {
-            if (clientIPAddr.match(ipaddr.parseCIDR(range))) {
-              return action;
+            if (sourceIPAddr.match(ipaddr.parseCIDR(range))) {
+              return {
+                sourceIP,
+                remediationAction: action,
+                scope: "Range",
+                scopeValue: range,
+              };
             }
           } catch (error) {
             // This happens when trying to match IPv6 address with IPv4 CIDR (or vice versa)
@@ -335,21 +346,32 @@ export default {
       }
       // Check for decision against the AS
       if (request.cf && request.cf.asn) {
-        const clientASN = request.cf.asn.toString();
-        value = await getFromKV(env.CROWDSECCFBOUNCERNS, clientASN);
-        if (value !== null) {
-          return value;
+        const sourceASN = request.cf.asn.toString();
+        const actionForASN = await getFromKV(env.CROWDSECCFBOUNCERNS, sourceASN);
+        if (actionForASN !== null) {
+          return {
+            sourceIP,
+            remediationAction: actionForASN,
+            scope: "ASN",
+            scopeValue: sourceASN,
+          };
         }
       }
 
       // Check for decision against the country of the request
       if (request.cf && request.cf.country) {
-        value = await getFromKV(
+        const sourceCountry = request.cf.country.toLowerCase();
+        const actionForCountry = await getFromKV(
           env.CROWDSECCFBOUNCERNS,
-          request.cf.country.toLowerCase(),
+          sourceCountry,
         );
-        if (value !== null) {
-          return value;
+        if (actionForCountry !== null) {
+          return {
+            sourceIP,
+            remediationAction: actionForCountry,
+            scope: "Country",
+            scopeValue: sourceCountry,
+          };
         }
       }
       return null;
@@ -361,12 +383,21 @@ export default {
       origin,
       remediationType,
       latencyMs,
+      sourceIP,
+      requestURL,
     ) => {
       if (!env.CROWDSECCFBOUNCER_AE) return;
       try {
         env.CROWDSECCFBOUNCER_AE.writeDataPoint({
           indexes: [env.ACCOUNT_NAME || "default"],
-          blobs: [metricName, ipType, origin || "", remediationType || ""],
+          blobs: [
+            metricName,
+            ipType,
+            origin || "",
+            remediationType || "",
+            sourceIP || "",
+            requestURL || "",
+          ],
           doubles: [1, latencyMs || 0],
         });
       } catch (e) {
@@ -395,11 +426,8 @@ export default {
     let errored = false;
 
     try {
-      let remediation = await getRemediationForRequest(request, env);
-      if (remediation === null) {
-        console.log("No remediation found for request");
-        return fetch(request);
-      }
+      // Check the possible remediation for this domain
+        // If we can't find any we just pass the request through
       if (typeof env.ACTIONS_BY_DOMAIN === "string") {
         try {
           env.ACTIONS_BY_DOMAIN = JSON.parse(env.ACTIONS_BY_DOMAIN);
@@ -417,12 +445,24 @@ export default {
         return fetch(request);
       }
       console.log("Zone for this request is " + zoneForThisRequest);
-      remediation = getSupportedActionForZone(
-        remediation,
+
+      // Get the remediation details for this request (on IP, Range, ASN or Country)
+        // And then match the action with the supported actions for this zone
+      const remediationDetails = await getRemediationForRequest(request, env);
+      if (remediationDetails === null) {
+        console.log("No remediation found for request");
+        return fetch(request);
+      }
+      console.log(
+        `Found action for IP=${remediationDetails.sourceIP} is "${remediationDetails.remediationAction}", Matched on scope=${remediationDetails.scope} value=${remediationDetails.scopeValue}`,
+      );
+
+      const remediationAction = getSupportedActionForZone(
+        remediationDetails.remediationAction,
         env.ACTIONS_BY_DOMAIN[zoneForThisRequest],
       );
-      console.log("Remediation for request is " + remediation);
-      switch (remediation) {
+      console.log("Applied action for request is " + remediationAction);
+      switch (remediationAction) {
         case "ban":
           blocked = true;
           metricOrigin = "crowdsec";
@@ -455,6 +495,8 @@ export default {
           metricOrigin,
           metricRemediation,
           latencyMs,
+          clientIP,
+          request.url,
         );
       }
     }
