@@ -384,7 +384,7 @@ export default {
       remediationType,
       latencyMs,
       sourceIP,
-      requestURL,
+      requestHostAndPath,
     ) => {
       if (!env.CROWDSECCFBOUNCER_AE) return;
       try {
@@ -396,7 +396,7 @@ export default {
             origin || "",
             remediationType || "",
             sourceIP || "",
-            requestURL || "",
+            requestHostAndPath || "",
           ],
           doubles: [1, latencyMs || 0],
         });
@@ -489,6 +489,7 @@ export default {
       if (errored) {
         writeMetricEvent("error", ipType, "", "", latencyMs);
       } else if (blocked) {
+        const requestURL = new URL(request.url);
         writeMetricEvent(
           "dropped",
           ipType,
@@ -496,7 +497,7 @@ export default {
           metricRemediation,
           latencyMs,
           clientIP,
-          request.url,
+          requestURL.hostname + requestURL.pathname,
         );
       }
     }

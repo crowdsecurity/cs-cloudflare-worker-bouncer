@@ -2040,7 +2040,7 @@ const writeToKV = async (kv, key, value) => {
       remediationType,
       latencyMs,
       sourceIP,
-      requestURL,
+      requestHostAndPath,
     ) => {
       if (!env.CROWDSECCFBOUNCER_AE) return;
       try {
@@ -2052,7 +2052,7 @@ const writeToKV = async (kv, key, value) => {
             origin || "",
             remediationType || "",
             sourceIP || "",
-            requestURL || "",
+            requestHostAndPath || "",
           ],
           doubles: [1, latencyMs || 0],
         });
@@ -2145,6 +2145,7 @@ const writeToKV = async (kv, key, value) => {
       if (errored) {
         writeMetricEvent("error", ipType, "", "", latencyMs);
       } else if (blocked) {
+        const requestURL = new URL(request.url);
         writeMetricEvent(
           "dropped",
           ipType,
@@ -2152,7 +2153,7 @@ const writeToKV = async (kv, key, value) => {
           metricRemediation,
           latencyMs,
           clientIP,
-          request.url,
+          requestURL.hostname + requestURL.pathname,
         );
       }
     }
