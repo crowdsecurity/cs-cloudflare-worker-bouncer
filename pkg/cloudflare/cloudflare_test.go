@@ -121,6 +121,14 @@ type mockCFAPI struct {
 	listWorkersKVNamespacesFn  func(context.Context, *cf.ResourceContainer, cf.ListWorkersKVNamespacesParams) ([]cf.WorkersKVNamespace, *cf.ResultInfo, error)
 	deleteWorkersKVNamespaceFn func(context.Context, *cf.ResourceContainer, string) (cf.Response, error)
 	deleteKVCalls              []string
+
+	uploadWorkerFn   func(context.Context, *cf.ResourceContainer, cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
+	uploadWorkerCall *cf.CreateWorkerParams
+
+	listD1DatabasesFn  func(context.Context, *cf.ResourceContainer, cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
+	createD1DatabaseFn func(context.Context, *cf.ResourceContainer, cf.CreateD1DatabaseParams) (cf.D1Database, error)
+	queryD1DatabaseFn  func(context.Context, *cf.ResourceContainer, cf.QueryD1DatabaseParams) ([]cf.D1Result, error)
+	d1CallsMade        bool
 }
 
 func (*mockCFAPI) Account(_ context.Context, _ string) (cf.Account, cf.ResultInfo, error) {
@@ -128,6 +136,27 @@ func (*mockCFAPI) Account(_ context.Context, _ string) (cf.Account, cf.ResultInf
 }
 func (*mockCFAPI) CreateTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateTurnstileWidgetParams) (cf.TurnstileWidget, error) {
 	return cf.TurnstileWidget{}, nil
+}
+func (m *mockCFAPI) CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error) {
+	m.d1CallsMade = true
+	if m.createD1DatabaseFn != nil {
+		return m.createD1DatabaseFn(ctx, rc, params)
+	}
+	return cf.D1Database{Name: params.Name, UUID: "test-d1-database-id"}, nil
+}
+func (m *mockCFAPI) ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
+	m.d1CallsMade = true
+	if m.listD1DatabasesFn != nil {
+		return m.listD1DatabasesFn(ctx, rc, params)
+	}
+	return nil, &cf.ResultInfo{}, nil
+}
+func (m *mockCFAPI) QueryD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error) {
+	m.d1CallsMade = true
+	if m.queryD1DatabaseFn != nil {
+		return m.queryD1DatabaseFn(ctx, rc, params)
+	}
+	return nil, nil
 }
 func (*mockCFAPI) CreateWorkerRoute(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkerRouteParams) (cf.WorkerRouteResponse, error) {
 	return cf.WorkerRouteResponse{}, nil
@@ -184,7 +213,11 @@ func (*mockCFAPI) RotateTurnstileWidget(_ context.Context, _ *cf.ResourceContain
 func (*mockCFAPI) SetWorkersSecret(_ context.Context, _ *cf.ResourceContainer, _ cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error) {
 	return cf.WorkersPutSecretResponse{}, nil
 }
-func (*mockCFAPI) UploadWorker(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkerParams) (cf.WorkerScriptResponse, error) {
+func (m *mockCFAPI) UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error) {
+	m.uploadWorkerCall = &params
+	if m.uploadWorkerFn != nil {
+		return m.uploadWorkerFn(ctx, rc, params)
+	}
 	return cf.WorkerScriptResponse{}, nil
 }
 func (*mockCFAPI) UpdateWorkerCronTriggers(_ context.Context, _ *cf.ResourceContainer, _ cf.UpdateWorkerCronTriggersParams) ([]cf.WorkerCronTrigger, error) {
@@ -193,6 +226,7 @@ func (*mockCFAPI) UpdateWorkerCronTriggers(_ context.Context, _ *cf.ResourceCont
 func (*mockCFAPI) WriteWorkersKVEntries(_ context.Context, _ *cf.ResourceContainer, _ cf.WriteWorkersKVEntriesParams) (cf.Response, error) {
 	return cf.Response{}, nil
 }
+
 // ============================================================
 // Group 1: queryAnalyticsEngine
 // ============================================================
@@ -962,5 +996,170 @@ func TestEnableObservability_ExplicitlyDisabled(t *testing.T) {
 	obs := obsFromBody(t, captured.Body)
 	if enabled, ok := obs["enabled"].(bool); !ok || enabled {
 		t.Errorf("enabled = %v, want false", obs["enabled"])
+	}
+}
+
+// ============================================================
+// Group: DeployDecisionsSyncWorker
+// ============================================================
+
+func plainTextBinding(t *testing.T, params *cf.CreateWorkerParams, name string) string {
+	t.Helper()
+	binding, ok := params.Bindings[name]
+	if !ok {
+		t.Fatalf("binding %q missing from CreateWorkerParams", name)
+	}
+	ptBinding, ok := binding.(cf.WorkerPlainTextBinding)
+	if !ok {
+		t.Fatalf("binding %q is %T, want WorkerPlainTextBinding", name, binding)
+	}
+	return ptBinding.Text
+}
+
+func TestDeployDecisionsSyncWorker_DefaultsSyncToKVOnly(t *testing.T) {
+	m := newTestManager()
+	mock := &mockCFAPI{}
+	m.api = mock
+
+	enabled := true
+	syncCfg := cfg.DecisionsSyncWorkerConfig{
+		Cron:     "*/5 * * * *",
+		SyncToKV: &enabled,
+	}
+
+	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if mock.uploadWorkerCall == nil {
+		t.Fatal("UploadWorker was not called")
+	}
+
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_KV"); got != "true" {
+		t.Errorf("SYNC_TO_KV = %q, want %q", got, "true")
+	}
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_IP_LISTS"); got != "false" {
+		t.Errorf("SYNC_TO_IP_LISTS = %q, want %q", got, "false")
+	}
+	if _, ok := mock.uploadWorkerCall.Bindings["IP_LIST_PREFIX"]; ok {
+		t.Error("IP_LIST_PREFIX binding should be absent when SyncToIPLists is disabled")
+	}
+	if _, ok := mock.uploadWorkerCall.Bindings["IP_LIST_BATCH_SIZE"]; ok {
+		t.Error("IP_LIST_BATCH_SIZE binding should be absent when SyncToIPLists is disabled")
+	}
+	if _, ok := mock.uploadWorkerCall.Bindings[IPListQueueDBBindingName]; ok {
+		t.Error("D1 queue database binding should be absent when SyncToIPLists is disabled")
+	}
+	if mock.d1CallsMade {
+		t.Error("no D1 API calls should be made when SyncToIPLists is disabled")
+	}
+}
+
+func TestDeployDecisionsSyncWorker_IPListsEnabled(t *testing.T) {
+	m := newTestManager()
+	var migrationSQL []string
+	mock := &mockCFAPI{
+		queryD1DatabaseFn: func(_ context.Context, _ *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error) {
+			migrationSQL = append(migrationSQL, params.SQL)
+			return nil, nil
+		},
+	}
+	m.api = mock
+
+	syncToKV := false
+	syncCfg := cfg.DecisionsSyncWorkerConfig{
+		Cron:            "*/5 * * * *",
+		SyncToKV:        &syncToKV,
+		SyncToIPLists:   true,
+		IPListPrefix:    "crowdsec_",
+		D1DatabaseName:  "crowdsec_ip_list_queue",
+		IPListBatchSize: 2000,
+	}
+
+	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if mock.uploadWorkerCall == nil {
+		t.Fatal("UploadWorker was not called")
+	}
+
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_KV"); got != "false" {
+		t.Errorf("SYNC_TO_KV = %q, want %q", got, "false")
+	}
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_IP_LISTS"); got != "true" {
+		t.Errorf("SYNC_TO_IP_LISTS = %q, want %q", got, "true")
+	}
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "IP_LIST_PREFIX"); got != "crowdsec_" {
+		t.Errorf("IP_LIST_PREFIX = %q, want %q", got, "crowdsec_")
+	}
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "IP_LIST_BATCH_SIZE"); got != "2000" {
+		t.Errorf("IP_LIST_BATCH_SIZE = %q, want %q", got, "2000")
+	}
+
+	d1Binding, ok := mock.uploadWorkerCall.Bindings[IPListQueueDBBindingName]
+	if !ok {
+		t.Fatal("D1 database binding missing from CreateWorkerParams")
+	}
+	d1, ok := d1Binding.(cf.WorkerD1DatabaseBinding)
+	if !ok {
+		t.Fatalf("D1 binding is %T, want WorkerD1DatabaseBinding", d1Binding)
+	}
+	if d1.DatabaseID != "test-d1-database-id" {
+		t.Errorf("D1 DatabaseID = %q, want %q", d1.DatabaseID, "test-d1-database-id")
+	}
+
+	if len(migrationSQL) != 1 {
+		t.Fatalf("expected exactly 1 migration query, got %d: %v", len(migrationSQL), migrationSQL)
+	}
+	if !strings.Contains(migrationSQL[0], "CREATE TABLE IF NOT EXISTS ip_list_queue") {
+		t.Errorf("migration SQL = %q, want it to create ip_list_queue", migrationSQL[0])
+	}
+}
+
+func TestDeployDecisionsSyncWorker_IPListsEnabled_ReusesExistingD1Database(t *testing.T) {
+	m := newTestManager()
+	mock := &mockCFAPI{
+		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
+			return []cf.D1Database{{Name: params.Name, UUID: "existing-db-id"}}, &cf.ResultInfo{}, nil
+		},
+		createD1DatabaseFn: func(context.Context, *cf.ResourceContainer, cf.CreateD1DatabaseParams) (cf.D1Database, error) {
+			t.Fatal("CreateD1Database should not be called when a matching database already exists")
+			return cf.D1Database{}, nil
+		},
+	}
+	m.api = mock
+
+	syncCfg := cfg.DecisionsSyncWorkerConfig{
+		Cron:           "*/5 * * * *",
+		SyncToIPLists:  true,
+		D1DatabaseName: "crowdsec_ip_list_queue",
+	}
+
+	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	d1Binding := mock.uploadWorkerCall.Bindings[IPListQueueDBBindingName].(cf.WorkerD1DatabaseBinding)
+	if d1Binding.DatabaseID != "existing-db-id" {
+		t.Errorf("D1 DatabaseID = %q, want %q (should reuse existing database)", d1Binding.DatabaseID, "existing-db-id")
+	}
+}
+
+func TestDeployDecisionsSyncWorker_NilSyncToKVDefaultsTrue(t *testing.T) {
+	m := newTestManager()
+	mock := &mockCFAPI{}
+	m.api = mock
+
+	// SyncToKV left nil, as would happen if a caller builds the struct
+	// without going through DecisionsSyncWorkerConfig.setDefaults().
+	syncCfg := cfg.DecisionsSyncWorkerConfig{Cron: "*/5 * * * *"}
+
+	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_KV"); got != "true" {
+		t.Errorf("SYNC_TO_KV = %q, want %q", got, "true")
 	}
 }

@@ -135,6 +135,50 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, i
 
 type DecisionsSyncWorkerConfig struct {
 	Cron string `yaml:"cron"` // Cron schedule for autonomous decisions sync (e.g., "*/5 * * * *" for every 5 minutes)
+
+	// SyncToKV controls whether decisions are synced to the Worker's KV store
+	// (the L7 bouncer worker's data source). Defaults to true.
+	SyncToKV *bool `yaml:"sync_to_kv,omitempty"`
+
+	// SyncToIPLists controls whether 'ip'/'range' scoped decisions are synced
+	// to Cloudflare IP Lists (used for L3/4 firewall-rule bouncing). The IP
+	// Lists themselves and the firewall rules referencing them must be
+	// provisioned externally; this only manages list membership. Defaults to
+	// false.
+	SyncToIPLists bool `yaml:"sync_to_ip_lists,omitempty"`
+
+	// IPListPrefix is the name prefix used to discover which Cloudflare IP
+	// Lists this worker is allowed to manage. Only used when SyncToIPLists is
+	// enabled.
+	IPListPrefix string `yaml:"ip_list_prefix,omitempty"`
+
+	// D1DatabaseName is the name of the D1 database backing the IP list sync
+	// queue. Created automatically on deploy if it doesn't already exist.
+	// Only used when SyncToIPLists is enabled.
+	D1DatabaseName string `yaml:"d1_database_name,omitempty"`
+
+	// IPListBatchSize caps how many queued rows (new adds and expired
+	// removals combined) are processed against Cloudflare IP Lists per sync
+	// tick. Bounding this keeps each tick's Cloudflare API usage predictable
+	// regardless of backlog size — a large warmup drains over many ticks
+	// instead of in one burst. Only used when SyncToIPLists is enabled.
+	IPListBatchSize int `yaml:"ip_list_batch_size,omitempty"`
+}
+
+func (d *DecisionsSyncWorkerConfig) setDefaults() {
+	if d.SyncToKV == nil {
+		enabled := true
+		d.SyncToKV = &enabled
+	}
+	if d.IPListPrefix == "" {
+		d.IPListPrefix = "crowdsec_"
+	}
+	if d.D1DatabaseName == "" {
+		d.D1DatabaseName = "crowdsec_ip_list_queue"
+	}
+	if d.IPListBatchSize == 0 {
+		d.IPListBatchSize = 1000
+	}
 }
 
 type CloudflareConfig struct {
@@ -248,7 +292,8 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 			zoneIDSet[zone.ID] = true
 		}
 	}
-	config.CloudflareConfig.Worker.setDefaults() // set defaults for worker
+	config.CloudflareConfig.Worker.setDefaults()              // set defaults for worker
+	config.CloudflareConfig.DecisionsSyncWorker.setDefaults() // set defaults for decisions sync worker
 
 	if !validAnalyticsDataset.MatchString(config.CloudflareConfig.Worker.AnalyticsDataset) {
 		return nil, fmt.Errorf("invalid analytics_dataset %q: must match %s", config.CloudflareConfig.Worker.AnalyticsDataset, validAnalyticsDataset.String())
@@ -464,4 +509,5 @@ func setDefaults(cfg *BouncerConfig) {
 	}
 	cfg.CloudflareConfig.Worker.setDefaults()
 	cfg.CloudflareConfig.DecisionsSyncWorker.Cron = "*/5 * * * *" // Default: every 5 minutes
+	cfg.CloudflareConfig.DecisionsSyncWorker.setDefaults()
 }

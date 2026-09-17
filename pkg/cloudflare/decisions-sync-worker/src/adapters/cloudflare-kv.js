@@ -239,6 +239,17 @@ export async function shouldReset(kvNamespace) {
 }
 
 /**
+ * Clear the RESET flag. resetAllDecisions already does this as part of
+ * clearing KV, but callers that honor RESET without KV sync enabled (e.g.
+ * IP-list-only mode) must clear it explicitly, or a manual RESET=true would
+ * otherwise never be acknowledged and would keep re-triggering every tick.
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ */
+export async function clearResetFlag(kvNamespace) {
+	await kvNamespace.put(RESET_KEY, 'false');
+}
+
+/**
  * List all keys in KV namespace using Cloudflare API
  * @param {string} accountId - Cloudflare account ID
  * @param {string} namespaceId - KV namespace ID
