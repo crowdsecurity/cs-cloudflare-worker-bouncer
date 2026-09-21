@@ -86,13 +86,13 @@ const SYNC_LOCK_TTL_SECONDS = 300;
 const SUPPORTED_SCOPES = ['ip', 'range', 'as', 'country'];
 
 /**
- * Check if this is the first fetch by looking for the WARMED_UP flag in KV
+ * Check if the cache needs to be warmed up by looking for the WARMED_UP flag in KV
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- * @returns {Promise<boolean>} True if this is the first fetch
+ * @returns {Promise<boolean>} True if the cache needs to be warmed up (WARMED_UP is not exactly 'true')
  */
-async function isFirstFetch(kvNamespace) {
+async function needWarmUp(kvNamespace) {
 	const warmedUpFlag = await kvNamespace.get(WARMED_UP_KEY);
-	return !warmedUpFlag;
+	return warmedUpFlag !== 'true';
 }
 
 /**
@@ -711,10 +711,7 @@ async function shouldReset(kvNamespace) {
 }
 
 /**
- * Clear the RESET flag. resetAllDecisions already does this as part of
- * clearing KV, but callers that honor RESET without KV sync enabled (e.g.
- * IP-list-only mode) must clear it explicitly, or a manual RESET=true would
- * otherwise never be acknowledged and would keep re-triggering every tick.
+ * Clear the RESET state in KV
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
  */
 async function clearResetFlag(kvNamespace) {
@@ -789,10 +786,6 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 	if (keysToDelete.length > 0) {
 		await batchDeleteStringBasedDecisions(accountId, namespaceId, apiToken, keysToDelete);
 	}
-
-	// Step 4: Set RESET to false
-	await kvNamespace.put(RESET_KEY, 'false');
-	logger.info('RESET key set to false');
 
 	logger.info('KV reset completed successfully');
 }
@@ -1373,7 +1366,9 @@ async function clearBackoff(kvNamespace) {
 ;// ./src/index.js
 /**
  * CrowdSec Autonomous Decisions Sync Worker
- * Periodically fetches security decisions from CrowdSec LAPI and updates Cloudflare KV (CROWDSECCFBOUNCERNS) storage
+ * Periodically fetches security decisions from CrowdSec LAPI and updates
+ * exactly one sync target: Cloudflare KV (SYNC_TO_LIST_NOT_KV=false, the
+ * default) or Cloudflare IP Lists (SYNC_TO_LIST_NOT_KV=true).
  */
 
 
@@ -1387,12 +1382,210 @@ const DEFAULT_IP_LIST_PREFIX = 'crowdsec_';
 const DEFAULT_IP_LIST_BATCH_SIZE = 1000;
 
 /**
+ * Scheduled handler
+ * @param {ScheduledEvent} event - The scheduled event
+ * @param {import('./types.js').CrowdSecEnv} env - Environment bindings (secrets, KV namespaces, etc.)
+ * @param {ExecutionContext} _ctx - Execution context
+ */
+async function scheduled(event, env, _ctx) {
+	const startTime = Date.now();
+
+	logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
+
+	try {
+		// The worker always syncs to exactly one target, never both — this
+		// keeps warmup/WARMED_UP handling simple, since there's only ever one
+		// sync target's completion to wait on. Any value other than the
+		// literal string "true" means KV mode (the default).
+		const syncToListsMode = env.SYNC_TO_LIST_NOT_KV === 'true';
+		const syncToKvEnabled = !syncToListsMode;
+		const syncToIpListsEnabled = syncToListsMode;
+
+		// Validate required environment variables
+		if (!env.LAPI_URL) {
+			logger.error('LAPI_URL environment variable is not set');
+			return;
+		}
+
+		if (!env.LAPI_KEY) {
+			logger.error('LAPI_KEY secret is not set');
+			return;
+		}
+
+		// CROWDSECCFBOUNCERNS is required in both modes: it's the L7 worker's
+		// data store in KV mode, and it also holds the sync lock, warmed
+		// flag, reset flag, and IP-list backoff timer in list mode.
+		if (!env.CROWDSECCFBOUNCERNS) {
+			logger.error('CROWDSECCFBOUNCERNS KV namespace is not bound');
+			return;
+		}
+
+		if (!env.CF_ACCOUNT_ID) {
+			logger.error('CF_ACCOUNT_ID environment variable is not set');
+			return;
+		}
+
+		// CF_KV_NAMESPACE_ID is only used for bulk KV API calls
+		if (syncToKvEnabled && !env.CF_KV_NAMESPACE_ID) {
+			logger.error('CF_KV_NAMESPACE_ID environment variable is not set (required when syncing to KV)');
+			return;
+		}
+
+		if (syncToIpListsEnabled && !env.LIST_STATE_DB) {
+			logger.error('LIST_STATE_DB D1 database is not bound (required when syncing to IP Lists)');
+			return;
+		}
+
+		if (!env.CF_API_TOKEN) {
+			logger.error('CF_API_TOKEN secret is not set (required for bulk KV/IP list operations)');
+			return;
+		}
+
+		const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
+
+		// Acquire the sync lock so an overlapping cron tick (or a manual run
+		// while a previous one is still in flight) doesn't fan out into a
+		// full-sync storm against LAPI. Released in finally below; TTL is
+		// only a backstop for a hard crash.
+		const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
+		if (!lockAcquired) {
+			logger.info('Sync already in progress, skipping this run');
+			return;
+		}
+
+		try {
+			// Determine if this is the first fetch
+			const needStartUpFetch = await needWarmUp(env.CROWDSECCFBOUNCERNS);
+			logger.info('Fetch type determined', { startup: needStartUpFetch });
+
+			// Check if reset is requested
+			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
+
+			// Clear residual state before the pull, both on an explicit RESET
+			// and on the very first sync after a cold start — either way,
+			// what's about to be fetched from LAPI (startup=true below) is the
+			// full current state, not a diff, so stale entries from a previous
+			// run must not survive into it.
+			if ((resetRequested || needStartUpFetch) && syncToKvEnabled) {
+				logger.info('Clearing all decision keys from KV before fresh sync...');
+				await resetAllDecisions(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					env.CROWDSECCFBOUNCERNS
+				);
+			}
+			if ((resetRequested || needStartUpFetch) && syncToIpListsEnabled) {
+				logger.info('Clearing all managed IP lists and the sync queue before fresh sync...');
+				await clearAllIpLists(env);
+			}
+			if (resetRequested && syncToIpListsEnabled) {
+				// resetAllDecisions (above) already clears RESET as part of
+				// wiping KV; in IP-list mode it's never called, so clear the
+				// flag here or a manual RESET=true would never be acknowledged
+				// and would keep re-triggering every tick.
+				await clearResetFlag(env.CROWDSECCFBOUNCERNS);
+			}
+
+			// Parse optional filter configuration
+			const scenariosContaining = env.INCLUDE_SCENARIOS ? env.INCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
+			const scenariosNotContaining = env.EXCLUDE_SCENARIOS ? env.EXCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
+			const origins = env.ONLY_INCLUDE_ORIGINS ? env.ONLY_INCLUDE_ORIGINS.split(',').map((s) => s.trim()) : [];
+
+			// Fetch decisions from LAPI
+			const decisions = await fetchDecisionsStream(lapiUrl, env.LAPI_KEY, {
+				startup: needStartUpFetch,
+				scenariosContaining,
+				scenariosNotContaining,
+				origins,
+			});
+
+			// Log summary
+			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+			logger.info('Decision stream completed successfully', {
+				duration: `${duration}s`,
+				newDecisions: decisions.new.length,
+				deletedDecisions: decisions.deleted.length,
+			});
+
+			// Handle HTTP 204 (LAPI has no decisions - clear the active sync target)
+			if (decisions.deleteAll) {
+				if (syncToKvEnabled) {
+					logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
+					await resetAllDecisions(
+						env.CF_ACCOUNT_ID,
+						env.CF_KV_NAMESPACE_ID,
+						env.CF_API_TOKEN,
+						env.CROWDSECCFBOUNCERNS
+					);
+				}
+				if (syncToIpListsEnabled) {
+					await clearAllIpLists(env);
+				}
+				// Safe to mark warmed here: the sync target is now in its
+				// intended empty state, so a crash at this point doesn't leave
+				// decisions unwritten.
+				if (needStartUpFetch) {
+					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+					logger.info('Cache marked as warmed (LAPI has no decisions)');
+				}
+				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+				logger.info('Cleared successfully (LAPI has no decisions)', {
+					totalDuration: `${finalDuration}s`,
+				});
+				return; // Exit early - no further sync needed
+			}
+
+			// syncToKv throws on failure, so reaching markAsWarmed below means
+			// it fully completed. syncToIpLists instead returns a boolean,
+			// since a rate limit or error there is expected, recoverable
+			// progress rather than a hard failure — see its own docs.
+			let syncSucceeded = true;
+			if (syncToKvEnabled) {
+				await syncToKv(env, decisions, needStartUpFetch);
+			} else {
+				syncSucceeded = await syncToIpLists(env, decisions);
+			}
+
+			// Mark cache as warmed ONLY after the sync target has captured
+			// this run's decisions. If this runs before every write actually
+			// landed, a mid-sync crash leaves WARMED_UP=true with some
+			// decisions never applied, and the next run does an incremental
+			// fetch that never backfills what was missed — a silent
+			// enforcement gap.
+			if (needStartUpFetch && syncSucceeded) {
+				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+				logger.info('Cache marked as warmed (first sync complete)');
+			} else if (needStartUpFetch) {
+				logger.warn('First sync incomplete (IP list sync failed); cache not marked as warmed yet');
+			}
+
+			// Final summary
+			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+			logger.info('Decision sync completed successfully', { totalDuration: `${finalDuration}s` });
+		} finally {
+			await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
+		}
+	} catch (error) {
+		const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+		logger.error('Decision sync failed', {
+			duration: `${duration}s`,
+			error: error.message,
+			stack: error.stack,
+		});
+
+		// Don't throw - we want to continue running on the next cron trigger
+		// The existing decisions in KV (if any) will remain valid
+	}
+}
+
+/**
  * Sync decisions to the Worker's KV store (used by the L7 bouncer worker).
  * @param {import('./types.js').CrowdSecEnv} env
  * @param {import('./types.js').DecisionStreamResponse} decisions
- * @param {boolean} isFirst
+ * @param {boolean} needStartUpFetch
  */
-async function syncToKv(env, decisions, isFirst) {
+async function syncToKv(env, decisions, needStartUpFetch) {
 	logger.info('Starting KV sync...');
 
 	// Step 1: Get existing IP_RANGES from KV
@@ -1401,7 +1594,7 @@ async function syncToKv(env, decisions, isFirst) {
 	// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
 	let existingStringDecisions = new Map();
 
-	if (!isFirst) {
+	if (!needStartUpFetch) {
 		// On incremental updates, check existing values to avoid redundant writes
 		logger.debug('Incremental update: checking existing decisions in KV');
 		const allStringKeys = [
@@ -1424,7 +1617,7 @@ async function syncToKv(env, decisions, isFirst) {
 			uniqueStringKeys
 		);
 	} else {
-		logger.debug('First run: skipping existence check (KV is empty)');
+		logger.debug('Startup fetch: skipping existence check (KV is empty)');
 	}
 
 	// Step 3: Process new decisions
@@ -1467,25 +1660,24 @@ async function syncToKv(env, decisions, isFirst) {
  * externally — this only fills/empties membership of lists whose name
  * starts with IP_LIST_PREFIX.
  *
- * The D1 table (env.CROWDSECCFBOUNCER_QUEUE_DB) is the single source of
- * truth for both pending work and current membership — see
- * cloudflare-ip-lists.js for the row shape. Each tick: expired decisions are
- * upserted as list_action='delete' and new decisions as list_action='new'
- * (delete always wins if the same IP appears in both this tick), then a
- * bounded slice of pending deletes/adds is applied to Cloudflare. This makes
- * a large warmup (which can take days at realistic decision volumes)
- * resumable — a rate limit or error mid-tick just leaves the rest pending
- * for next time — and an append-only add / id-targeted remove never
- * overwrites IPs some other process added to the same lists, unlike a
- * full-replace would.
+ * The D1 table (env.LIST_STATE_DB) is the single source of truth for both
+ * pending work and current membership — see cloudflare-ip-lists.js for the
+ * row shape. Each tick: expired decisions are upserted as
+ * list_action='delete' and new decisions as list_action='new' (delete always
+ * wins if the same IP appears in both this tick), then a bounded slice of
+ * pending deletes/adds is applied to Cloudflare. This makes a large warmup
+ * (which can take days at realistic decision volumes) resumable — a rate
+ * limit or error mid-tick just leaves the rest pending for next time — and
+ * an append-only add / id-targeted remove never overwrites IPs some other
+ * process added to the same lists, unlike a full-replace would.
  *
  * On the first sync after a cold start, the caller clears both the table and
  * the managed lists (clearAllIpLists) before this runs, so what's upserted
  * here is a clean full-state pull rather than layered on residue from a
  * previously interrupted warmup. Draining pending adds toward Cloudflare is
  * a separate, ongoing process that continues across ticks regardless of
- * isFirst — WARMED_UP only means "the initial full pull from LAPI has been
- * captured", not "every pending add has been pushed".
+ * needStartUpFetch — WARMED_UP only means "the initial full pull from LAPI
+ * has been captured", not "every pending add has been pushed".
  *
  * @param {import('./types.js').CrowdSecEnv} env
  * @param {import('./types.js').DecisionStreamResponse} decisions
@@ -1506,7 +1698,7 @@ async function syncToIpLists(env, decisions) {
 
 	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
 	const batchSize = env.IP_LIST_BATCH_SIZE ? parseInt(env.IP_LIST_BATCH_SIZE, 10) : DEFAULT_IP_LIST_BATCH_SIZE;
-	const db = env.CROWDSECCFBOUNCER_QUEUE_DB;
+	const db = env.LIST_STATE_DB;
 
 	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
 	if (lists.length === 0) {
@@ -1660,7 +1852,7 @@ async function clearAllIpLists(env) {
 	logger.info('Clearing all managed IP lists...');
 
 	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
-	const db = env.CROWDSECCFBOUNCER_QUEUE_DB;
+	const db = env.LIST_STATE_DB;
 	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
 	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
 	const listedByList = await readAllListed(db);
@@ -1685,212 +1877,6 @@ async function clearAllIpLists(env) {
 	logger.info('All managed IP lists cleared successfully', { listCount: lists.length, listsUpdated: clearedLists });
 }
 
-/* harmony default export */ const src = ({
-	/**
-	 * Scheduled handler
-	 * @param {ScheduledEvent} event - The scheduled event
-	 * @param {import('./types.js').CrowdSecEnv} env - Environment bindings (secrets, KV namespaces, etc.)
-	 * @param {ExecutionContext} _ctx - Execution context
-	 */
-	async scheduled(event, env, _ctx) {
-		const startTime = Date.now();
-
-		logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
-
-		try {
-			// Both sync targets default to their historical behavior: KV sync
-			// (the L7 bouncer worker's data source) is on unless explicitly
-			// disabled; IP list sync (L3/4 firewall rules) is off unless opted in.
-			const syncToKvEnabled = env.SYNC_TO_KV !== 'false';
-			const syncToIpListsEnabled = env.SYNC_TO_IP_LISTS === 'true';
-
-			if (!syncToKvEnabled && !syncToIpListsEnabled) {
-				logger.error('Both SYNC_TO_KV and SYNC_TO_IP_LISTS are disabled; nothing to do');
-				return;
-			}
-
-			// Validate required environment variables
-			if (!env.LAPI_URL) {
-				logger.error('LAPI_URL environment variable is not set');
-				return;
-			}
-
-			if (!env.LAPI_KEY) {
-				logger.error('LAPI_KEY secret is not set');
-				return;
-			}
-
-			// CROWDSECCFBOUNCERNS is required in both modes: it's the L7 worker's
-			// data store in KV mode, and it also holds the sync lock, warmed
-			// flag, reset flag, and the IP list membership index in list mode.
-			if (!env.CROWDSECCFBOUNCERNS) {
-				logger.error('CROWDSECCFBOUNCERNS KV namespace is not bound');
-				return;
-			}
-
-			if (!env.CF_ACCOUNT_ID) {
-				logger.error('CF_ACCOUNT_ID environment variable is not set');
-				return;
-			}
-
-			if (syncToKvEnabled && !env.CF_KV_NAMESPACE_ID) {
-				logger.error('CF_KV_NAMESPACE_ID environment variable is not set (required when SYNC_TO_KV is enabled)');
-				return;
-			}
-
-			if (syncToIpListsEnabled && !env.CROWDSECCFBOUNCER_QUEUE_DB) {
-				logger.error('CROWDSECCFBOUNCER_QUEUE_DB D1 database is not bound (required when SYNC_TO_IP_LISTS is enabled)');
-				return;
-			}
-
-			if (!env.CF_API_TOKEN) {
-				logger.error('CF_API_TOKEN secret is not set (required for bulk KV/IP list operations)');
-				return;
-			}
-
-			const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
-
-			// Acquire the sync lock so an overlapping cron tick (or a manual run
-			// while a previous one is still in flight) doesn't fan out into a
-			// full-sync storm against LAPI. Released in finally below; TTL is
-			// only a backstop for a hard crash.
-			const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
-			if (!lockAcquired) {
-				logger.info('Sync already in progress, skipping this run');
-				return;
-			}
-
-			try {
-				// Determine if this is the first fetch
-				const isFirst = await isFirstFetch(env.CROWDSECCFBOUNCERNS);
-				logger.info('Fetch type determined', { isFirstFetch: isFirst });
-
-				// Check if reset is requested
-				const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
-
-				// Clear residual state before the pull, both on an explicit RESET
-				// and on the very first sync after a cold start — either way,
-				// what's about to be fetched from LAPI (startup=true below) is the
-				// full current state, not a diff, so stale entries from a previous
-				// run (KV keys, D1 queue rows, IP list membership) must not survive
-				// into it.
-				if ((resetRequested || isFirst) && syncToKvEnabled) {
-					logger.info('Clearing all decision keys from KV before fresh sync...');
-					await resetAllDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						env.CROWDSECCFBOUNCERNS
-					);
-				}
-				if ((resetRequested || isFirst) && syncToIpListsEnabled) {
-					logger.info('Clearing all managed IP lists and the sync queue before fresh sync...');
-					await clearAllIpLists(env);
-				}
-				if (resetRequested && !syncToKvEnabled) {
-					// resetAllDecisions (above) already clears RESET as part of
-					// wiping KV; in IP-list-only mode it's never called, so clear
-					// the flag here or a manual RESET=true would never be
-					// acknowledged and would keep re-triggering every tick.
-					await clearResetFlag(env.CROWDSECCFBOUNCERNS);
-				}
-
-				// Parse optional filter configuration
-				const scenariosContaining = env.INCLUDE_SCENARIOS ? env.INCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
-				const scenariosNotContaining = env.EXCLUDE_SCENARIOS ? env.EXCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
-				const origins = env.ONLY_INCLUDE_ORIGINS ? env.ONLY_INCLUDE_ORIGINS.split(',').map((s) => s.trim()) : [];
-
-				// Fetch decisions from LAPI
-				const decisions = await fetchDecisionsStream(lapiUrl, env.LAPI_KEY, {
-					startup: isFirst,
-					scenariosContaining,
-					scenariosNotContaining,
-					origins,
-				});
-
-				// Log summary
-				const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-				logger.info('Decision stream completed successfully', {
-					duration: `${duration}s`,
-					newDecisions: decisions.new.length,
-					deletedDecisions: decisions.deleted.length,
-				});
-
-				// Handle HTTP 204 (LAPI has no decisions - delete all from KV)
-				if (decisions.deleteAll) {
-					if (syncToKvEnabled) {
-						logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
-						await resetAllDecisions(
-							env.CF_ACCOUNT_ID,
-							env.CF_KV_NAMESPACE_ID,
-							env.CF_API_TOKEN,
-							env.CROWDSECCFBOUNCERNS
-						);
-					}
-					if (syncToIpListsEnabled) {
-						await clearAllIpLists(env);
-					}
-					// Safe to mark warmed here: KV is now in its intended empty state,
-					// so a crash at this point doesn't leave decisions unwritten.
-					if (isFirst) {
-						await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-						logger.info('Cache marked as warmed (LAPI has no decisions)');
-					}
-					const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-					logger.info('Cleared successfully (LAPI has no decisions)', {
-						totalDuration: `${finalDuration}s`,
-					});
-					return; // Exit early - no further sync needed
-				}
-
-				if (syncToKvEnabled) {
-					// Throws on failure, so reaching the next line means it fully completed.
-					await syncToKv(env, decisions, isFirst);
-				}
-
-				// syncToIpLists upserts the full incoming batch into the D1 queue
-				// before attempting any Cloudflare push, so WARMED_UP (meaning "the
-				// initial full pull from LAPI has been captured") is correct even if
-				// the push itself is rate-limited or fails — that failure only
-				// delays draining the queue toward Cloudflare, a separate ongoing
-				// process independent of isFirst. Only treat it as blocking warmup
-				// if it fails outright (returns false).
-				let ipListsSucceeded = true;
-				if (syncToIpListsEnabled) {
-					ipListsSucceeded = await syncToIpLists(env, decisions);
-				}
-
-				// Mark cache as warmed ONLY after all enabled sync targets have
-				// captured this run's decisions. If this runs before every write
-				// actually landed, a mid-sync crash leaves WARMED_UP=true with some
-				// decisions never applied, and the next run does an incremental
-				// fetch that never backfills what was missed — a silent
-				// enforcement gap.
-				if (isFirst && ipListsSucceeded) {
-					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-					logger.info('Cache marked as warmed (first sync complete)');
-				} else if (isFirst) {
-					logger.warn('First sync incomplete (IP list sync failed); cache not marked as warmed yet');
-				}
-
-				// Final summary
-				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-				logger.info('Decision sync completed successfully', { totalDuration: `${finalDuration}s` });
-			} finally {
-				await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
-			}
-		} catch (error) {
-			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-			logger.error('Decision sync failed', {
-				duration: `${duration}s`,
-				error: error.message,
-				stack: error.stack,
-			});
-
-			// Don't throw - we want to continue running on the next cron trigger
-			// The existing decisions in KV (if any) will remain valid
-		}
-	},
-});
+/* harmony default export */ const src = ({ scheduled });
 
 export { src as default };

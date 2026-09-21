@@ -1016,16 +1016,14 @@ func plainTextBinding(t *testing.T, params *cf.CreateWorkerParams, name string) 
 	return ptBinding.Text
 }
 
-func TestDeployDecisionsSyncWorker_DefaultsSyncToKVOnly(t *testing.T) {
+func TestDeployDecisionsSyncWorker_DefaultsToKV(t *testing.T) {
 	m := newTestManager()
 	mock := &mockCFAPI{}
 	m.api = mock
 
-	enabled := true
-	syncCfg := cfg.DecisionsSyncWorkerConfig{
-		Cron:     "*/5 * * * *",
-		SyncToKV: &enabled,
-	}
+	// SyncToListNotKV left at its zero value (false), as happens for any
+	// config that doesn't explicitly opt into IP-list mode.
+	syncCfg := cfg.DecisionsSyncWorkerConfig{Cron: "*/5 * * * *"}
 
 	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1035,23 +1033,20 @@ func TestDeployDecisionsSyncWorker_DefaultsSyncToKVOnly(t *testing.T) {
 		t.Fatal("UploadWorker was not called")
 	}
 
-	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_KV"); got != "true" {
-		t.Errorf("SYNC_TO_KV = %q, want %q", got, "true")
-	}
-	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_IP_LISTS"); got != "false" {
-		t.Errorf("SYNC_TO_IP_LISTS = %q, want %q", got, "false")
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_LIST_NOT_KV"); got != "false" {
+		t.Errorf("SYNC_TO_LIST_NOT_KV = %q, want %q", got, "false")
 	}
 	if _, ok := mock.uploadWorkerCall.Bindings["IP_LIST_PREFIX"]; ok {
-		t.Error("IP_LIST_PREFIX binding should be absent when SyncToIPLists is disabled")
+		t.Error("IP_LIST_PREFIX binding should be absent when SyncToListNotKV is false")
 	}
 	if _, ok := mock.uploadWorkerCall.Bindings["IP_LIST_BATCH_SIZE"]; ok {
-		t.Error("IP_LIST_BATCH_SIZE binding should be absent when SyncToIPLists is disabled")
+		t.Error("IP_LIST_BATCH_SIZE binding should be absent when SyncToListNotKV is false")
 	}
 	if _, ok := mock.uploadWorkerCall.Bindings[IPListQueueDBBindingName]; ok {
-		t.Error("D1 queue database binding should be absent when SyncToIPLists is disabled")
+		t.Error("D1 queue database binding should be absent when SyncToListNotKV is false")
 	}
 	if mock.d1CallsMade {
-		t.Error("no D1 API calls should be made when SyncToIPLists is disabled")
+		t.Error("no D1 API calls should be made when SyncToListNotKV is false")
 	}
 }
 
@@ -1066,11 +1061,9 @@ func TestDeployDecisionsSyncWorker_IPListsEnabled(t *testing.T) {
 	}
 	m.api = mock
 
-	syncToKV := false
 	syncCfg := cfg.DecisionsSyncWorkerConfig{
 		Cron:            "*/5 * * * *",
-		SyncToKV:        &syncToKV,
-		SyncToIPLists:   true,
+		SyncToListNotKV: true,
 		IPListPrefix:    "crowdsec_",
 		D1DatabaseName:  "crowdsec_ip_list_state",
 		IPListBatchSize: 2000,
@@ -1084,11 +1077,8 @@ func TestDeployDecisionsSyncWorker_IPListsEnabled(t *testing.T) {
 		t.Fatal("UploadWorker was not called")
 	}
 
-	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_KV"); got != "false" {
-		t.Errorf("SYNC_TO_KV = %q, want %q", got, "false")
-	}
-	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_IP_LISTS"); got != "true" {
-		t.Errorf("SYNC_TO_IP_LISTS = %q, want %q", got, "true")
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_LIST_NOT_KV"); got != "true" {
+		t.Errorf("SYNC_TO_LIST_NOT_KV = %q, want %q", got, "true")
 	}
 	if got := plainTextBinding(t, mock.uploadWorkerCall, "IP_LIST_PREFIX"); got != "crowdsec_" {
 		t.Errorf("IP_LIST_PREFIX = %q, want %q", got, "crowdsec_")
@@ -1141,9 +1131,9 @@ func TestDeployDecisionsSyncWorker_IPListsEnabled_ReusesExistingD1Database(t *te
 	m.api = mock
 
 	syncCfg := cfg.DecisionsSyncWorkerConfig{
-		Cron:           "*/5 * * * *",
-		SyncToIPLists:  true,
-		D1DatabaseName: "crowdsec_ip_list_state",
+		Cron:            "*/5 * * * *",
+		SyncToListNotKV: true,
+		D1DatabaseName:  "crowdsec_ip_list_state",
 	}
 
 	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
@@ -1153,23 +1143,5 @@ func TestDeployDecisionsSyncWorker_IPListsEnabled_ReusesExistingD1Database(t *te
 	d1Binding := mock.uploadWorkerCall.Bindings[IPListQueueDBBindingName].(cf.WorkerD1DatabaseBinding)
 	if d1Binding.DatabaseID != "existing-db-id" {
 		t.Errorf("D1 DatabaseID = %q, want %q (should reuse existing database)", d1Binding.DatabaseID, "existing-db-id")
-	}
-}
-
-func TestDeployDecisionsSyncWorker_NilSyncToKVDefaultsTrue(t *testing.T) {
-	m := newTestManager()
-	mock := &mockCFAPI{}
-	m.api = mock
-
-	// SyncToKV left nil, as would happen if a caller builds the struct
-	// without going through DecisionsSyncWorkerConfig.setDefaults().
-	syncCfg := cfg.DecisionsSyncWorkerConfig{Cron: "*/5 * * * *"}
-
-	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_KV"); got != "true" {
-		t.Errorf("SYNC_TO_KV = %q, want %q", got, "true")
 	}
 }

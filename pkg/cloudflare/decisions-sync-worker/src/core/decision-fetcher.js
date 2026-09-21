@@ -15,13 +15,13 @@ const SYNC_LOCK_TTL_SECONDS = 300;
 const SUPPORTED_SCOPES = ['ip', 'range', 'as', 'country'];
 
 /**
- * Check if this is the first fetch by looking for the WARMED_UP flag in KV
+ * Check if the cache needs to be warmed up by looking for the WARMED_UP flag in KV
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- * @returns {Promise<boolean>} True if this is the first fetch
+ * @returns {Promise<boolean>} True if the cache needs to be warmed up (WARMED_UP is not exactly 'true')
  */
-export async function isFirstFetch(kvNamespace) {
+export async function needWarmUp(kvNamespace) {
 	const warmedUpFlag = await kvNamespace.get(WARMED_UP_KEY);
-	return !warmedUpFlag;
+	return warmedUpFlag !== 'true';
 }
 
 /**

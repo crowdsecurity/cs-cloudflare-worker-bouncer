@@ -115,11 +115,8 @@ cloudflare_config:
 
 	syncCfg := config.CloudflareConfig.DecisionsSyncWorker
 
-	if syncCfg.SyncToKV == nil || !*syncCfg.SyncToKV {
-		t.Fatalf("SyncToKV = %v, want true", syncCfg.SyncToKV)
-	}
-	if syncCfg.SyncToIPLists {
-		t.Fatalf("SyncToIPLists = %v, want false", syncCfg.SyncToIPLists)
+	if syncCfg.SyncToListNotKV {
+		t.Fatalf("SyncToListNotKV = %v, want false", syncCfg.SyncToListNotKV)
 	}
 	if syncCfg.IPListPrefix != "crowdsec_" {
 		t.Fatalf("IPListPrefix = %q, want %q", syncCfg.IPListPrefix, "crowdsec_")
@@ -140,10 +137,9 @@ crowdsec_config:
   update_frequency: 10s
 cloudflare_config:
   decisions_sync_worker:
-    sync_to_kv: false
-    sync_to_ip_lists: true
+    sync_to_list_not_kv: true
     ip_list_prefix: myprefix_
-    d1_database_name: my_queue_db
+    d1_database_name: my_list_state_db
     ip_list_batch_size: 2000
   accounts:
     - id: acc1
@@ -162,17 +158,14 @@ cloudflare_config:
 
 	syncCfg := config.CloudflareConfig.DecisionsSyncWorker
 
-	if syncCfg.SyncToKV == nil || *syncCfg.SyncToKV {
-		t.Fatalf("SyncToKV = %v, want false", syncCfg.SyncToKV)
-	}
-	if !syncCfg.SyncToIPLists {
-		t.Fatalf("SyncToIPLists = %v, want true", syncCfg.SyncToIPLists)
+	if !syncCfg.SyncToListNotKV {
+		t.Fatalf("SyncToListNotKV = %v, want true", syncCfg.SyncToListNotKV)
 	}
 	if syncCfg.IPListPrefix != "myprefix_" {
 		t.Fatalf("IPListPrefix = %q, want %q", syncCfg.IPListPrefix, "myprefix_")
 	}
-	if syncCfg.D1DatabaseName != "my_queue_db" {
-		t.Fatalf("D1DatabaseName = %q, want %q", syncCfg.D1DatabaseName, "my_queue_db")
+	if syncCfg.D1DatabaseName != "my_list_state_db" {
+		t.Fatalf("D1DatabaseName = %q, want %q", syncCfg.D1DatabaseName, "my_list_state_db")
 	}
 	if syncCfg.IPListBatchSize != 2000 {
 		t.Fatalf("IPListBatchSize = %d, want %d", syncCfg.IPListBatchSize, 2000)

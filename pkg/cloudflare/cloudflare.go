@@ -39,7 +39,7 @@ const (
 	// IPListQueueDBBindingName is the worker env binding name for the D1
 	// database backing the IP list sync queue. Hardcoded in the compiled
 	// worker JS; must not change without also updating the worker source.
-	IPListQueueDBBindingName = "CROWDSECCFBOUNCER_QUEUE_DB"
+	IPListQueueDBBindingName = "LIST_STATE_DB"
 
 	// ipListStateTableMigration creates the single table that is the source
 	// of truth for both pending work and current IP List membership, if it
@@ -400,11 +400,12 @@ func (m *CloudflareAccountManager) ensureIPListStateDatabase(name string) error 
 
 // DeployDecisionsSyncWorker deploys the autonomous decisions sync worker.
 // This worker runs on a cron schedule and syncs decisions from CrowdSec LAPI
-// to Cloudflare KV and/or Cloudflare IP Lists, per syncCfg.
+// to exactly one target — Cloudflare KV or Cloudflare IP Lists — per
+// syncCfg.SyncToListNotKV.
 func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.CrowdSecConfig, syncCfg cfg.DecisionsSyncWorkerConfig) error {
 	m.logger.Infof("Deploying decisions sync worker %s with cron schedule: %s", m.Worker.DecisionsSyncScriptName, syncCfg.Cron)
 
-	if syncCfg.SyncToIPLists {
+	if syncCfg.SyncToListNotKV {
 		if err := m.ensureIPListStateDatabase(syncCfg.D1DatabaseName); err != nil {
 			return fmt.Errorf("failed to set up IP list queue database: %w", err)
 		}
@@ -414,8 +415,6 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 	includeScenarios := strings.Join(crowdSecConfig.IncludeScenariosContaining, ",")
 	excludeScenarios := strings.Join(crowdSecConfig.ExcludeScenariosContaining, ",")
 	origins := strings.Join(crowdSecConfig.OnlyIncludeDecisionsFrom, ",")
-
-	syncToKV := syncCfg.SyncToKV == nil || *syncCfg.SyncToKV
 
 	// Create bindings for the sync worker
 	bindings := map[string]cf.WorkerBinding{
@@ -436,11 +435,8 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 		"CF_API_TOKEN": cf.WorkerSecretTextBinding{
 			Text: m.AccountCfg.Token,
 		},
-		"SYNC_TO_KV": cf.WorkerPlainTextBinding{
-			Text: fmt.Sprintf("%t", syncToKV),
-		},
-		"SYNC_TO_IP_LISTS": cf.WorkerPlainTextBinding{
-			Text: fmt.Sprintf("%t", syncCfg.SyncToIPLists),
+		"SYNC_TO_LIST_NOT_KV": cf.WorkerPlainTextBinding{
+			Text: fmt.Sprintf("%t", syncCfg.SyncToListNotKV),
 		},
 	}
 
@@ -460,7 +456,7 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 			Text: origins,
 		}
 	}
-	if syncCfg.SyncToIPLists {
+	if syncCfg.SyncToListNotKV {
 		bindings["IP_LIST_PREFIX"] = cf.WorkerPlainTextBinding{
 			Text: syncCfg.IPListPrefix,
 		}

@@ -136,41 +136,37 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, i
 type DecisionsSyncWorkerConfig struct {
 	Cron string `yaml:"cron"` // Cron schedule for autonomous decisions sync (e.g., "*/5 * * * *" for every 5 minutes)
 
-	// SyncToKV controls whether decisions are synced to the Worker's KV store
-	// (the L7 bouncer worker's data source). Defaults to true.
-	SyncToKV *bool `yaml:"sync_to_kv,omitempty"`
-
-	// SyncToIPLists controls whether 'ip'/'range' scoped decisions are synced
-	// to Cloudflare IP Lists (used for L3/4 firewall-rule bouncing). The IP
-	// Lists themselves and the firewall rules referencing them must be
-	// provisioned externally; this only manages list membership. Defaults to
-	// false.
-	SyncToIPLists bool `yaml:"sync_to_ip_lists,omitempty"`
+	// SyncToListNotKV selects which single sync target the worker uses: false
+	// (default) syncs decisions to the Worker's KV store (the L7 bouncer
+	// worker's data source); true syncs 'ip'/'range' scoped decisions to
+	// Cloudflare IP Lists instead (used for L3/4 firewall-rule bouncing). The
+	// two modes are mutually exclusive — the worker always does exactly one,
+	// never both — which keeps the warmup/WARMED_UP handling simple: there is
+	// only ever one sync target's completion to wait on. The IP Lists
+	// themselves and the firewall rules referencing them must be provisioned
+	// externally; this only manages list membership.
+	SyncToListNotKV bool `yaml:"sync_to_list_not_kv,omitempty"`
 
 	// IPListPrefix is the name prefix used to discover which Cloudflare IP
-	// Lists this worker is allowed to manage. Only used when SyncToIPLists is
-	// enabled.
+	// Lists this worker is allowed to manage. Only used when SyncToListNotKV
+	// is true.
 	IPListPrefix string `yaml:"ip_list_prefix,omitempty"`
 
 	// D1DatabaseName is the name of the D1 database holding IP list state
 	// (pending work and current Cloudflare IP List membership). Created
 	// automatically on deploy if it doesn't already exist. Only used when
-	// SyncToIPLists is enabled.
+	// SyncToListNotKV is true.
 	D1DatabaseName string `yaml:"d1_database_name,omitempty"`
 
 	// IPListBatchSize caps how many queued rows (new adds and expired
 	// removals combined) are processed against Cloudflare IP Lists per sync
 	// tick. Bounding this keeps each tick's Cloudflare API usage predictable
 	// regardless of backlog size — a large warmup drains over many ticks
-	// instead of in one burst. Only used when SyncToIPLists is enabled.
+	// instead of in one burst. Only used when SyncToListNotKV is true.
 	IPListBatchSize int `yaml:"ip_list_batch_size,omitempty"`
 }
 
 func (d *DecisionsSyncWorkerConfig) setDefaults() {
-	if d.SyncToKV == nil {
-		enabled := true
-		d.SyncToKV = &enabled
-	}
 	if d.IPListPrefix == "" {
 		d.IPListPrefix = "crowdsec_"
 	}
