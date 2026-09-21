@@ -22,13 +22,16 @@ import {
 	resetAllDecisions,
 	clearResetFlag,
 } from './adapters/cloudflare-kv.js';
-import { planQueueUpserts, splitBatch, planAdds } from './core/ip-list-processor.js';
+import { planUpserts, planAdds } from './core/ip-list-processor.js';
 import {
 	listManagedIpLists,
-	readIndex,
-	writeIndexShard,
-	upsertQueue,
-	readQueueBatch,
+	upsertDeletes,
+	upsertNews,
+	readPendingDeletes,
+	readPendingAdds,
+	readListSizes,
+	readAllListed,
+	markListed,
 	deleteQueueRows,
 	clearQueue,
 	addListItems,
@@ -36,6 +39,7 @@ import {
 	getBackoffUntil,
 	setBackoff,
 	clearBackoff,
+	MAX_ITEMS_PER_LIST,
 	CloudflareApiError,
 } from './adapters/cloudflare-ip-lists.js';
 
@@ -123,29 +127,31 @@ async function syncToKv(env, decisions, isFirst) {
  * externally — this only fills/empties membership of lists whose name
  * starts with IP_LIST_PREFIX.
  *
- * Decisions are queued in a D1 table (env.CROWDSECCFBOUNCER_QUEUE_DB) rather
- * than applied immediately: each tick upserts new/expired decisions into the
- * queue, reads back a bounded batch (IP_LIST_BATCH_SIZE rows, a mix of
- * pending adds and removals), applies it to Cloudflare, and only then
- * deletes those rows from the queue. This makes a large warmup (which can
- * take days at realistic decision volumes) resumable — a rate limit or
- * error mid-tick just leaves the rest queued for next time — and an
- * append-only add / id-targeted remove never overwrites IPs some other
- * process added to the same lists, unlike a full-replace would.
+ * The D1 table (env.CROWDSECCFBOUNCER_QUEUE_DB) is the single source of
+ * truth for both pending work and current membership — see
+ * cloudflare-ip-lists.js for the row shape. Each tick: expired decisions are
+ * upserted as list_action='delete' and new decisions as list_action='new'
+ * (delete always wins if the same IP appears in both this tick), then a
+ * bounded slice of pending deletes/adds is applied to Cloudflare. This makes
+ * a large warmup (which can take days at realistic decision volumes)
+ * resumable — a rate limit or error mid-tick just leaves the rest pending
+ * for next time — and an append-only add / id-targeted remove never
+ * overwrites IPs some other process added to the same lists, unlike a
+ * full-replace would.
  *
- * On the first sync after a cold start, the caller clears both the queue and
+ * On the first sync after a cold start, the caller clears both the table and
  * the managed lists (clearAllIpLists) before this runs, so what's upserted
  * here is a clean full-state pull rather than layered on residue from a
- * previously interrupted warmup. Draining the queue toward Cloudflare is a
- * separate, ongoing process that continues across ticks regardless of
+ * previously interrupted warmup. Draining pending adds toward Cloudflare is
+ * a separate, ongoing process that continues across ticks regardless of
  * isFirst — WARMED_UP only means "the initial full pull from LAPI has been
- * captured into the queue", not "the queue is empty".
+ * captured", not "every pending add has been pushed".
  *
  * @param {import('./types.js').CrowdSecEnv} env
  * @param {import('./types.js').DecisionStreamResponse} decisions
  * @returns {Promise<boolean>} true unless this tick stopped early (rate
- *   limit or error) — an unplaced/still-queued remainder is normal, expected
- *   progress, not a failure.
+ *   limit or error) — an unplaced/still-pending remainder is normal,
+ *   expected progress, not a failure.
  */
 async function syncToIpLists(env, decisions) {
 	logger.info('Starting IP list sync...');
@@ -168,36 +174,24 @@ async function syncToIpLists(env, decisions) {
 		// Nothing we can do without any managed lists; don't block warming on it.
 		return true;
 	}
+	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
+	const listIds = lists.map((l) => l.id); // already name-sorted by listManagedIpLists
 
-	const listNames = lists.map((l) => l.name);
-	const listById = new Map(lists.map((l) => [l.name, l.id]));
-	const index = await readIndex(env.CROWDSECCFBOUNCERNS, lists);
+	// 1/2: split into upsert-ready entries, warning if the same IP shows up
+	// in both batches this tick (delete always wins).
+	const { newItems, deleteItems } = planUpserts(decisions.new, decisions.deleted, (msg, ctx) => logger.warn(msg, ctx));
 
-	// --- upsert expired decisions into the queue as 'delete' rows ---
-	const toDeleteRows = planQueueUpserts(decisions.deleted, index, /* isExpiry */ true);
-	await upsertQueue(db, toDeleteRows, 'delete');
+	// 3: upsert new decisions (list_action='new' unless already 'listed'),
+	// then expired decisions (list_action='delete', unconditionally).
+	await upsertNews(db, newItems);
+	await upsertDeletes(db, deleteItems);
 
-	// --- upsert new decisions into the queue as 'new' rows ---
-	const toNewRows = planQueueUpserts(decisions.new, index, /* isExpiry */ false);
-	await upsertQueue(db, toNewRows, 'new');
+	// 4: apply every pending delete now — removals aren't paced/batched like
+	// adds are, since getting a ban off a list promptly matters more than
+	// pacing removals.
+	const { deletesByList, queueOnlyDeletes } = await readPendingDeletes(db);
+	const confirmedIps = new Set(queueOnlyDeletes); // nothing to remove from Cloudflare; just drop the row
 
-	// --- read a bounded batch back (mix of pending adds/removals) ---
-	const batch = await readQueueBatch(db, batchSize);
-	if (batch.length === 0) {
-		logger.info('IP list sync completed successfully (queue empty)');
-		await clearBackoff(env.CROWDSECCFBOUNCERNS);
-		return true;
-	}
-
-	const { deletesByList, notFoundDeletes, newRows } = splitBatch(batch, index);
-	const { addsByList, unplaced } = planAdds(newRows, listNames, index);
-	if (unplaced.length > 0) {
-		logger.warn(`${unplaced.length} queued IP(s) have no room in any managed list; left queued`);
-	}
-
-	const confirmedIps = new Set(notFoundDeletes); // nothing to remove from Cloudflare; just drop the queue row
-	let removedCount = 0;
-	let addedCount = 0;
 	// Per-list tallies for the completion summary below, so it's clear at a
 	// glance which lists were actually touched this tick and by how much.
 	const updatedLists = new Map(); // listName -> { added, removed }
@@ -207,8 +201,9 @@ async function syncToIpLists(env, decisions) {
 		updatedLists.set(listName, stat);
 	};
 
-	for (const [listName, toDelete] of deletesByList) {
-		const listId = listById.get(listName);
+	let removedCount = 0;
+	for (const [listId, toDelete] of deletesByList) {
+		const listName = listNameById.get(listId) ?? listId;
 		logger.info(`Removing ${toDelete.length} item(s) from IP list ${listName}...`, {
 			list: listName,
 			removed: toDelete.length,
@@ -224,51 +219,54 @@ async function syncToIpLists(env, decisions) {
 			await deleteQueueRows(db, [...confirmedIps]);
 			return handleIpListError(env, e, `removing items from IP list ${listName}`);
 		}
-		const members = index.get(listName);
 		for (const { ip } of toDelete) {
-			members.delete(ip);
 			confirmedIps.add(ip);
 			removedCount++;
 		}
 		bumpListStat(listName, 'removed', toDelete.length);
-		await writeIndexShard(env.CROWDSECCFBOUNCERNS, listName, members);
 	}
-
-	for (const [listName, items] of addsByList) {
-		const listId = listById.get(listName);
-		const ips = items.map((i) => i.ip);
-		logger.info(`Adding ${ips.length} item(s) to IP list ${listName}...`, {
-			list: listName,
-			added: ips.length,
-		});
-
-		let itemIdByIp;
-		try {
-			itemIdByIp = await addListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, ips);
-		} catch (e) {
-			// Whatever was already applied and persisted in earlier iterations of
-			// these loops stays applied; the rest of the batch stays queued.
-			await deleteQueueRows(db, [...confirmedIps]);
-			return handleIpListError(env, e, `adding items to IP list ${listName}`);
-		}
-
-		const members = index.get(listName);
-		let listAddedCount = 0;
-		for (const item of items) {
-			const itemId = itemIdByIp.get(item.ip);
-			if (!itemId) continue; // resolution failure already logged by addListItems
-			members.set(item.ip, { itemId, action: item.action, until: item.until });
-			confirmedIps.add(item.ip);
-			addedCount++;
-			listAddedCount++;
-		}
-		bumpListStat(listName, 'added', listAddedCount);
-		await writeIndexShard(env.CROWDSECCFBOUNCERNS, listName, members);
-	}
-
-	// Only rows Cloudflare actually confirmed leave the queue; unplaced adds
-	// stay put for a future tick.
+	// Rows Cloudflare confirmed removed, or that were never actually pushed,
+	// are done for good — drop them from the table entirely.
 	await deleteQueueRows(db, [...confirmedIps]);
+
+	// 5: place a bounded batch of pending adds, packing lists to capacity in
+	// order based on current member counts.
+	const pendingAdds = await readPendingAdds(db, batchSize);
+	let addedCount = 0;
+	let unplacedCount = 0;
+
+	if (pendingAdds.length > 0) {
+		const listSizes = await readListSizes(db);
+		const { addsByList, unplaced } = planAdds(pendingAdds, listIds, listSizes, MAX_ITEMS_PER_LIST);
+		unplacedCount = unplaced.length;
+		if (unplaced.length > 0) {
+			logger.warn(`${unplaced.length} pending IP(s) have no room in any managed list; left pending`);
+		}
+
+		for (const [listId, items] of addsByList) {
+			const listName = listNameById.get(listId) ?? listId;
+			const ips = items.map((i) => i.ip);
+			logger.info(`Adding ${ips.length} item(s) to IP list ${listName}...`, {
+				list: listName,
+				added: ips.length,
+			});
+
+			let itemIdByIp;
+			try {
+				itemIdByIp = await addListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, ips);
+			} catch (e) {
+				// Deletes and any earlier add iterations already committed above
+				// (and via markListed calls below) stay applied; the rest of this
+				// tick's adds stay pending for next time.
+				return handleIpListError(env, e, `adding items to IP list ${listName}`);
+			}
+
+			const placed = items.map((item) => ({ ip: item.ip, itemId: itemIdByIp.get(item.ip) })).filter((p) => p.itemId);
+			await markListed(db, listId, placed);
+			addedCount += placed.length;
+			bumpListStat(listName, 'added', placed.length);
+		}
+	}
 
 	// Made it through this tick without hitting a rate limit; clear any
 	// stale backoff from a previous run so the next tick isn't held back
@@ -279,8 +277,7 @@ async function syncToIpLists(env, decisions) {
 		removed: removedCount,
 		added: addedCount,
 		listsUpdated: [...updatedLists.entries()].map(([list, stat]) => ({ list, ...stat })),
-		unplaced: unplaced.length,
-		batchSize: batch.length,
+		unplaced: unplacedCount,
 	});
 
 	return true;
@@ -314,34 +311,36 @@ async function handleIpListError(env, e, what) {
 }
 
 /**
- * Empty every managed IP list and the pending queue. Used when LAPI reports
- * no decisions at all (HTTP 204), mirroring the KV path's resetAllDecisions.
+ * Empty every managed IP list and the D1 table entirely. Used when LAPI
+ * reports no decisions at all (HTTP 204), mirroring the KV path's
+ * resetAllDecisions.
  * @param {import('./types.js').CrowdSecEnv} env
  */
 async function clearAllIpLists(env) {
 	logger.info('Clearing all managed IP lists...');
 
 	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
+	const db = env.CROWDSECCFBOUNCER_QUEUE_DB;
 	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
-	const index = await readIndex(env.CROWDSECCFBOUNCERNS, lists);
+	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
+	const listedByList = await readAllListed(db);
 
 	const clearedLists = [];
-	for (const list of lists) {
-		const members = index.get(list.name);
-		if (members.size === 0) continue;
+	for (const [listId, members] of listedByList) {
+		if (members.length === 0) continue;
+		const listName = listNameById.get(listId) ?? listId;
 
-		logger.info(`Emptying IP list ${list.name}...`, { list: list.name, removed: members.size });
+		logger.info(`Emptying IP list ${listName}...`, { list: listName, removed: members.length });
 		await removeListItems(
 			env.CF_ACCOUNT_ID,
 			env.CF_API_TOKEN,
-			list.id,
-			[...members.values()].map((entry) => entry.itemId)
+			listId,
+			members.map((m) => m.itemId)
 		);
-		await writeIndexShard(env.CROWDSECCFBOUNCERNS, list.name, new Map());
-		clearedLists.push({ list: list.name, removed: members.size });
+		clearedLists.push({ list: listName, removed: members.length });
 	}
 
-	await clearQueue(env.CROWDSECCFBOUNCER_QUEUE_DB);
+	await clearQueue(db);
 
 	logger.info('All managed IP lists cleared successfully', { listCount: lists.length, listsUpdated: clearedLists });
 }

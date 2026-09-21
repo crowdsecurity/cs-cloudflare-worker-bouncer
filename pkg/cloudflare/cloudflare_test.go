@@ -1072,7 +1072,7 @@ func TestDeployDecisionsSyncWorker_IPListsEnabled(t *testing.T) {
 		SyncToKV:        &syncToKV,
 		SyncToIPLists:   true,
 		IPListPrefix:    "crowdsec_",
-		D1DatabaseName:  "crowdsec_ip_list_queue",
+		D1DatabaseName:  "crowdsec_ip_list_state",
 		IPListBatchSize: 2000,
 	}
 
@@ -1112,8 +1112,18 @@ func TestDeployDecisionsSyncWorker_IPListsEnabled(t *testing.T) {
 	if len(migrationSQL) != 1 {
 		t.Fatalf("expected exactly 1 migration query, got %d: %v", len(migrationSQL), migrationSQL)
 	}
-	if !strings.Contains(migrationSQL[0], "CREATE TABLE IF NOT EXISTS ip_list_queue") {
-		t.Errorf("migration SQL = %q, want it to create ip_list_queue", migrationSQL[0])
+	if !strings.Contains(migrationSQL[0], "CREATE TABLE IF NOT EXISTS ip_list_state") {
+		t.Errorf("migration SQL = %q, want it to create ip_list_state", migrationSQL[0])
+	}
+	for _, col := range []string{"list_id", "item_id"} {
+		if !strings.Contains(migrationSQL[0], col) {
+			t.Errorf("migration SQL missing column %q", col)
+		}
+	}
+	for _, idx := range []string{"idx_ip_list_state_list_action", "idx_ip_list_state_list_id"} {
+		if !strings.Contains(migrationSQL[0], idx) {
+			t.Errorf("migration SQL missing index %q", idx)
+		}
 	}
 }
 
@@ -1133,7 +1143,7 @@ func TestDeployDecisionsSyncWorker_IPListsEnabled_ReusesExistingD1Database(t *te
 	syncCfg := cfg.DecisionsSyncWorkerConfig{
 		Cron:           "*/5 * * * *",
 		SyncToIPLists:  true,
-		D1DatabaseName: "crowdsec_ip_list_queue",
+		D1DatabaseName: "crowdsec_ip_list_state",
 	}
 
 	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {

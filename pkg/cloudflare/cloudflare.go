@@ -41,17 +41,29 @@ const (
 	// worker JS; must not change without also updating the worker source.
 	IPListQueueDBBindingName = "CROWDSECCFBOUNCER_QUEUE_DB"
 
-	// ipListQueueTableMigration creates the single table backing the IP list
-	// sync queue, if it doesn't already exist. `ip` is the primary key so a
-	// repeated decision for the same IP (e.g. re-seen across LAPI stream
-	// polls, or a ban that expires and is re-issued before the queue drains)
-	// upserts in place rather than creating a duplicate row.
-	ipListQueueTableMigration = `CREATE TABLE IF NOT EXISTS ip_list_queue (
+	// ipListStateTableMigration creates the single table that is the source
+	// of truth for both pending work and current IP List membership, if it
+	// doesn't already exist. `ip` is the primary key so a repeated decision
+	// for the same IP (e.g. re-seen across LAPI stream polls, or a ban that
+	// expires and is re-issued before it's processed) upserts in place
+	// rather than creating a duplicate row.
+	//
+	// list_action is one of:
+	//   'new'    - pending add, not yet pushed to any Cloudflare list
+	//   'delete' - pending removal from list_id/item_id
+	//   'listed' - currently a member of list_id (item_id is Cloudflare's id
+	//              for it there); nothing pending
+	// list_id/item_id are only populated once list_action = 'listed'.
+	ipListStateTableMigration = `CREATE TABLE IF NOT EXISTS ip_list_state (
 		ip TEXT PRIMARY KEY,
 		action TEXT NOT NULL,
 		until TEXT,
-		list_action TEXT NOT NULL
-	)`
+		list_action TEXT NOT NULL,
+		list_id TEXT,
+		item_id TEXT
+	);
+	CREATE INDEX IF NOT EXISTS idx_ip_list_state_list_action ON ip_list_state(list_action);
+	CREATE INDEX IF NOT EXISTS idx_ip_list_state_list_id ON ip_list_state(list_id);`
 
 	// metricsPollLookback is how far back the AE metrics cursor reaches when
 	// the manager is freshly constructed, so the first poll covers any AE
@@ -350,10 +362,10 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	return zg.Wait()
 }
 
-// ensureIPListQueueDatabase finds the D1 database backing the IP list sync
+// ensureIPListStateDatabase finds the D1 database backing the IP list sync
 // queue by name, creating it if it doesn't exist yet, then runs the schema
 // migration (idempotent: CREATE TABLE IF NOT EXISTS). Sets m.D1DatabaseID.
-func (m *CloudflareAccountManager) ensureIPListQueueDatabase(name string) error {
+func (m *CloudflareAccountManager) ensureIPListStateDatabase(name string) error {
 	databases, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{Name: name})
 	if err != nil {
 		return fmt.Errorf("failed to list D1 databases: %w", err)
@@ -368,7 +380,7 @@ func (m *CloudflareAccountManager) ensureIPListQueueDatabase(name string) error 
 	}
 
 	if db.UUID == "" {
-		m.logger.Infof("Creating D1 database %s for IP list sync queue", name)
+		m.logger.Infof("Creating D1 database %s for IP list state", name)
 		db, err = m.api.CreateD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateD1DatabaseParams{Name: name})
 		if err != nil {
 			return fmt.Errorf("failed to create D1 database %s: %w", name, err)
@@ -378,7 +390,7 @@ func (m *CloudflareAccountManager) ensureIPListQueueDatabase(name string) error 
 
 	if _, err := m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
 		DatabaseID: m.D1DatabaseID,
-		SQL:        ipListQueueTableMigration,
+		SQL:        ipListStateTableMigration,
 	}); err != nil {
 		return fmt.Errorf("failed to migrate D1 database %s: %w", name, err)
 	}
@@ -393,7 +405,7 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 	m.logger.Infof("Deploying decisions sync worker %s with cron schedule: %s", m.Worker.DecisionsSyncScriptName, syncCfg.Cron)
 
 	if syncCfg.SyncToIPLists {
-		if err := m.ensureIPListQueueDatabase(syncCfg.D1DatabaseName); err != nil {
+		if err := m.ensureIPListStateDatabase(syncCfg.D1DatabaseName); err != nil {
 			return fmt.Errorf("failed to set up IP list queue database: %w", err)
 		}
 	}

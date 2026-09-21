@@ -76,9 +76,9 @@ export interface CrowdSecEnv {
 	IP_LIST_PREFIX?: string;
 
 	/**
-	 * D1 database backing the IP list sync queue (a single `ip_list_queue`
-	 * table: pending new/expired decisions, keyed by ip). Required when
-	 * SYNC_TO_IP_LISTS is enabled.
+	 * D1 database holding IP list state (a single `ip_list_state` table:
+	 * pending work and current Cloudflare IP List membership, keyed by ip).
+	 * Required when SYNC_TO_IP_LISTS is enabled.
 	 */
 	CROWDSECCFBOUNCER_QUEUE_DB?: D1Database;
 

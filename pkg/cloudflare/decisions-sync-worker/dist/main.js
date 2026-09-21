@@ -797,6 +797,101 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 	logger.info('KV reset completed successfully');
 }
 
+;// ./src/core/ip-list-processor.js
+/**
+ * IP List Processor
+ * Pure planning logic for the D1-backed Cloudflare IP List sync (L3/4
+ * bouncing). Only 'ip' and 'range' scoped decisions apply here — country/AS
+ * decisions aren't representable in a Cloudflare IP List.
+ *
+ * The D1 table (ip_list_state) is the single source of truth for both
+ * pending work and current membership, so planning here only ever deals
+ * with plain decision objects and plain row objects — no separate
+ * in-memory index to keep in sync with it.
+ */
+
+const IP_LIST_SCOPES = ['ip', 'range'];
+
+/**
+ * Filter a decision batch down to the scopes an IP List can represent.
+ * @param {import('../types.js').Decision[]} decisions
+ * @returns {import('../types.js').Decision[]}
+ */
+function filterIpListScopes(decisions) {
+	return decisions.filter((d) => IP_LIST_SCOPES.includes(d.scope));
+}
+
+/**
+ * Split new/deleted decisions into upsert-ready entries, resolving the case
+ * where the same IP appears in both batches from the same LAPI pull. That's
+ * an unusual signal (a decision both freshly issued and freshly expired at
+ * once) — logged so it can be traced back to LAPI's stream — but delete
+ * always wins: the two batches below are upserted in order (news, then
+ * deletes; see upsertNews/upsertDeletes), so the delete overwrites whatever
+ * the new-decision upsert would otherwise have set.
+ * @param {import('../types.js').Decision[]} newDecisions
+ * @param {import('../types.js').Decision[]} expiredDecisions
+ * @param {(msg: string, ctx?: object) => void} warn - logger.warn, injected so this stays a pure function
+ * @returns {{newItems: {ip: string, action: string, until: string}[], deleteItems: {ip: string, action: string, until: string}[]}}
+ */
+function planUpserts(newDecisions, expiredDecisions, warn) {
+	const newScoped = filterIpListScopes(newDecisions);
+	const deleteScoped = filterIpListScopes(expiredDecisions);
+
+	const deleteIps = new Set(deleteScoped.map((d) => d.value));
+	const conflicting = newScoped.filter((d) => deleteIps.has(d.value)).map((d) => d.value);
+	if (conflicting.length > 0) {
+		warn(`${conflicting.length} IP(s) appear in both new and expired decisions this tick; delete wins`, {
+			ips: conflicting,
+		});
+	}
+
+	const toEntry = (d) => ({ ip: d.value, action: d.type, until: d.until });
+	return {
+		newItems: newScoped.map(toEntry),
+		deleteItems: deleteScoped.map(toEntry),
+	};
+}
+
+/**
+ * Pack a batch of pending-add rows into managed lists in order: list 1 is
+ * filled to MAX_ITEMS_PER_LIST before list 2 is touched, etc, based on
+ * current member counts (readListSizes). A list already at capacity is
+ * skipped entirely. Items that don't fit anywhere are left un-planned
+ * (still 'new' in the queue, retried next tick).
+ * @param {{ip: string, action: string, until: string}[]} pendingAdds
+ * @param {string[]} listIds - managed list ids, in stable (name-sorted) order
+ * @param {Map<string, number>} listSizes - list_id -> current member count
+ * @param {number} maxItemsPerList
+ * @returns {{addsByList: Map<string, {ip: string, action: string, until: string}[]>, unplaced: string[]}}
+ */
+function planAdds(pendingAdds, listIds, listSizes, maxItemsPerList) {
+	const sizeByList = new Map(listIds.map((id) => [id, listSizes.get(id) ?? 0]));
+	const addsByList = new Map();
+	const unplaced = [];
+
+	for (const item of pendingAdds) {
+		let target = null;
+		for (const listId of listIds) {
+			if (sizeByList.get(listId) < maxItemsPerList) {
+				target = listId;
+				break;
+			}
+		}
+
+		if (!target) {
+			unplaced.push(item.ip);
+			continue;
+		}
+
+		sizeByList.set(target, sizeByList.get(target) + 1);
+		if (!addsByList.has(target)) addsByList.set(target, []);
+		addsByList.get(target).push(item);
+	}
+
+	return { addsByList, unplaced };
+}
+
 ;// ./src/adapters/cloudflare-ip-lists.js
 /**
  * Cloudflare IP Lists Adapter
@@ -805,24 +900,28 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
  * are provisioned by an external process — this adapter only fills/empties
  * list membership.
  *
- * New and expired decisions are never applied to Cloudflare directly: they're
- * queued in a D1 table first (see the QUEUE_* functions below), and a bounded
- * batch is drained from the queue each sync tick. This lets warmup (which can
- * take days at realistic decision volumes) make steady, resumable progress
- * without ever overwriting IPs that some other process manually added to the
- * same lists — an append-only add and an id-targeted remove never touch
- * anything the worker didn't itself queue.
+ * A single D1 table (ip_list_state) is the source of truth for both pending
+ * work and current membership — see the D1_* functions below. Each row's
+ * list_action is one of:
+ *   'new'    - pending add, not yet pushed to any Cloudflare list
+ *   'delete' - pending removal from list_id/item_id
+ *   'listed' - currently a member of list_id (item_id is Cloudflare's id for
+ *              it there); nothing pending
+ * There is no separate index: list_id/item_id live on the row itself, so
+ * finding which list holds an IP — or how full a list currently is — is a
+ * plain query against this one table instead of a second KV-backed store.
  *
- * Per-list membership is tracked in a sharded KV index (one key per list) so
- * that a single JSON blob never has to hold the whole account's IP set — see
- * IDX_KEY_PREFIX below. Each entry also carries Cloudflare's internal item
- * id, since removing a specific IP requires that id, not the IP itself (see
- * removeListItems).
+ * New/expired decisions are queued (list_action='new'/'delete') rather than
+ * applied to Cloudflare immediately: each sync tick processes pending
+ * deletes and adds against a bounded slice of the table. This lets warmup
+ * (which can take days at realistic decision volumes) make steady, resumable
+ * progress without ever overwriting IPs some other process added to the same
+ * lists — an append-only add and an id-targeted remove never touch anything
+ * outside what this worker itself is tracking.
  */
 
 
 
-const IDX_KEY_PREFIX = 'IPLIST_IDX_';
 // Holds a single ISO timestamp: don't attempt IP list writes again until
 // after this time. Set when Cloudflare returns 429 with a Retry-After we can
 // trust; checked at the start of the next sync so we don't burn a cron tick
@@ -833,8 +932,8 @@ const MAX_ITEMS_PER_LIST = 10000;
 const BULK_POLL_INTERVAL_MS = 1000;
 const BULK_POLL_TIMEOUT_MS = 120000;
 // D1 caps bound parameters at 100/query; each queue row binds 4 (ip, action,
-// until, list_action), so 25 rows is the most that fit in one multi-row
-// VALUES statement.
+// until, list_action) for a 'new'/'delete' upsert, so 25 rows is the most
+// that fit in one multi-row VALUES statement.
 const D1_MAX_ROWS_PER_STATEMENT = 25;
 
 /**
@@ -878,6 +977,21 @@ function cloudflare_ip_lists_buildApiHeaders(apiToken) {
 }
 
 /**
+ * Split an array into fixed-size chunks.
+ * @template T
+ * @param {T[]} arr
+ * @param {number} size
+ * @returns {T[][]}
+ */
+function chunk(arr, size) {
+	const chunks = [];
+	for (let i = 0; i < arr.length; i += size) {
+		chunks.push(arr.slice(i, i + size));
+	}
+	return chunks;
+}
+
+/**
  * Discover the IP Lists this worker is allowed to manage: every custom list
  * whose name starts with the configured prefix. Lists are sorted by name so
  * pack-to-full placement (list 1 first) is stable across runs.
@@ -906,72 +1020,23 @@ async function listManagedIpLists(accountId, apiToken, prefix) {
 }
 
 /**
- * Read the sharded membership index for every managed list.
- * @param {KVNamespace} kvNamespace
- * @param {{id: string, name: string}[]} lists
- * @returns {Promise<Map<string, Map<string, {itemId: string, action: string, until: string}>>>} listName -> (ip -> entry)
- */
-async function readIndex(kvNamespace, lists) {
-	const index = new Map();
-
-	await Promise.all(
-		lists.map(async (list) => {
-			const raw = await kvNamespace.get(IDX_KEY_PREFIX + list.name);
-			if (!raw) {
-				index.set(list.name, new Map());
-				return;
-			}
-			try {
-				const parsed = JSON.parse(raw);
-				index.set(list.name, new Map(Object.entries(parsed)));
-			} catch (e) {
-				logger.error(`Failed to parse IP list index for ${list.name}, treating as empty`, { error: e.message });
-				index.set(list.name, new Map());
-			}
-		})
-	);
-
-	return index;
-}
-
-/**
- * Persist the membership shard for a single list.
- * @param {KVNamespace} kvNamespace
- * @param {string} listName
- * @param {Map<string, {itemId: string, action: string, until: string}>} members
- */
-async function writeIndexShard(kvNamespace, listName, members) {
-	const obj = Object.fromEntries(members);
-	await kvNamespace.put(IDX_KEY_PREFIX + listName, JSON.stringify(obj));
-}
-
-/**
- * Upsert a batch of decisions into the D1 queue table, keyed by ip. A row
- * already queued for the same IP is overwritten in place — e.g. an IP
- * queued as 'new' that expires before ever being pushed just flips to
- * 'delete' rather than getting pushed and immediately removed, and a
- * duplicate 'new' from a repeated LAPI stream poll just refreshes
- * action/until rather than erroring or duplicating.
+ * Upsert expired decisions into the queue, unconditionally forcing
+ * list_action='delete' — even for a row that was already 'listed', since
+ * that's exactly the row we want removed.
  * @param {D1Database} db
  * @param {{ip: string, action: string, until: string}[]} items
- * @param {'new' | 'delete'} listAction
  */
-async function upsertQueue(db, items, listAction) {
+async function upsertDeletes(db, items) {
 	if (items.length === 0) return;
 
-	// D1 caps bound parameters at 100/query; each row binds 4, so at most 25
-	// rows fit in one multi-row VALUES statement. Chunking this way (rather
-	// than one statement per row) keeps a large batch well under D1's
-	// queries-per-invocation limit (50 on Free, 1000 on Paid) — e.g. 1000
-	// rows becomes 40 statements in one db.batch(), not 1000.
 	const chunks = chunk(items, D1_MAX_ROWS_PER_STATEMENT);
 	const statements = chunks.map((rows) => {
 		const placeholders = rows.map(() => '(?, ?, ?, ?)').join(', ');
-		const params = rows.flatMap((item) => [item.ip, item.action, item.until ?? null, listAction]);
+		const params = rows.flatMap((item) => [item.ip, item.action, item.until ?? null, 'delete']);
 		return db
 			.prepare(
-				`INSERT INTO ip_list_queue (ip, action, until, list_action) VALUES ${placeholders}
-				 ON CONFLICT(ip) DO UPDATE SET action = excluded.action, until = excluded.until, list_action = excluded.list_action`
+				`INSERT INTO ip_list_state (ip, action, until, list_action) VALUES ${placeholders}
+				 ON CONFLICT(ip) DO UPDATE SET action = excluded.action, until = excluded.until, list_action = 'delete'`
 			)
 			.bind(...params);
 	});
@@ -980,63 +1045,155 @@ async function upsertQueue(db, items, listAction) {
 }
 
 /**
- * Read up to `limit` queued rows (a mix of 'new' and 'delete' entries).
+ * Upsert new decisions into the queue as list_action='new' — unless the row
+ * is already 'listed', in which case list_action is left untouched (only
+ * action/until refresh). Without this guard, a decision CrowdSec re-sends
+ * for an IP that's already placed would flip it back to 'new' and lose its
+ * list_id/item_id, causing it to be (redundantly, harmlessly, but wastefully)
+ * re-added on a future tick.
  * @param {D1Database} db
- * @param {number} limit
- * @returns {Promise<{ip: string, action: string, until: string, listAction: string}[]>}
+ * @param {{ip: string, action: string, until: string}[]} items
  */
-async function readQueueBatch(db, limit) {
-	const result = await db.prepare('SELECT ip, action, until, list_action FROM ip_list_queue LIMIT ?').bind(limit).all();
-	return (result.results || []).map((row) => ({
-		ip: row.ip,
-		action: row.action,
-		until: row.until,
-		listAction: row.list_action,
-	}));
-}
+async function upsertNews(db, items) {
+	if (items.length === 0) return;
 
-/**
- * Remove rows from the queue by ip, once their corresponding Cloudflare
- * write has been confirmed and persisted to the per-list KV index.
- * @param {D1Database} db
- * @param {string[]} ips
- */
-async function deleteQueueRows(db, ips) {
-	if (ips.length === 0) return;
-
-	// Each bound ip is 1 param, so up to 100 fit in one IN (...) statement —
-	// same query-count reasoning as upsertQueue.
-	const chunks = chunk(ips, 100);
+	const chunks = chunk(items, D1_MAX_ROWS_PER_STATEMENT);
 	const statements = chunks.map((rows) => {
-		const placeholders = rows.map(() => '?').join(', ');
-		return db.prepare(`DELETE FROM ip_list_queue WHERE ip IN (${placeholders})`).bind(...rows);
+		const placeholders = rows.map(() => '(?, ?, ?, ?)').join(', ');
+		const params = rows.flatMap((item) => [item.ip, item.action, item.until ?? null, 'new']);
+		return db
+			.prepare(
+				`INSERT INTO ip_list_state (ip, action, until, list_action) VALUES ${placeholders}
+				 ON CONFLICT(ip) DO UPDATE SET
+				   action = excluded.action,
+				   until = excluded.until,
+				   list_action = CASE WHEN ip_list_state.list_action != 'listed' THEN excluded.list_action ELSE ip_list_state.list_action END`
+			)
+			.bind(...params);
 	});
 
 	await db.batch(statements);
 }
 
 /**
- * Delete every row from the D1 queue table. Used when LAPI reports no
- * decisions at all (HTTP 204), mirroring the KV path's resetAllDecisions.
+ * Read every row pending deletion, grouped by the list it's currently in.
+ * A row with no list_id (queued 'new' then expired before ever being
+ * pushed) has nothing on Cloudflare to remove — it's returned separately so
+ * the caller can just drop it from the queue.
  * @param {D1Database} db
+ * @returns {Promise<{deletesByList: Map<string, {ip: string, itemId: string}[]>, queueOnlyDeletes: string[]}>}
  */
-async function clearQueue(db) {
-	await db.prepare('DELETE FROM ip_list_queue').run();
+async function readPendingDeletes(db) {
+	const result = await db.prepare("SELECT ip, list_id, item_id FROM ip_list_state WHERE list_action = 'delete'").all();
+
+	const deletesByList = new Map();
+	const queueOnlyDeletes = [];
+
+	for (const row of result.results || []) {
+		if (!row.list_id || !row.item_id) {
+			queueOnlyDeletes.push(row.ip);
+			continue;
+		}
+		if (!deletesByList.has(row.list_id)) {
+			deletesByList.set(row.list_id, []);
+		}
+		deletesByList.get(row.list_id).push({ ip: row.ip, itemId: row.item_id });
+	}
+
+	return { deletesByList, queueOnlyDeletes };
 }
 
 /**
- * Split an array into fixed-size chunks.
- * @template T
- * @param {T[]} arr
- * @param {number} size
- * @returns {T[][]}
+ * Read every row currently marked 'listed', grouped by list. Used only by
+ * clearAllIpLists (warmup/reset/204) to empty every managed list wholesale —
+ * the normal per-tick flow never needs "all listed rows" in one shot.
+ * @param {D1Database} db
+ * @returns {Promise<Map<string, {ip: string, itemId: string}[]>>} list_id -> members
  */
-function chunk(arr, size) {
-	const chunks = [];
-	for (let i = 0; i < arr.length; i += size) {
-		chunks.push(arr.slice(i, i + size));
+async function readAllListed(db) {
+	const result = await db.prepare("SELECT ip, list_id, item_id FROM ip_list_state WHERE list_action = 'listed'").all();
+
+	const byList = new Map();
+	for (const row of result.results || []) {
+		if (!byList.has(row.list_id)) {
+			byList.set(row.list_id, []);
+		}
+		byList.get(row.list_id).push({ ip: row.ip, itemId: row.item_id });
 	}
-	return chunks;
+	return byList;
+}
+
+/**
+ * Remove a batch of rows entirely (used once their deletion — or lack of
+ * anything to delete — has been confirmed).
+ * @param {D1Database} db
+ * @param {string[]} ips
+ */
+async function deleteQueueRows(db, ips) {
+	if (ips.length === 0) return;
+
+	// Each bound ip is 1 param, so up to 100 fit in one IN (...) statement.
+	const chunks = chunk(ips, 100);
+	const statements = chunks.map((rows) => {
+		const placeholders = rows.map(() => '?').join(', ');
+		return db.prepare(`DELETE FROM ip_list_state WHERE ip IN (${placeholders})`).bind(...rows);
+	});
+
+	await db.batch(statements);
+}
+
+/**
+ * Read up to `limit` rows still pending an add (list_action='new').
+ * @param {D1Database} db
+ * @param {number} limit
+ * @returns {Promise<{ip: string, action: string, until: string}[]>}
+ */
+async function readPendingAdds(db, limit) {
+	const result = await db
+		.prepare("SELECT ip, action, until FROM ip_list_state WHERE list_action = 'new' LIMIT ?")
+		.bind(limit)
+		.all();
+	return result.results || [];
+}
+
+/**
+ * Current member count per managed list, from the rows already marked
+ * 'listed' — the actual source of truth for how much room is left,
+ * queried fresh each tick rather than tracked separately.
+ * @param {D1Database} db
+ * @returns {Promise<Map<string, number>>} list_id -> count
+ */
+async function readListSizes(db) {
+	const result = await db.prepare("SELECT list_id, COUNT(*) as n FROM ip_list_state WHERE list_action = 'listed' GROUP BY list_id").all();
+	const sizes = new Map();
+	for (const row of result.results || []) {
+		sizes.set(row.list_id, row.n);
+	}
+	return sizes;
+}
+
+/**
+ * Mark a batch of rows as confirmed members of a list, once Cloudflare has
+ * accepted the add.
+ * @param {D1Database} db
+ * @param {string} listId
+ * @param {{ip: string, itemId: string}[]} placed
+ */
+async function markListed(db, listId, placed) {
+	if (placed.length === 0) return;
+
+	const stmt = db.prepare("UPDATE ip_list_state SET list_action = 'listed', list_id = ?, item_id = ? WHERE ip = ?");
+	await db.batch(placed.map((p) => stmt.bind(listId, p.itemId, p.ip)));
+}
+
+/**
+ * Delete every row from the D1 queue table. Used when LAPI reports no
+ * decisions at all (HTTP 204), or on the first sync after a cold start,
+ * mirroring the KV path's resetAllDecisions.
+ * @param {D1Database} db
+ */
+async function clearQueue(db) {
+	await db.prepare('DELETE FROM ip_list_state').run();
 }
 
 /**
@@ -1213,143 +1370,6 @@ async function clearBackoff(kvNamespace) {
 
 
 
-;// ./src/core/ip-list-processor.js
-/**
- * IP List Processor
- * Pure planning logic for the D1-queue-based Cloudflare IP List sync (L3/4
- * bouncing). Only 'ip' and 'range' scoped decisions apply here — country/AS
- * decisions aren't representable in a Cloudflare IP List.
- *
- * Each tick: new/expired decisions are upserted into the D1 queue table
- * (list_action = 'new'|'delete'), then a bounded batch of queue rows —
- * whichever kind — is read back and split into a delete plan (against the
- * current per-list index) and an add plan (packed into lists in order, list
- * 1 filled to capacity before list 2 is touched).
- */
-
-
-
-const IP_LIST_SCOPES = ['ip', 'range'];
-
-/**
- * Filter a decision batch down to the scopes an IP List can represent.
- * @param {import('../types.js').Decision[]} decisions
- * @returns {import('../types.js').Decision[]}
- */
-function filterIpListScopes(decisions) {
-	return decisions.filter((d) => IP_LIST_SCOPES.includes(d.scope));
-}
-
-/**
- * Convert decisions into queue-upsert entries. Skips new decisions for IPs
- * already present in a managed list (nothing to do; sticky by construction
- * since we never move an IP once it's placed) — expired decisions are never
- * skipped this way, since they need to reach the queue even if the IP isn't
- * currently in any list (e.g. it was queued as 'new' but never pushed yet).
- * @param {import('../types.js').Decision[]} decisions
- * @param {Map<string, Map<string, {itemId: string, action: string, until: string}>>} index
- * @param {boolean} isExpiry
- * @returns {{ip: string, action: string, until: string}[]}
- */
-function planQueueUpserts(decisions, index, isExpiry) {
-	const alreadyInLists = new Set();
-	if (!isExpiry) {
-		for (const members of index.values()) {
-			for (const ip of members.keys()) alreadyInLists.add(ip);
-		}
-	}
-
-	const toUpsert = [];
-	for (const decision of filterIpListScopes(decisions)) {
-		if (!isExpiry && alreadyInLists.has(decision.value)) continue;
-		toUpsert.push({ ip: decision.value, action: decision.type, until: decision.until });
-	}
-	return toUpsert;
-}
-
-/**
- * Split a batch of queue rows (mixed 'new'/'delete') into a delete plan
- * (grouped by the list currently holding each IP, for one DELETE call per
- * affected list) and the subset of rows that are actually new additions to
- * plan placement for.
- * @param {{ip: string, action: string, until: string, listAction: string}[]} batch
- * @param {Map<string, Map<string, {itemId: string, action: string, until: string}>>} index
- * @returns {{deletesByList: Map<string, {ip: string, itemId: string}[]>, notFoundDeletes: string[], newRows: {ip: string, action: string, until: string}[]}}
- */
-function splitBatch(batch, index) {
-	const deletesByList = new Map();
-	const notFoundDeletes = [];
-	const newRows = [];
-
-	for (const row of batch) {
-		if (row.listAction === 'new') {
-			newRows.push({ ip: row.ip, action: row.action, until: row.until });
-			continue;
-		}
-
-		// row.listAction === 'delete'
-		let hit = null;
-		for (const [listName, members] of index) {
-			const entry = members.get(row.ip);
-			if (entry) {
-				hit = { listName, itemId: entry.itemId };
-				break;
-			}
-		}
-
-		if (!hit) {
-			// Was queued as 'new' but never actually pushed to a list before
-			// expiring — nothing on Cloudflare to remove, just a queue row to drop.
-			notFoundDeletes.push(row.ip);
-			continue;
-		}
-
-		if (!deletesByList.has(hit.listName)) {
-			deletesByList.set(hit.listName, []);
-		}
-		deletesByList.get(hit.listName).push({ ip: row.ip, itemId: hit.itemId });
-	}
-
-	return { deletesByList, notFoundDeletes, newRows };
-}
-
-/**
- * Pack a batch of new queue rows into managed lists in order: list 1 is
- * filled to MAX_ITEMS_PER_LIST before list 2 is touched, etc. A list already
- * at capacity is skipped entirely. Items that don't fit anywhere are left
- * un-planned (still in the queue, retried next tick).
- * @param {{ip: string, action: string, until: string}[]} newRows
- * @param {string[]} listNames - managed list names, in stable (sorted) order
- * @param {Map<string, Map<string, {itemId: string, action: string, until: string}>>} index
- * @returns {{addsByList: Map<string, {ip: string, action: string, until: string}[]>, unplaced: string[]}}
- */
-function planAdds(newRows, listNames, index) {
-	const sizeByList = new Map(listNames.map((name) => [name, index.get(name)?.size ?? 0]));
-	const addsByList = new Map();
-	const unplaced = [];
-
-	for (const item of newRows) {
-		let target = null;
-		for (const listName of listNames) {
-			if (sizeByList.get(listName) < MAX_ITEMS_PER_LIST) {
-				target = listName;
-				break;
-			}
-		}
-
-		if (!target) {
-			unplaced.push(item.ip);
-			continue;
-		}
-
-		sizeByList.set(target, sizeByList.get(target) + 1);
-		if (!addsByList.has(target)) addsByList.set(target, []);
-		addsByList.get(target).push(item);
-	}
-
-	return { addsByList, unplaced };
-}
-
 ;// ./src/index.js
 /**
  * CrowdSec Autonomous Decisions Sync Worker
@@ -1447,29 +1467,31 @@ async function syncToKv(env, decisions, isFirst) {
  * externally — this only fills/empties membership of lists whose name
  * starts with IP_LIST_PREFIX.
  *
- * Decisions are queued in a D1 table (env.CROWDSECCFBOUNCER_QUEUE_DB) rather
- * than applied immediately: each tick upserts new/expired decisions into the
- * queue, reads back a bounded batch (IP_LIST_BATCH_SIZE rows, a mix of
- * pending adds and removals), applies it to Cloudflare, and only then
- * deletes those rows from the queue. This makes a large warmup (which can
- * take days at realistic decision volumes) resumable — a rate limit or
- * error mid-tick just leaves the rest queued for next time — and an
- * append-only add / id-targeted remove never overwrites IPs some other
- * process added to the same lists, unlike a full-replace would.
+ * The D1 table (env.CROWDSECCFBOUNCER_QUEUE_DB) is the single source of
+ * truth for both pending work and current membership — see
+ * cloudflare-ip-lists.js for the row shape. Each tick: expired decisions are
+ * upserted as list_action='delete' and new decisions as list_action='new'
+ * (delete always wins if the same IP appears in both this tick), then a
+ * bounded slice of pending deletes/adds is applied to Cloudflare. This makes
+ * a large warmup (which can take days at realistic decision volumes)
+ * resumable — a rate limit or error mid-tick just leaves the rest pending
+ * for next time — and an append-only add / id-targeted remove never
+ * overwrites IPs some other process added to the same lists, unlike a
+ * full-replace would.
  *
- * On the first sync after a cold start, the caller clears both the queue and
+ * On the first sync after a cold start, the caller clears both the table and
  * the managed lists (clearAllIpLists) before this runs, so what's upserted
  * here is a clean full-state pull rather than layered on residue from a
- * previously interrupted warmup. Draining the queue toward Cloudflare is a
- * separate, ongoing process that continues across ticks regardless of
+ * previously interrupted warmup. Draining pending adds toward Cloudflare is
+ * a separate, ongoing process that continues across ticks regardless of
  * isFirst — WARMED_UP only means "the initial full pull from LAPI has been
- * captured into the queue", not "the queue is empty".
+ * captured", not "every pending add has been pushed".
  *
  * @param {import('./types.js').CrowdSecEnv} env
  * @param {import('./types.js').DecisionStreamResponse} decisions
  * @returns {Promise<boolean>} true unless this tick stopped early (rate
- *   limit or error) — an unplaced/still-queued remainder is normal, expected
- *   progress, not a failure.
+ *   limit or error) — an unplaced/still-pending remainder is normal,
+ *   expected progress, not a failure.
  */
 async function syncToIpLists(env, decisions) {
 	logger.info('Starting IP list sync...');
@@ -1492,36 +1514,24 @@ async function syncToIpLists(env, decisions) {
 		// Nothing we can do without any managed lists; don't block warming on it.
 		return true;
 	}
+	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
+	const listIds = lists.map((l) => l.id); // already name-sorted by listManagedIpLists
 
-	const listNames = lists.map((l) => l.name);
-	const listById = new Map(lists.map((l) => [l.name, l.id]));
-	const index = await readIndex(env.CROWDSECCFBOUNCERNS, lists);
+	// 1/2: split into upsert-ready entries, warning if the same IP shows up
+	// in both batches this tick (delete always wins).
+	const { newItems, deleteItems } = planUpserts(decisions.new, decisions.deleted, (msg, ctx) => logger.warn(msg, ctx));
 
-	// --- upsert expired decisions into the queue as 'delete' rows ---
-	const toDeleteRows = planQueueUpserts(decisions.deleted, index, /* isExpiry */ true);
-	await upsertQueue(db, toDeleteRows, 'delete');
+	// 3: upsert new decisions (list_action='new' unless already 'listed'),
+	// then expired decisions (list_action='delete', unconditionally).
+	await upsertNews(db, newItems);
+	await upsertDeletes(db, deleteItems);
 
-	// --- upsert new decisions into the queue as 'new' rows ---
-	const toNewRows = planQueueUpserts(decisions.new, index, /* isExpiry */ false);
-	await upsertQueue(db, toNewRows, 'new');
+	// 4: apply every pending delete now — removals aren't paced/batched like
+	// adds are, since getting a ban off a list promptly matters more than
+	// pacing removals.
+	const { deletesByList, queueOnlyDeletes } = await readPendingDeletes(db);
+	const confirmedIps = new Set(queueOnlyDeletes); // nothing to remove from Cloudflare; just drop the row
 
-	// --- read a bounded batch back (mix of pending adds/removals) ---
-	const batch = await readQueueBatch(db, batchSize);
-	if (batch.length === 0) {
-		logger.info('IP list sync completed successfully (queue empty)');
-		await clearBackoff(env.CROWDSECCFBOUNCERNS);
-		return true;
-	}
-
-	const { deletesByList, notFoundDeletes, newRows } = splitBatch(batch, index);
-	const { addsByList, unplaced } = planAdds(newRows, listNames, index);
-	if (unplaced.length > 0) {
-		logger.warn(`${unplaced.length} queued IP(s) have no room in any managed list; left queued`);
-	}
-
-	const confirmedIps = new Set(notFoundDeletes); // nothing to remove from Cloudflare; just drop the queue row
-	let removedCount = 0;
-	let addedCount = 0;
 	// Per-list tallies for the completion summary below, so it's clear at a
 	// glance which lists were actually touched this tick and by how much.
 	const updatedLists = new Map(); // listName -> { added, removed }
@@ -1531,8 +1541,9 @@ async function syncToIpLists(env, decisions) {
 		updatedLists.set(listName, stat);
 	};
 
-	for (const [listName, toDelete] of deletesByList) {
-		const listId = listById.get(listName);
+	let removedCount = 0;
+	for (const [listId, toDelete] of deletesByList) {
+		const listName = listNameById.get(listId) ?? listId;
 		logger.info(`Removing ${toDelete.length} item(s) from IP list ${listName}...`, {
 			list: listName,
 			removed: toDelete.length,
@@ -1548,51 +1559,54 @@ async function syncToIpLists(env, decisions) {
 			await deleteQueueRows(db, [...confirmedIps]);
 			return handleIpListError(env, e, `removing items from IP list ${listName}`);
 		}
-		const members = index.get(listName);
 		for (const { ip } of toDelete) {
-			members.delete(ip);
 			confirmedIps.add(ip);
 			removedCount++;
 		}
 		bumpListStat(listName, 'removed', toDelete.length);
-		await writeIndexShard(env.CROWDSECCFBOUNCERNS, listName, members);
 	}
-
-	for (const [listName, items] of addsByList) {
-		const listId = listById.get(listName);
-		const ips = items.map((i) => i.ip);
-		logger.info(`Adding ${ips.length} item(s) to IP list ${listName}...`, {
-			list: listName,
-			added: ips.length,
-		});
-
-		let itemIdByIp;
-		try {
-			itemIdByIp = await addListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, ips);
-		} catch (e) {
-			// Whatever was already applied and persisted in earlier iterations of
-			// these loops stays applied; the rest of the batch stays queued.
-			await deleteQueueRows(db, [...confirmedIps]);
-			return handleIpListError(env, e, `adding items to IP list ${listName}`);
-		}
-
-		const members = index.get(listName);
-		let listAddedCount = 0;
-		for (const item of items) {
-			const itemId = itemIdByIp.get(item.ip);
-			if (!itemId) continue; // resolution failure already logged by addListItems
-			members.set(item.ip, { itemId, action: item.action, until: item.until });
-			confirmedIps.add(item.ip);
-			addedCount++;
-			listAddedCount++;
-		}
-		bumpListStat(listName, 'added', listAddedCount);
-		await writeIndexShard(env.CROWDSECCFBOUNCERNS, listName, members);
-	}
-
-	// Only rows Cloudflare actually confirmed leave the queue; unplaced adds
-	// stay put for a future tick.
+	// Rows Cloudflare confirmed removed, or that were never actually pushed,
+	// are done for good — drop them from the table entirely.
 	await deleteQueueRows(db, [...confirmedIps]);
+
+	// 5: place a bounded batch of pending adds, packing lists to capacity in
+	// order based on current member counts.
+	const pendingAdds = await readPendingAdds(db, batchSize);
+	let addedCount = 0;
+	let unplacedCount = 0;
+
+	if (pendingAdds.length > 0) {
+		const listSizes = await readListSizes(db);
+		const { addsByList, unplaced } = planAdds(pendingAdds, listIds, listSizes, MAX_ITEMS_PER_LIST);
+		unplacedCount = unplaced.length;
+		if (unplaced.length > 0) {
+			logger.warn(`${unplaced.length} pending IP(s) have no room in any managed list; left pending`);
+		}
+
+		for (const [listId, items] of addsByList) {
+			const listName = listNameById.get(listId) ?? listId;
+			const ips = items.map((i) => i.ip);
+			logger.info(`Adding ${ips.length} item(s) to IP list ${listName}...`, {
+				list: listName,
+				added: ips.length,
+			});
+
+			let itemIdByIp;
+			try {
+				itemIdByIp = await addListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, ips);
+			} catch (e) {
+				// Deletes and any earlier add iterations already committed above
+				// (and via markListed calls below) stay applied; the rest of this
+				// tick's adds stay pending for next time.
+				return handleIpListError(env, e, `adding items to IP list ${listName}`);
+			}
+
+			const placed = items.map((item) => ({ ip: item.ip, itemId: itemIdByIp.get(item.ip) })).filter((p) => p.itemId);
+			await markListed(db, listId, placed);
+			addedCount += placed.length;
+			bumpListStat(listName, 'added', placed.length);
+		}
+	}
 
 	// Made it through this tick without hitting a rate limit; clear any
 	// stale backoff from a previous run so the next tick isn't held back
@@ -1603,8 +1617,7 @@ async function syncToIpLists(env, decisions) {
 		removed: removedCount,
 		added: addedCount,
 		listsUpdated: [...updatedLists.entries()].map(([list, stat]) => ({ list, ...stat })),
-		unplaced: unplaced.length,
-		batchSize: batch.length,
+		unplaced: unplacedCount,
 	});
 
 	return true;
@@ -1638,34 +1651,36 @@ async function handleIpListError(env, e, what) {
 }
 
 /**
- * Empty every managed IP list and the pending queue. Used when LAPI reports
- * no decisions at all (HTTP 204), mirroring the KV path's resetAllDecisions.
+ * Empty every managed IP list and the D1 table entirely. Used when LAPI
+ * reports no decisions at all (HTTP 204), mirroring the KV path's
+ * resetAllDecisions.
  * @param {import('./types.js').CrowdSecEnv} env
  */
 async function clearAllIpLists(env) {
 	logger.info('Clearing all managed IP lists...');
 
 	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
+	const db = env.CROWDSECCFBOUNCER_QUEUE_DB;
 	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
-	const index = await readIndex(env.CROWDSECCFBOUNCERNS, lists);
+	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
+	const listedByList = await readAllListed(db);
 
 	const clearedLists = [];
-	for (const list of lists) {
-		const members = index.get(list.name);
-		if (members.size === 0) continue;
+	for (const [listId, members] of listedByList) {
+		if (members.length === 0) continue;
+		const listName = listNameById.get(listId) ?? listId;
 
-		logger.info(`Emptying IP list ${list.name}...`, { list: list.name, removed: members.size });
+		logger.info(`Emptying IP list ${listName}...`, { list: listName, removed: members.length });
 		await removeListItems(
 			env.CF_ACCOUNT_ID,
 			env.CF_API_TOKEN,
-			list.id,
-			[...members.values()].map((entry) => entry.itemId)
+			listId,
+			members.map((m) => m.itemId)
 		);
-		await writeIndexShard(env.CROWDSECCFBOUNCERNS, list.name, new Map());
-		clearedLists.push({ list: list.name, removed: members.size });
+		clearedLists.push({ list: listName, removed: members.length });
 	}
 
-	await clearQueue(env.CROWDSECCFBOUNCER_QUEUE_DB);
+	await clearQueue(db);
 
 	logger.info('All managed IP lists cleared successfully', { listCount: lists.length, listsUpdated: clearedLists });
 }

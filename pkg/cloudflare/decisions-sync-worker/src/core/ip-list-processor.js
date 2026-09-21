@@ -1,17 +1,14 @@
 /**
  * IP List Processor
- * Pure planning logic for the D1-queue-based Cloudflare IP List sync (L3/4
+ * Pure planning logic for the D1-backed Cloudflare IP List sync (L3/4
  * bouncing). Only 'ip' and 'range' scoped decisions apply here — country/AS
  * decisions aren't representable in a Cloudflare IP List.
  *
- * Each tick: new/expired decisions are upserted into the D1 queue table
- * (list_action = 'new'|'delete'), then a bounded batch of queue rows —
- * whichever kind — is read back and split into a delete plan (against the
- * current per-list index) and an add plan (packed into lists in order, list
- * 1 filled to capacity before list 2 is touched).
+ * The D1 table (ip_list_state) is the single source of truth for both
+ * pending work and current membership, so planning here only ever deals
+ * with plain decision objects and plain row objects — no separate
+ * in-memory index to keep in sync with it.
  */
-
-import { MAX_ITEMS_PER_LIST } from '../adapters/cloudflare-ip-lists.js';
 
 const IP_LIST_SCOPES = ['ip', 'range'];
 
@@ -25,98 +22,59 @@ export function filterIpListScopes(decisions) {
 }
 
 /**
- * Convert decisions into queue-upsert entries. Skips new decisions for IPs
- * already present in a managed list (nothing to do; sticky by construction
- * since we never move an IP once it's placed) — expired decisions are never
- * skipped this way, since they need to reach the queue even if the IP isn't
- * currently in any list (e.g. it was queued as 'new' but never pushed yet).
- * @param {import('../types.js').Decision[]} decisions
- * @param {Map<string, Map<string, {itemId: string, action: string, until: string}>>} index
- * @param {boolean} isExpiry
- * @returns {{ip: string, action: string, until: string}[]}
+ * Split new/deleted decisions into upsert-ready entries, resolving the case
+ * where the same IP appears in both batches from the same LAPI pull. That's
+ * an unusual signal (a decision both freshly issued and freshly expired at
+ * once) — logged so it can be traced back to LAPI's stream — but delete
+ * always wins: the two batches below are upserted in order (news, then
+ * deletes; see upsertNews/upsertDeletes), so the delete overwrites whatever
+ * the new-decision upsert would otherwise have set.
+ * @param {import('../types.js').Decision[]} newDecisions
+ * @param {import('../types.js').Decision[]} expiredDecisions
+ * @param {(msg: string, ctx?: object) => void} warn - logger.warn, injected so this stays a pure function
+ * @returns {{newItems: {ip: string, action: string, until: string}[], deleteItems: {ip: string, action: string, until: string}[]}}
  */
-export function planQueueUpserts(decisions, index, isExpiry) {
-	const alreadyInLists = new Set();
-	if (!isExpiry) {
-		for (const members of index.values()) {
-			for (const ip of members.keys()) alreadyInLists.add(ip);
-		}
+export function planUpserts(newDecisions, expiredDecisions, warn) {
+	const newScoped = filterIpListScopes(newDecisions);
+	const deleteScoped = filterIpListScopes(expiredDecisions);
+
+	const deleteIps = new Set(deleteScoped.map((d) => d.value));
+	const conflicting = newScoped.filter((d) => deleteIps.has(d.value)).map((d) => d.value);
+	if (conflicting.length > 0) {
+		warn(`${conflicting.length} IP(s) appear in both new and expired decisions this tick; delete wins`, {
+			ips: conflicting,
+		});
 	}
 
-	const toUpsert = [];
-	for (const decision of filterIpListScopes(decisions)) {
-		if (!isExpiry && alreadyInLists.has(decision.value)) continue;
-		toUpsert.push({ ip: decision.value, action: decision.type, until: decision.until });
-	}
-	return toUpsert;
+	const toEntry = (d) => ({ ip: d.value, action: d.type, until: d.until });
+	return {
+		newItems: newScoped.map(toEntry),
+		deleteItems: deleteScoped.map(toEntry),
+	};
 }
 
 /**
- * Split a batch of queue rows (mixed 'new'/'delete') into a delete plan
- * (grouped by the list currently holding each IP, for one DELETE call per
- * affected list) and the subset of rows that are actually new additions to
- * plan placement for.
- * @param {{ip: string, action: string, until: string, listAction: string}[]} batch
- * @param {Map<string, Map<string, {itemId: string, action: string, until: string}>>} index
- * @returns {{deletesByList: Map<string, {ip: string, itemId: string}[]>, notFoundDeletes: string[], newRows: {ip: string, action: string, until: string}[]}}
- */
-export function splitBatch(batch, index) {
-	const deletesByList = new Map();
-	const notFoundDeletes = [];
-	const newRows = [];
-
-	for (const row of batch) {
-		if (row.listAction === 'new') {
-			newRows.push({ ip: row.ip, action: row.action, until: row.until });
-			continue;
-		}
-
-		// row.listAction === 'delete'
-		let hit = null;
-		for (const [listName, members] of index) {
-			const entry = members.get(row.ip);
-			if (entry) {
-				hit = { listName, itemId: entry.itemId };
-				break;
-			}
-		}
-
-		if (!hit) {
-			// Was queued as 'new' but never actually pushed to a list before
-			// expiring — nothing on Cloudflare to remove, just a queue row to drop.
-			notFoundDeletes.push(row.ip);
-			continue;
-		}
-
-		if (!deletesByList.has(hit.listName)) {
-			deletesByList.set(hit.listName, []);
-		}
-		deletesByList.get(hit.listName).push({ ip: row.ip, itemId: hit.itemId });
-	}
-
-	return { deletesByList, notFoundDeletes, newRows };
-}
-
-/**
- * Pack a batch of new queue rows into managed lists in order: list 1 is
- * filled to MAX_ITEMS_PER_LIST before list 2 is touched, etc. A list already
- * at capacity is skipped entirely. Items that don't fit anywhere are left
- * un-planned (still in the queue, retried next tick).
- * @param {{ip: string, action: string, until: string}[]} newRows
- * @param {string[]} listNames - managed list names, in stable (sorted) order
- * @param {Map<string, Map<string, {itemId: string, action: string, until: string}>>} index
+ * Pack a batch of pending-add rows into managed lists in order: list 1 is
+ * filled to MAX_ITEMS_PER_LIST before list 2 is touched, etc, based on
+ * current member counts (readListSizes). A list already at capacity is
+ * skipped entirely. Items that don't fit anywhere are left un-planned
+ * (still 'new' in the queue, retried next tick).
+ * @param {{ip: string, action: string, until: string}[]} pendingAdds
+ * @param {string[]} listIds - managed list ids, in stable (name-sorted) order
+ * @param {Map<string, number>} listSizes - list_id -> current member count
+ * @param {number} maxItemsPerList
  * @returns {{addsByList: Map<string, {ip: string, action: string, until: string}[]>, unplaced: string[]}}
  */
-export function planAdds(newRows, listNames, index) {
-	const sizeByList = new Map(listNames.map((name) => [name, index.get(name)?.size ?? 0]));
+export function planAdds(pendingAdds, listIds, listSizes, maxItemsPerList) {
+	const sizeByList = new Map(listIds.map((id) => [id, listSizes.get(id) ?? 0]));
 	const addsByList = new Map();
 	const unplaced = [];
 
-	for (const item of newRows) {
+	for (const item of pendingAdds) {
 		let target = null;
-		for (const listName of listNames) {
-			if (sizeByList.get(listName) < MAX_ITEMS_PER_LIST) {
-				target = listName;
+		for (const listId of listIds) {
+			if (sizeByList.get(listId) < maxItemsPerList) {
+				target = listId;
 				break;
 			}
 		}

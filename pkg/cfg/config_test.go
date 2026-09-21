@@ -124,8 +124,8 @@ cloudflare_config:
 	if syncCfg.IPListPrefix != "crowdsec_" {
 		t.Fatalf("IPListPrefix = %q, want %q", syncCfg.IPListPrefix, "crowdsec_")
 	}
-	if syncCfg.D1DatabaseName != "crowdsec_ip_list_queue" {
-		t.Fatalf("D1DatabaseName = %q, want %q", syncCfg.D1DatabaseName, "crowdsec_ip_list_queue")
+	if syncCfg.D1DatabaseName != "crowdsec_ip_list_state" {
+		t.Fatalf("D1DatabaseName = %q, want %q", syncCfg.D1DatabaseName, "crowdsec_ip_list_state")
 	}
 	if syncCfg.IPListBatchSize != 1000 {
 		t.Fatalf("IPListBatchSize = %d, want %d", syncCfg.IPListBatchSize, 1000)

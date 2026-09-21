@@ -152,9 +152,10 @@ type DecisionsSyncWorkerConfig struct {
 	// enabled.
 	IPListPrefix string `yaml:"ip_list_prefix,omitempty"`
 
-	// D1DatabaseName is the name of the D1 database backing the IP list sync
-	// queue. Created automatically on deploy if it doesn't already exist.
-	// Only used when SyncToIPLists is enabled.
+	// D1DatabaseName is the name of the D1 database holding IP list state
+	// (pending work and current Cloudflare IP List membership). Created
+	// automatically on deploy if it doesn't already exist. Only used when
+	// SyncToIPLists is enabled.
 	D1DatabaseName string `yaml:"d1_database_name,omitempty"`
 
 	// IPListBatchSize caps how many queued rows (new adds and expired
@@ -174,7 +175,7 @@ func (d *DecisionsSyncWorkerConfig) setDefaults() {
 		d.IPListPrefix = "crowdsec_"
 	}
 	if d.D1DatabaseName == "" {
-		d.D1DatabaseName = "crowdsec_ip_list_queue"
+		d.D1DatabaseName = "crowdsec_ip_list_state"
 	}
 	if d.IPListBatchSize == 0 {
 		d.IPListBatchSize = 1000

@@ -5,24 +5,28 @@
  * are provisioned by an external process — this adapter only fills/empties
  * list membership.
  *
- * New and expired decisions are never applied to Cloudflare directly: they're
- * queued in a D1 table first (see the QUEUE_* functions below), and a bounded
- * batch is drained from the queue each sync tick. This lets warmup (which can
- * take days at realistic decision volumes) make steady, resumable progress
- * without ever overwriting IPs that some other process manually added to the
- * same lists — an append-only add and an id-targeted remove never touch
- * anything the worker didn't itself queue.
+ * A single D1 table (ip_list_state) is the source of truth for both pending
+ * work and current membership — see the D1_* functions below. Each row's
+ * list_action is one of:
+ *   'new'    - pending add, not yet pushed to any Cloudflare list
+ *   'delete' - pending removal from list_id/item_id
+ *   'listed' - currently a member of list_id (item_id is Cloudflare's id for
+ *              it there); nothing pending
+ * There is no separate index: list_id/item_id live on the row itself, so
+ * finding which list holds an IP — or how full a list currently is — is a
+ * plain query against this one table instead of a second KV-backed store.
  *
- * Per-list membership is tracked in a sharded KV index (one key per list) so
- * that a single JSON blob never has to hold the whole account's IP set — see
- * IDX_KEY_PREFIX below. Each entry also carries Cloudflare's internal item
- * id, since removing a specific IP requires that id, not the IP itself (see
- * removeListItems).
+ * New/expired decisions are queued (list_action='new'/'delete') rather than
+ * applied to Cloudflare immediately: each sync tick processes pending
+ * deletes and adds against a bounded slice of the table. This lets warmup
+ * (which can take days at realistic decision volumes) make steady, resumable
+ * progress without ever overwriting IPs some other process added to the same
+ * lists — an append-only add and an id-targeted remove never touch anything
+ * outside what this worker itself is tracking.
  */
 
 import logger from '../utils/logger.js';
 
-const IDX_KEY_PREFIX = 'IPLIST_IDX_';
 // Holds a single ISO timestamp: don't attempt IP list writes again until
 // after this time. Set when Cloudflare returns 429 with a Retry-After we can
 // trust; checked at the start of the next sync so we don't burn a cron tick
@@ -33,8 +37,8 @@ const MAX_ITEMS_PER_LIST = 10000;
 const BULK_POLL_INTERVAL_MS = 1000;
 const BULK_POLL_TIMEOUT_MS = 120000;
 // D1 caps bound parameters at 100/query; each queue row binds 4 (ip, action,
-// until, list_action), so 25 rows is the most that fit in one multi-row
-// VALUES statement.
+// until, list_action) for a 'new'/'delete' upsert, so 25 rows is the most
+// that fit in one multi-row VALUES statement.
 const D1_MAX_ROWS_PER_STATEMENT = 25;
 
 /**
@@ -78,6 +82,21 @@ function buildApiHeaders(apiToken) {
 }
 
 /**
+ * Split an array into fixed-size chunks.
+ * @template T
+ * @param {T[]} arr
+ * @param {number} size
+ * @returns {T[][]}
+ */
+function chunk(arr, size) {
+	const chunks = [];
+	for (let i = 0; i < arr.length; i += size) {
+		chunks.push(arr.slice(i, i + size));
+	}
+	return chunks;
+}
+
+/**
  * Discover the IP Lists this worker is allowed to manage: every custom list
  * whose name starts with the configured prefix. Lists are sorted by name so
  * pack-to-full placement (list 1 first) is stable across runs.
@@ -106,72 +125,23 @@ export async function listManagedIpLists(accountId, apiToken, prefix) {
 }
 
 /**
- * Read the sharded membership index for every managed list.
- * @param {KVNamespace} kvNamespace
- * @param {{id: string, name: string}[]} lists
- * @returns {Promise<Map<string, Map<string, {itemId: string, action: string, until: string}>>>} listName -> (ip -> entry)
- */
-export async function readIndex(kvNamespace, lists) {
-	const index = new Map();
-
-	await Promise.all(
-		lists.map(async (list) => {
-			const raw = await kvNamespace.get(IDX_KEY_PREFIX + list.name);
-			if (!raw) {
-				index.set(list.name, new Map());
-				return;
-			}
-			try {
-				const parsed = JSON.parse(raw);
-				index.set(list.name, new Map(Object.entries(parsed)));
-			} catch (e) {
-				logger.error(`Failed to parse IP list index for ${list.name}, treating as empty`, { error: e.message });
-				index.set(list.name, new Map());
-			}
-		})
-	);
-
-	return index;
-}
-
-/**
- * Persist the membership shard for a single list.
- * @param {KVNamespace} kvNamespace
- * @param {string} listName
- * @param {Map<string, {itemId: string, action: string, until: string}>} members
- */
-export async function writeIndexShard(kvNamespace, listName, members) {
-	const obj = Object.fromEntries(members);
-	await kvNamespace.put(IDX_KEY_PREFIX + listName, JSON.stringify(obj));
-}
-
-/**
- * Upsert a batch of decisions into the D1 queue table, keyed by ip. A row
- * already queued for the same IP is overwritten in place — e.g. an IP
- * queued as 'new' that expires before ever being pushed just flips to
- * 'delete' rather than getting pushed and immediately removed, and a
- * duplicate 'new' from a repeated LAPI stream poll just refreshes
- * action/until rather than erroring or duplicating.
+ * Upsert expired decisions into the queue, unconditionally forcing
+ * list_action='delete' — even for a row that was already 'listed', since
+ * that's exactly the row we want removed.
  * @param {D1Database} db
  * @param {{ip: string, action: string, until: string}[]} items
- * @param {'new' | 'delete'} listAction
  */
-export async function upsertQueue(db, items, listAction) {
+export async function upsertDeletes(db, items) {
 	if (items.length === 0) return;
 
-	// D1 caps bound parameters at 100/query; each row binds 4, so at most 25
-	// rows fit in one multi-row VALUES statement. Chunking this way (rather
-	// than one statement per row) keeps a large batch well under D1's
-	// queries-per-invocation limit (50 on Free, 1000 on Paid) — e.g. 1000
-	// rows becomes 40 statements in one db.batch(), not 1000.
 	const chunks = chunk(items, D1_MAX_ROWS_PER_STATEMENT);
 	const statements = chunks.map((rows) => {
 		const placeholders = rows.map(() => '(?, ?, ?, ?)').join(', ');
-		const params = rows.flatMap((item) => [item.ip, item.action, item.until ?? null, listAction]);
+		const params = rows.flatMap((item) => [item.ip, item.action, item.until ?? null, 'delete']);
 		return db
 			.prepare(
-				`INSERT INTO ip_list_queue (ip, action, until, list_action) VALUES ${placeholders}
-				 ON CONFLICT(ip) DO UPDATE SET action = excluded.action, until = excluded.until, list_action = excluded.list_action`
+				`INSERT INTO ip_list_state (ip, action, until, list_action) VALUES ${placeholders}
+				 ON CONFLICT(ip) DO UPDATE SET action = excluded.action, until = excluded.until, list_action = 'delete'`
 			)
 			.bind(...params);
 	});
@@ -180,63 +150,155 @@ export async function upsertQueue(db, items, listAction) {
 }
 
 /**
- * Read up to `limit` queued rows (a mix of 'new' and 'delete' entries).
+ * Upsert new decisions into the queue as list_action='new' — unless the row
+ * is already 'listed', in which case list_action is left untouched (only
+ * action/until refresh). Without this guard, a decision CrowdSec re-sends
+ * for an IP that's already placed would flip it back to 'new' and lose its
+ * list_id/item_id, causing it to be (redundantly, harmlessly, but wastefully)
+ * re-added on a future tick.
  * @param {D1Database} db
- * @param {number} limit
- * @returns {Promise<{ip: string, action: string, until: string, listAction: string}[]>}
+ * @param {{ip: string, action: string, until: string}[]} items
  */
-export async function readQueueBatch(db, limit) {
-	const result = await db.prepare('SELECT ip, action, until, list_action FROM ip_list_queue LIMIT ?').bind(limit).all();
-	return (result.results || []).map((row) => ({
-		ip: row.ip,
-		action: row.action,
-		until: row.until,
-		listAction: row.list_action,
-	}));
-}
+export async function upsertNews(db, items) {
+	if (items.length === 0) return;
 
-/**
- * Remove rows from the queue by ip, once their corresponding Cloudflare
- * write has been confirmed and persisted to the per-list KV index.
- * @param {D1Database} db
- * @param {string[]} ips
- */
-export async function deleteQueueRows(db, ips) {
-	if (ips.length === 0) return;
-
-	// Each bound ip is 1 param, so up to 100 fit in one IN (...) statement —
-	// same query-count reasoning as upsertQueue.
-	const chunks = chunk(ips, 100);
+	const chunks = chunk(items, D1_MAX_ROWS_PER_STATEMENT);
 	const statements = chunks.map((rows) => {
-		const placeholders = rows.map(() => '?').join(', ');
-		return db.prepare(`DELETE FROM ip_list_queue WHERE ip IN (${placeholders})`).bind(...rows);
+		const placeholders = rows.map(() => '(?, ?, ?, ?)').join(', ');
+		const params = rows.flatMap((item) => [item.ip, item.action, item.until ?? null, 'new']);
+		return db
+			.prepare(
+				`INSERT INTO ip_list_state (ip, action, until, list_action) VALUES ${placeholders}
+				 ON CONFLICT(ip) DO UPDATE SET
+				   action = excluded.action,
+				   until = excluded.until,
+				   list_action = CASE WHEN ip_list_state.list_action != 'listed' THEN excluded.list_action ELSE ip_list_state.list_action END`
+			)
+			.bind(...params);
 	});
 
 	await db.batch(statements);
 }
 
 /**
- * Delete every row from the D1 queue table. Used when LAPI reports no
- * decisions at all (HTTP 204), mirroring the KV path's resetAllDecisions.
+ * Read every row pending deletion, grouped by the list it's currently in.
+ * A row with no list_id (queued 'new' then expired before ever being
+ * pushed) has nothing on Cloudflare to remove — it's returned separately so
+ * the caller can just drop it from the queue.
  * @param {D1Database} db
+ * @returns {Promise<{deletesByList: Map<string, {ip: string, itemId: string}[]>, queueOnlyDeletes: string[]}>}
  */
-export async function clearQueue(db) {
-	await db.prepare('DELETE FROM ip_list_queue').run();
+export async function readPendingDeletes(db) {
+	const result = await db.prepare("SELECT ip, list_id, item_id FROM ip_list_state WHERE list_action = 'delete'").all();
+
+	const deletesByList = new Map();
+	const queueOnlyDeletes = [];
+
+	for (const row of result.results || []) {
+		if (!row.list_id || !row.item_id) {
+			queueOnlyDeletes.push(row.ip);
+			continue;
+		}
+		if (!deletesByList.has(row.list_id)) {
+			deletesByList.set(row.list_id, []);
+		}
+		deletesByList.get(row.list_id).push({ ip: row.ip, itemId: row.item_id });
+	}
+
+	return { deletesByList, queueOnlyDeletes };
 }
 
 /**
- * Split an array into fixed-size chunks.
- * @template T
- * @param {T[]} arr
- * @param {number} size
- * @returns {T[][]}
+ * Read every row currently marked 'listed', grouped by list. Used only by
+ * clearAllIpLists (warmup/reset/204) to empty every managed list wholesale —
+ * the normal per-tick flow never needs "all listed rows" in one shot.
+ * @param {D1Database} db
+ * @returns {Promise<Map<string, {ip: string, itemId: string}[]>>} list_id -> members
  */
-function chunk(arr, size) {
-	const chunks = [];
-	for (let i = 0; i < arr.length; i += size) {
-		chunks.push(arr.slice(i, i + size));
+export async function readAllListed(db) {
+	const result = await db.prepare("SELECT ip, list_id, item_id FROM ip_list_state WHERE list_action = 'listed'").all();
+
+	const byList = new Map();
+	for (const row of result.results || []) {
+		if (!byList.has(row.list_id)) {
+			byList.set(row.list_id, []);
+		}
+		byList.get(row.list_id).push({ ip: row.ip, itemId: row.item_id });
 	}
-	return chunks;
+	return byList;
+}
+
+/**
+ * Remove a batch of rows entirely (used once their deletion — or lack of
+ * anything to delete — has been confirmed).
+ * @param {D1Database} db
+ * @param {string[]} ips
+ */
+export async function deleteQueueRows(db, ips) {
+	if (ips.length === 0) return;
+
+	// Each bound ip is 1 param, so up to 100 fit in one IN (...) statement.
+	const chunks = chunk(ips, 100);
+	const statements = chunks.map((rows) => {
+		const placeholders = rows.map(() => '?').join(', ');
+		return db.prepare(`DELETE FROM ip_list_state WHERE ip IN (${placeholders})`).bind(...rows);
+	});
+
+	await db.batch(statements);
+}
+
+/**
+ * Read up to `limit` rows still pending an add (list_action='new').
+ * @param {D1Database} db
+ * @param {number} limit
+ * @returns {Promise<{ip: string, action: string, until: string}[]>}
+ */
+export async function readPendingAdds(db, limit) {
+	const result = await db
+		.prepare("SELECT ip, action, until FROM ip_list_state WHERE list_action = 'new' LIMIT ?")
+		.bind(limit)
+		.all();
+	return result.results || [];
+}
+
+/**
+ * Current member count per managed list, from the rows already marked
+ * 'listed' — the actual source of truth for how much room is left,
+ * queried fresh each tick rather than tracked separately.
+ * @param {D1Database} db
+ * @returns {Promise<Map<string, number>>} list_id -> count
+ */
+export async function readListSizes(db) {
+	const result = await db.prepare("SELECT list_id, COUNT(*) as n FROM ip_list_state WHERE list_action = 'listed' GROUP BY list_id").all();
+	const sizes = new Map();
+	for (const row of result.results || []) {
+		sizes.set(row.list_id, row.n);
+	}
+	return sizes;
+}
+
+/**
+ * Mark a batch of rows as confirmed members of a list, once Cloudflare has
+ * accepted the add.
+ * @param {D1Database} db
+ * @param {string} listId
+ * @param {{ip: string, itemId: string}[]} placed
+ */
+export async function markListed(db, listId, placed) {
+	if (placed.length === 0) return;
+
+	const stmt = db.prepare("UPDATE ip_list_state SET list_action = 'listed', list_id = ?, item_id = ? WHERE ip = ?");
+	await db.batch(placed.map((p) => stmt.bind(listId, p.itemId, p.ip)));
+}
+
+/**
+ * Delete every row from the D1 queue table. Used when LAPI reports no
+ * decisions at all (HTTP 204), or on the first sync after a cold start,
+ * mirroring the KV path's resetAllDecisions.
+ * @param {D1Database} db
+ */
+export async function clearQueue(db) {
+	await db.prepare('DELETE FROM ip_list_state').run();
 }
 
 /**
