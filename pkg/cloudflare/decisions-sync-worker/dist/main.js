@@ -915,19 +915,8 @@ function planAdds(pendingAdds, listIds, listSizes, maxItemsPerList) {
 
 
 
-// Holds a single ISO timestamp: don't attempt IP list writes again until
-// after this time. Set when Cloudflare returns 429 with a Retry-After we can
-// trust; checked at the start of the next sync so we don't burn a cron tick
-// re-attempting a call we already know will be rejected.
-const IPLIST_BACKOFF_UNTIL_KEY = 'IPLIST_BACKOFF_UNTIL';
-// Holds a single ISO timestamp: don't touch D1 again until after this time.
-// Set when D1's free-tier daily row-write quota is hit — unlike
-// IPLIST_BACKOFF_UNTIL (which only pauses pushing to Cloudflare's API), this
-// means D1 itself can't be written to at all, so nothing in syncToIpLists can
-// safely proceed: not the upserts, not the deletes, not the adds. The quota
-// resets at midnight UTC, not after a fixed delay, so this is a distinct
-// mechanism from setIpListBackoff/getIpListBackoffUntil above, not a variant of it.
-const D1_BACKOFF_UNTIL_KEY = 'D1_BACKOFF_UNTIL';
+const BACKOFF_IPLIST_UNTIL_KEY = 'BACKOFF_IPLIST_UNTIL';
+const BACKOFF_D1_UNTIL_KEY = 'BACKOFF_D1__UNTIL';
 // Substring Cloudflare's D1 binding uses for this specific quota error, so we
 // can back off precisely for this cause rather than for any D1 write failure
 // (e.g. a transient error we'd rather just retry next tick).
@@ -1336,7 +1325,7 @@ async function pollBulkOperation(accountId, apiToken, operationId) {
  * @returns {Promise<Date | null>} null if there's no active backoff
  */
 async function getIpListBackoffUntil(kvNamespace) {
-	const raw = await kvNamespace.get(IPLIST_BACKOFF_UNTIL_KEY);
+	const raw = await kvNamespace.get(BACKOFF_IPLIST_UNTIL_KEY);
 	if (!raw) return null;
 
 	const until = new Date(raw);
@@ -1353,7 +1342,7 @@ async function getIpListBackoffUntil(kvNamespace) {
  */
 async function setIpListBackoff(kvNamespace, retryAfterSeconds) {
 	const until = new Date(Date.now() + retryAfterSeconds * 1000);
-	await kvNamespace.put(IPLIST_BACKOFF_UNTIL_KEY, until.toISOString());
+	await kvNamespace.put(BACKOFF_IPLIST_UNTIL_KEY, until.toISOString());
 }
 
 /**
@@ -1362,7 +1351,7 @@ async function setIpListBackoff(kvNamespace, retryAfterSeconds) {
  * @param {KVNamespace} kvNamespace
  */
 async function clearIpListBackoff(kvNamespace) {
-	await kvNamespace.delete(IPLIST_BACKOFF_UNTIL_KEY);
+	await kvNamespace.delete(BACKOFF_IPLIST_UNTIL_KEY);
 }
 
 /**
@@ -1380,7 +1369,7 @@ function isD1DailyWriteLimitError(e) {
  * @returns {Promise<Date | null>} null if there's no active backoff
  */
 async function getD1BackoffUntil(kvNamespace) {
-	const raw = await kvNamespace.get(D1_BACKOFF_UNTIL_KEY);
+	const raw = await kvNamespace.get(BACKOFF_D1_UNTIL_KEY);
 	if (!raw) return null;
 
 	const until = new Date(raw);
@@ -1392,7 +1381,7 @@ async function getD1BackoffUntil(kvNamespace) {
 // Small safety margin past the actual UTC-midnight reset, in case Cloudflare
 // applies it a little late relative to our clock — avoids retrying into a
 // quota that hasn't actually reset yet.
-const D1_BACKOFF_SAFETY_MARGIN_MS = 10 * 60 * 1000;
+const BACKOFF_D1_SAFETY_MARGIN_MS = 10 * 60 * 1000;
 
 /**
  * Record that D1 should not be touched again until shortly after the next
@@ -1402,8 +1391,8 @@ const D1_BACKOFF_SAFETY_MARGIN_MS = 10 * 60 * 1000;
 async function setD1BackoffUntilMidnightUTC(kvNamespace) {
 	const until = new Date();
 	until.setUTCHours(24, 0, 0, 0); // next midnight UTC (today if already before it, rolls to tomorrow if past)
-	until.setTime(until.getTime() + D1_BACKOFF_SAFETY_MARGIN_MS);
-	await kvNamespace.put(D1_BACKOFF_UNTIL_KEY, until.toISOString());
+	until.setTime(until.getTime() + BACKOFF_D1_SAFETY_MARGIN_MS);
+	await kvNamespace.put(BACKOFF_D1_UNTIL_KEY, until.toISOString());
 }
 
 /**
@@ -1411,7 +1400,7 @@ async function setD1BackoffUntilMidnightUTC(kvNamespace) {
  * @param {KVNamespace} kvNamespace
  */
 async function clearD1Backoff(kvNamespace) {
-	await kvNamespace.delete(D1_BACKOFF_UNTIL_KEY);
+	await kvNamespace.delete(BACKOFF_D1_UNTIL_KEY);
 }
 
 
