@@ -919,7 +919,19 @@ function planAdds(pendingAdds, listIds, listSizes, maxItemsPerList) {
 // after this time. Set when Cloudflare returns 429 with a Retry-After we can
 // trust; checked at the start of the next sync so we don't burn a cron tick
 // re-attempting a call we already know will be rejected.
-const BACKOFF_UNTIL_KEY = 'IPLIST_BACKOFF_UNTIL';
+const IPLIST_BACKOFF_UNTIL_KEY = 'IPLIST_BACKOFF_UNTIL';
+// Holds a single ISO timestamp: don't touch D1 again until after this time.
+// Set when D1's free-tier daily row-write quota is hit — unlike
+// IPLIST_BACKOFF_UNTIL (which only pauses pushing to Cloudflare's API), this
+// means D1 itself can't be written to at all, so nothing in syncToIpLists can
+// safely proceed: not the upserts, not the deletes, not the adds. The quota
+// resets at midnight UTC, not after a fixed delay, so this is a distinct
+// mechanism from setIpListBackoff/getIpListBackoffUntil above, not a variant of it.
+const D1_BACKOFF_UNTIL_KEY = 'D1_BACKOFF_UNTIL';
+// Substring Cloudflare's D1 binding uses for this specific quota error, so we
+// can back off precisely for this cause rather than for any D1 write failure
+// (e.g. a transient error we'd rather just retry next tick).
+const D1_DAILY_WRITE_LIMIT_MESSAGE = "exceeded D1's free tier daily row write limit";
 // Hard Cloudflare ceiling for a single custom list.
 const MAX_ITEMS_PER_LIST = 10000;
 const BULK_POLL_INTERVAL_MS = 1000;
@@ -1013,9 +1025,7 @@ async function listManagedIpLists(accountId, apiToken, prefix) {
 }
 
 /**
- * Upsert expired decisions into the queue, unconditionally forcing
- * list_action='delete' — even for a row that was already 'listed', since
- * that's exactly the row we want removed.
+ * Upsert expired decisions into the queue, forcing list_action='delete' 
  * @param {D1Database} db
  * @param {{ip: string, action: string, until: string}[]} items
  */
@@ -1038,12 +1048,8 @@ async function upsertDeletes(db, items) {
 }
 
 /**
- * Upsert new decisions into the queue as list_action='new' — unless the row
- * is already 'listed', in which case list_action is left untouched (only
- * action/until refresh). Without this guard, a decision CrowdSec re-sends
- * for an IP that's already placed would flip it back to 'new' and lose its
- * list_id/item_id, causing it to be (redundantly, harmlessly, but wastefully)
- * re-added on a future tick.
+ * Upsert new decisions into the queue as list_action='new'
+ *   Unless the row is already 'listed'
  * @param {D1Database} db
  * @param {{ip: string, action: string, until: string}[]} items
  */
@@ -1070,9 +1076,7 @@ async function upsertNews(db, items) {
 
 /**
  * Read every row pending deletion, grouped by the list it's currently in.
- * A row with no list_id (queued 'new' then expired before ever being
- * pushed) has nothing on Cloudflare to remove — it's returned separately so
- * the caller can just drop it from the queue.
+ * IPs not in lists yet are returned separately so the caller can just drop it from the queue.
  * @param {D1Database} db
  * @returns {Promise<{deletesByList: Map<string, {ip: string, itemId: string}[]>, queueOnlyDeletes: string[]}>}
  */
@@ -1331,8 +1335,8 @@ async function pollBulkOperation(accountId, apiToken, operationId) {
  * @param {KVNamespace} kvNamespace
  * @returns {Promise<Date | null>} null if there's no active backoff
  */
-async function getBackoffUntil(kvNamespace) {
-	const raw = await kvNamespace.get(BACKOFF_UNTIL_KEY);
+async function getIpListBackoffUntil(kvNamespace) {
+	const raw = await kvNamespace.get(IPLIST_BACKOFF_UNTIL_KEY);
 	if (!raw) return null;
 
 	const until = new Date(raw);
@@ -1347,9 +1351,9 @@ async function getBackoffUntil(kvNamespace) {
  * @param {KVNamespace} kvNamespace
  * @param {number} retryAfterSeconds
  */
-async function setBackoff(kvNamespace, retryAfterSeconds) {
+async function setIpListBackoff(kvNamespace, retryAfterSeconds) {
 	const until = new Date(Date.now() + retryAfterSeconds * 1000);
-	await kvNamespace.put(BACKOFF_UNTIL_KEY, until.toISOString());
+	await kvNamespace.put(IPLIST_BACKOFF_UNTIL_KEY, until.toISOString());
 }
 
 /**
@@ -1357,8 +1361,57 @@ async function setBackoff(kvNamespace, retryAfterSeconds) {
  * completes without hitting a rate limit.
  * @param {KVNamespace} kvNamespace
  */
-async function clearBackoff(kvNamespace) {
-	await kvNamespace.delete(BACKOFF_UNTIL_KEY);
+async function clearIpListBackoff(kvNamespace) {
+	await kvNamespace.delete(IPLIST_BACKOFF_UNTIL_KEY);
+}
+
+/**
+ * True if `e` is D1's free-tier daily row-write quota error.
+ * @param {unknown} e
+ * @returns {boolean}
+ */
+function isD1DailyWriteLimitError(e) {
+	return e instanceof Error && e.message.includes(D1_DAILY_WRITE_LIMIT_MESSAGE);
+}
+
+/**
+ * Read the current D1 backoff deadline, if any.
+ * @param {KVNamespace} kvNamespace
+ * @returns {Promise<Date | null>} null if there's no active backoff
+ */
+async function getD1BackoffUntil(kvNamespace) {
+	const raw = await kvNamespace.get(D1_BACKOFF_UNTIL_KEY);
+	if (!raw) return null;
+
+	const until = new Date(raw);
+	if (Number.isNaN(until.getTime())) return null;
+
+	return until;
+}
+
+// Small safety margin past the actual UTC-midnight reset, in case Cloudflare
+// applies it a little late relative to our clock — avoids retrying into a
+// quota that hasn't actually reset yet.
+const D1_BACKOFF_SAFETY_MARGIN_MS = 10 * 60 * 1000;
+
+/**
+ * Record that D1 should not be touched again until shortly after the next
+ * UTC midnight, when D1's free-tier daily row-write quota resets.
+ * @param {KVNamespace} kvNamespace
+ */
+async function setD1BackoffUntilMidnightUTC(kvNamespace) {
+	const until = new Date();
+	until.setUTCHours(24, 0, 0, 0); // next midnight UTC (today if already before it, rolls to tomorrow if past)
+	until.setTime(until.getTime() + D1_BACKOFF_SAFETY_MARGIN_MS);
+	await kvNamespace.put(D1_BACKOFF_UNTIL_KEY, until.toISOString());
+}
+
+/**
+ * Clear the D1 backoff deadline, e.g. once it has passed.
+ * @param {KVNamespace} kvNamespace
+ */
+async function clearD1Backoff(kvNamespace) {
+	await kvNamespace.delete(D1_BACKOFF_UNTIL_KEY);
 }
 
 
@@ -1393,11 +1446,9 @@ async function scheduled(event, env, _ctx) {
 	logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
 
 	try {
-		// The worker always syncs to exactly one target, never both — this
-		// keeps warmup/WARMED_UP handling simple, since there's only ever one
-		// sync target's completion to wait on. Any value other than the
-		// literal string "true" means KV mode (the default).
+		// By Default, the worker syncs to KV unless explicitly configured to sync to IP Lists (SYNC_TO_LIST_NOT_KV=true).
 		const syncToListsMode = env.SYNC_TO_LIST_NOT_KV === 'true';
+		// Logic variables to make code more readable along the way
 		const syncToKvEnabled = !syncToListsMode;
 		const syncToIpListsEnabled = syncToListsMode;
 
@@ -1412,9 +1463,7 @@ async function scheduled(event, env, _ctx) {
 			return;
 		}
 
-		// CROWDSECCFBOUNCERNS is required in both modes: it's the L7 worker's
-		// data store in KV mode, and it also holds the sync lock, warmed
-		// flag, reset flag, and IP-list backoff timer in list mode.
+		// CROWDSECCFBOUNCERNS is required in both modes: KV or IP Lists.
 		if (!env.CROWDSECCFBOUNCERNS) {
 			logger.error('CROWDSECCFBOUNCERNS KV namespace is not bound');
 			return;
@@ -1443,10 +1492,7 @@ async function scheduled(event, env, _ctx) {
 
 		const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
 
-		// Acquire the sync lock so an overlapping cron tick (or a manual run
-		// while a previous one is still in flight) doesn't fan out into a
-		// full-sync storm against LAPI. Released in finally below; TTL is
-		// only a backstop for a hard crash.
+		// Lock to avoid overlapping syncs from multiple cron ticks or manual runs.
 		const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
 		if (!lockAcquired) {
 			logger.info('Sync already in progress, skipping this run');
@@ -1454,18 +1500,27 @@ async function scheduled(event, env, _ctx) {
 		}
 
 		try {
+			
+
+			// If D1 is out of its daily write-row quota, nothing in IP-list mode can proceed 
+			if (syncToIpListsEnabled) {
+				const d1BackoffUntil = await getD1BackoffUntil(env.CROWDSECCFBOUNCERNS);
+				if (d1BackoffUntil && d1BackoffUntil > new Date()) {
+					logger.warn('Skipping sync entirely: D1 daily write-row quota exceeded, waiting for reset', {
+						backoffUntil: d1BackoffUntil.toISOString(),
+					});
+					return;
+				}
+			}
+
 			// Determine if this is the first fetch
 			const needStartUpFetch = await needWarmUp(env.CROWDSECCFBOUNCERNS);
-			logger.info('Fetch type determined', { startup: needStartUpFetch });
+			logger.info('Pull All decisions ?', { startup: needStartUpFetch });
 
 			// Check if reset is requested
 			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
 
-			// Clear residual state before the pull, both on an explicit RESET
-			// and on the very first sync after a cold start — either way,
-			// what's about to be fetched from LAPI (startup=true below) is the
-			// full current state, not a diff, so stale entries from a previous
-			// run must not survive into it.
+			// Clear residual decisions before a fresh pull or on an explicit RESET
 			if ((resetRequested || needStartUpFetch) && syncToKvEnabled) {
 				logger.info('Clearing all decision keys from KV before fresh sync...');
 				await resetAllDecisions(
@@ -1479,11 +1534,8 @@ async function scheduled(event, env, _ctx) {
 				logger.info('Clearing all managed IP lists and the sync queue before fresh sync...');
 				await clearAllIpLists(env);
 			}
-			if (resetRequested && syncToIpListsEnabled) {
-				// resetAllDecisions (above) already clears RESET as part of
-				// wiping KV; in IP-list mode it's never called, so clear the
-				// flag here or a manual RESET=true would never be acknowledged
-				// and would keep re-triggering every tick.
+
+			if (resetRequested) {
 				await clearResetFlag(env.CROWDSECCFBOUNCERNS);
 			}
 
@@ -1522,9 +1574,7 @@ async function scheduled(event, env, _ctx) {
 				if (syncToIpListsEnabled) {
 					await clearAllIpLists(env);
 				}
-				// Safe to mark warmed here: the sync target is now in its
-				// intended empty state, so a crash at this point doesn't leave
-				// decisions unwritten.
+				// Safe to mark warmed here: it it's empty state we want
 				if (needStartUpFetch) {
 					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
 					logger.info('Cache marked as warmed (LAPI has no decisions)');
@@ -1536,14 +1586,13 @@ async function scheduled(event, env, _ctx) {
 				return; // Exit early - no further sync needed
 			}
 
-			// syncToKv throws on failure, so reaching markAsWarmed below means
-			// it fully completed. syncToIpLists instead returns a boolean,
-			// since a rate limit or error there is expected, recoverable
-			// progress rather than a hard failure — see its own docs.
-			let syncSucceeded = true;
+			let syncSucceeded;
 			if (syncToKvEnabled) {
 				await syncToKv(env, decisions, needStartUpFetch);
+				// syncToKv throws on failure, so reaching this point means it succeeded
+				syncSucceeded = true;
 			} else {
+				// Partial sync possible: in D1 but not in lists yet
 				syncSucceeded = await syncToIpLists(env, decisions);
 			}
 
@@ -1655,29 +1704,9 @@ async function syncToKv(env, decisions, needStartUpFetch) {
 }
 
 /**
- * Sync decisions to Cloudflare IP Lists (used for L3/4 bouncing). List
- * creation and the firewall rules referencing these lists are provisioned
- * externally — this only fills/empties membership of lists whose name
- * starts with IP_LIST_PREFIX.
+ * Sync decisions to Cloudflare IP Lists (used for L3/4 bouncing). 
  *
- * The D1 table (env.LIST_STATE_DB) is the single source of truth for both
- * pending work and current membership — see cloudflare-ip-lists.js for the
- * row shape. Each tick: expired decisions are upserted as
- * list_action='delete' and new decisions as list_action='new' (delete always
- * wins if the same IP appears in both this tick), then a bounded slice of
- * pending deletes/adds is applied to Cloudflare. This makes a large warmup
- * (which can take days at realistic decision volumes) resumable — a rate
- * limit or error mid-tick just leaves the rest pending for next time — and
- * an append-only add / id-targeted remove never overwrites IPs some other
- * process added to the same lists, unlike a full-replace would.
- *
- * On the first sync after a cold start, the caller clears both the table and
- * the managed lists (clearAllIpLists) before this runs, so what's upserted
- * here is a clean full-state pull rather than layered on residue from a
- * previously interrupted warmup. Draining pending adds toward Cloudflare is
- * a separate, ongoing process that continues across ticks regardless of
- * needStartUpFetch — WARMED_UP only means "the initial full pull from LAPI
- * has been captured", not "every pending add has been pushed".
+ * The D1 table is the source of truth for pending work and current list content index
  *
  * @param {import('./types.js').CrowdSecEnv} env
  * @param {import('./types.js').DecisionStreamResponse} decisions
@@ -1688,17 +1717,42 @@ async function syncToKv(env, decisions, needStartUpFetch) {
 async function syncToIpLists(env, decisions) {
 	logger.info('Starting IP list sync...');
 
-	const backoffUntil = await getBackoffUntil(env.CROWDSECCFBOUNCERNS);
-	if (backoffUntil && backoffUntil > new Date()) {
-		logger.warn('Skipping IP list sync: backing off after a previous rate limit', {
-			backoffUntil: backoffUntil.toISOString(),
-		});
-		return false;
-	}
-
 	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
 	const batchSize = env.IP_LIST_BATCH_SIZE ? parseInt(env.IP_LIST_BATCH_SIZE, 10) : DEFAULT_IP_LIST_BATCH_SIZE;
 	const db = env.LIST_STATE_DB;
+
+	// Split into upsert-ready entries, warning if the same IP shows up (delete always wins).
+	const { newItems, deleteItems } = planUpserts(decisions.new, decisions.deleted, (msg, ctx) => logger.warn(msg, ctx));
+
+	let deletesByList, queueOnlyDeletes;
+	try {
+		// Upsert new decisions (list_action='new' unless already 'listed'),
+		await upsertNews(db, newItems);
+		// then expired decisions (list_action='delete', unconditionally)
+		await upsertDeletes(db, deleteItems);
+
+		// Apply every pending delete that's D1-only
+		({ deletesByList, queueOnlyDeletes } = await readPendingDeletes(db));
+		await deleteQueueRows(db, queueOnlyDeletes);
+	} catch (e) {
+		if (isD1DailyWriteLimitError(e)) {
+			await setD1BackoffUntilMidnightUTC(env.CROWDSECCFBOUNCERNS);
+			logger.warn('D1 daily write-row quota exceeded while queuing this tick\'s changes; pausing all D1 writes until midnight UTC');
+			logger.warn('May be desynchronized with current CrowdSec endpoint !');
+			return false;
+		}
+		throw e;
+	}
+
+	// Check if we're currently backing off due to a previous rate limit.
+	const backoffUntil = await getIpListBackoffUntil(env.CROWDSECCFBOUNCERNS);
+	if (backoffUntil && backoffUntil > new Date()) {
+		logger.warn('Skipping Cloudflare IP list updates: backing off after a previous rate limit', {
+			backoffUntil: backoffUntil.toISOString(),
+		});
+
+		return false;
+	}
 
 	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
 	if (lists.length === 0) {
@@ -1709,23 +1763,25 @@ async function syncToIpLists(env, decisions) {
 	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
 	const listIds = lists.map((l) => l.id); // already name-sorted by listManagedIpLists
 
-	// 1/2: split into upsert-ready entries, warning if the same IP shows up
-	// in both batches this tick (delete always wins).
-	const { newItems, deleteItems } = planUpserts(decisions.new, decisions.deleted, (msg, ctx) => logger.warn(msg, ctx));
+	// Log current fill level per list
+	const logListCapacity = async (message) => {
+		const listSizes = await readListSizes(db);
+		logger.info(
+			message,
+			Object.fromEntries(
+				listIds.map((id) => {
+					const listName = listNameById.get(id) ?? id;
+					const size = listSizes.get(id) ?? 0;
+					return [listName, `${size}/${MAX_ITEMS_PER_LIST}`];
+				})
+			)
+		);
+		return listSizes;
+	};
+	await logListCapacity('IP list capacity before sync');
 
-	// 3: upsert new decisions (list_action='new' unless already 'listed'),
-	// then expired decisions (list_action='delete', unconditionally).
-	await upsertNews(db, newItems);
-	await upsertDeletes(db, deleteItems);
-
-	// 4: apply every pending delete now — removals aren't paced/batched like
-	// adds are, since getting a ban off a list promptly matters more than
-	// pacing removals.
-	const { deletesByList, queueOnlyDeletes } = await readPendingDeletes(db);
-	const confirmedIps = new Set(queueOnlyDeletes); // nothing to remove from Cloudflare; just drop the row
-
-	// Per-list tallies for the completion summary below, so it's clear at a
-	// glance which lists were actually touched this tick and by how much.
+	// Remove from Lists and keep track of success removal per list
+	const confirmedIps = new Set();
 	const updatedLists = new Map(); // listName -> { added, removed }
 	const bumpListStat = (listName, key, n) => {
 		const stat = updatedLists.get(listName) || { added: 0, removed: 0 };
@@ -1734,41 +1790,53 @@ async function syncToIpLists(env, decisions) {
 	};
 
 	let removedCount = 0;
-	for (const [listId, toDelete] of deletesByList) {
-		const listName = listNameById.get(listId) ?? listId;
-		logger.info(`Removing ${toDelete.length} item(s) from IP list ${listName}...`, {
-			list: listName,
-			removed: toDelete.length,
-		});
+	try {
+		for (const [listId, toDelete] of deletesByList) {
+			const listName = listNameById.get(listId) ?? listId;
+			logger.info(`Removing ${toDelete.length} item(s) from IP list ${listName}...`, {
+				list: listName,
+				removed: toDelete.length,
+			});
+			try {
+				await removeListItems(
+					env.CF_ACCOUNT_ID,
+					env.CF_API_TOKEN,
+					listId,
+					toDelete.map((t) => t.itemId)
+				);
+			} catch (e) {
+				return handleIpListError(env, e, `removing items from IP list ${listName}`);
+			}
+			for (const { ip } of toDelete) {
+				confirmedIps.add(ip);
+				removedCount++;
+			}
+			bumpListStat(listName, 'removed', toDelete.length);
+		}
+	} finally {
 		try {
-			await removeListItems(
-				env.CF_ACCOUNT_ID,
-				env.CF_API_TOKEN,
-				listId,
-				toDelete.map((t) => t.itemId)
-			);
-		} catch (e) {
 			await deleteQueueRows(db, [...confirmedIps]);
-			return handleIpListError(env, e, `removing items from IP list ${listName}`);
+		} catch (e) {
+			logger.error('D1 write failed after Cloudflare confirmed IP list removal(s); D1 and the IP lists are now out of sync for these IPs until the next startup/reset pull', {
+				ips: [...confirmedIps],
+				error: e.message,
+			});
+			if (isD1DailyWriteLimitError(e)) {
+				await setD1BackoffUntilMidnightUTC(env.CROWDSECCFBOUNCERNS);
+				logger.warn('D1 daily write-row quota exceeded; pausing all D1 writes until midnight UTC');
+			}
+			throw e;
 		}
-		for (const { ip } of toDelete) {
-			confirmedIps.add(ip);
-			removedCount++;
-		}
-		bumpListStat(listName, 'removed', toDelete.length);
 	}
-	// Rows Cloudflare confirmed removed, or that were never actually pushed,
-	// are done for good — drop them from the table entirely.
-	await deleteQueueRows(db, [...confirmedIps]);
 
-	// 5: place a bounded batch of pending adds, packing lists to capacity in
-	// order based on current member counts.
+	// Add to Lists and keep track of success addition per list
+		// Doing ONE batch per tick only, ticks are close to each other no need to rush
 	const pendingAdds = await readPendingAdds(db, batchSize);
 	let addedCount = 0;
 	let unplacedCount = 0;
 
 	if (pendingAdds.length > 0) {
-		const listSizes = await readListSizes(db);
+		const listSizes = await logListCapacity('IP list capacity before placing pending adds');
 		const { addsByList, unplaced } = planAdds(pendingAdds, listIds, listSizes, MAX_ITEMS_PER_LIST);
 		unplacedCount = unplaced.length;
 		if (unplaced.length > 0) {
@@ -1778,7 +1846,7 @@ async function syncToIpLists(env, decisions) {
 		for (const [listId, items] of addsByList) {
 			const listName = listNameById.get(listId) ?? listId;
 			const ips = items.map((i) => i.ip);
-			logger.info(`Adding ${ips.length} item(s) to IP list ${listName}...`, {
+			logger.info(`Trying to add ${ips.length} item(s) to IP list ${listName}...`, {
 				list: listName,
 				added: ips.length,
 			});
@@ -1787,23 +1855,37 @@ async function syncToIpLists(env, decisions) {
 			try {
 				itemIdByIp = await addListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, ips);
 			} catch (e) {
-				// Deletes and any earlier add iterations already committed above
-				// (and via markListed calls below) stay applied; the rest of this
-				// tick's adds stay pending for next time.
+				logger.info(`Failed to add IPs to list ${listName}...`, {
+					list: listName,
+				});
+			
 				return handleIpListError(env, e, `adding items to IP list ${listName}`);
 			}
 
 			const placed = items.map((item) => ({ ip: item.ip, itemId: itemIdByIp.get(item.ip) })).filter((p) => p.itemId);
-			await markListed(db, listId, placed);
+			try {
+				await markListed(db, listId, placed);
+			} catch (e) {
+				logger.error('D1 write failed after Cloudflare confirmed IP list addition(s); D1 and the IP lists are now out of sync for these IPs until the next startup/reset pull', {
+					list: listName,
+					ips: placed.map((p) => p.ip),
+					error: e.message,
+				});
+				if (isD1DailyWriteLimitError(e)) {
+					await setD1BackoffUntilMidnightUTC(env.CROWDSECCFBOUNCERNS);
+					logger.warn('D1 daily write-row quota exceeded; pausing all D1 writes until midnight UTC');
+				}
+				throw e;
+			}
 			addedCount += placed.length;
 			bumpListStat(listName, 'added', placed.length);
 		}
 	}
 
-	// Made it through this tick without hitting a rate limit; clear any
-	// stale backoff from a previous run so the next tick isn't held back
-	// unnecessarily.
-	await clearBackoff(env.CROWDSECCFBOUNCERNS);
+	// Made it through this tick without hitting a rate limit or a D1 write
+	// clearing backoff deadlines since this tick completed successfully
+	await clearIpListBackoff(env.CROWDSECCFBOUNCERNS);
+	await clearD1Backoff(env.CROWDSECCFBOUNCERNS);
 
 	logger.info('IP list sync completed successfully', {
 		removed: removedCount,
@@ -1827,7 +1909,7 @@ async function syncToIpLists(env, decisions) {
 async function handleIpListError(env, e, what) {
 	if (e instanceof CloudflareApiError && e.status === 429 && e.retryAfterSeconds !== undefined) {
 		logger.warn(`Rate limited ${what}; backing off`, { retryAfterSeconds: e.retryAfterSeconds });
-		await setBackoff(env.CROWDSECCFBOUNCERNS, e.retryAfterSeconds);
+		await setIpListBackoff(env.CROWDSECCFBOUNCERNS, e.retryAfterSeconds);
 	} else {
 		// Anything else (quota exceeded, malformed request, transient 5xx,
 		// ...) — Cloudflare doesn't give us a reliable way to tell these apart
