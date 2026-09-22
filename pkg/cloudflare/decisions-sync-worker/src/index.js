@@ -60,11 +60,9 @@ async function scheduled(event, env, _ctx) {
 	logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
 
 	try {
-		// The worker always syncs to exactly one target, never both — this
-		// keeps warmup/WARMED_UP handling simple, since there's only ever one
-		// sync target's completion to wait on. Any value other than the
-		// literal string "true" means KV mode (the default).
+		// By Default, the worker syncs to KV unless explicitly configured to sync to IP Lists (SYNC_TO_LIST_NOT_KV=true).
 		const syncToListsMode = env.SYNC_TO_LIST_NOT_KV === 'true';
+		// Logic variables to make code more readable along the way
 		const syncToKvEnabled = !syncToListsMode;
 		const syncToIpListsEnabled = syncToListsMode;
 
@@ -79,9 +77,7 @@ async function scheduled(event, env, _ctx) {
 			return;
 		}
 
-		// CROWDSECCFBOUNCERNS is required in both modes: it's the L7 worker's
-		// data store in KV mode, and it also holds the sync lock, warmed
-		// flag, reset flag, and IP-list backoff timer in list mode.
+		// CROWDSECCFBOUNCERNS is required in both modes: KV or IP Lists.
 		if (!env.CROWDSECCFBOUNCERNS) {
 			logger.error('CROWDSECCFBOUNCERNS KV namespace is not bound');
 			return;
@@ -110,10 +106,7 @@ async function scheduled(event, env, _ctx) {
 
 		const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
 
-		// Acquire the sync lock so an overlapping cron tick (or a manual run
-		// while a previous one is still in flight) doesn't fan out into a
-		// full-sync storm against LAPI. Released in finally below; TTL is
-		// only a backstop for a hard crash.
+		// Lock to avoid overlapping syncs from multiple cron ticks or manual runs.
 		const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
 		if (!lockAcquired) {
 			logger.info('Sync already in progress, skipping this run');
@@ -123,16 +116,12 @@ async function scheduled(event, env, _ctx) {
 		try {
 			// Determine if this is the first fetch
 			const needStartUpFetch = await needWarmUp(env.CROWDSECCFBOUNCERNS);
-			logger.info('Fetch type determined', { startup: needStartUpFetch });
+			logger.info('Pull All decisions ?', { startup: needStartUpFetch });
 
 			// Check if reset is requested
 			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
 
-			// Clear residual state before the pull, both on an explicit RESET
-			// and on the very first sync after a cold start — either way,
-			// what's about to be fetched from LAPI (startup=true below) is the
-			// full current state, not a diff, so stale entries from a previous
-			// run must not survive into it.
+			// Clear residual decisions before a fresh pull or on an explicit RESET
 			if ((resetRequested || needStartUpFetch) && syncToKvEnabled) {
 				logger.info('Clearing all decision keys from KV before fresh sync...');
 				await resetAllDecisions(
@@ -146,11 +135,8 @@ async function scheduled(event, env, _ctx) {
 				logger.info('Clearing all managed IP lists and the sync queue before fresh sync...');
 				await clearAllIpLists(env);
 			}
-			if (resetRequested && syncToIpListsEnabled) {
-				// resetAllDecisions (above) already clears RESET as part of
-				// wiping KV; in IP-list mode it's never called, so clear the
-				// flag here or a manual RESET=true would never be acknowledged
-				// and would keep re-triggering every tick.
+
+			if (resetRequested) {
 				await clearResetFlag(env.CROWDSECCFBOUNCERNS);
 			}
 
@@ -189,9 +175,7 @@ async function scheduled(event, env, _ctx) {
 				if (syncToIpListsEnabled) {
 					await clearAllIpLists(env);
 				}
-				// Safe to mark warmed here: the sync target is now in its
-				// intended empty state, so a crash at this point doesn't leave
-				// decisions unwritten.
+				// Safe to mark warmed here: it it's empty state we want
 				if (needStartUpFetch) {
 					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
 					logger.info('Cache marked as warmed (LAPI has no decisions)');
@@ -203,14 +187,13 @@ async function scheduled(event, env, _ctx) {
 				return; // Exit early - no further sync needed
 			}
 
-			// syncToKv throws on failure, so reaching markAsWarmed below means
-			// it fully completed. syncToIpLists instead returns a boolean,
-			// since a rate limit or error there is expected, recoverable
-			// progress rather than a hard failure — see its own docs.
-			let syncSucceeded = true;
+			let syncSucceeded;
 			if (syncToKvEnabled) {
 				await syncToKv(env, decisions, needStartUpFetch);
+				// syncToKv throws on failure, so reaching this point means it succeeded
+				syncSucceeded = true;
 			} else {
+				// Partial sync possible: in D1 but not in lists yet
 				syncSucceeded = await syncToIpLists(env, decisions);
 			}
 
@@ -322,29 +305,9 @@ async function syncToKv(env, decisions, needStartUpFetch) {
 }
 
 /**
- * Sync decisions to Cloudflare IP Lists (used for L3/4 bouncing). List
- * creation and the firewall rules referencing these lists are provisioned
- * externally — this only fills/empties membership of lists whose name
- * starts with IP_LIST_PREFIX.
+ * Sync decisions to Cloudflare IP Lists (used for L3/4 bouncing). 
  *
- * The D1 table (env.LIST_STATE_DB) is the single source of truth for both
- * pending work and current membership — see cloudflare-ip-lists.js for the
- * row shape. Each tick: expired decisions are upserted as
- * list_action='delete' and new decisions as list_action='new' (delete always
- * wins if the same IP appears in both this tick), then a bounded slice of
- * pending deletes/adds is applied to Cloudflare. This makes a large warmup
- * (which can take days at realistic decision volumes) resumable — a rate
- * limit or error mid-tick just leaves the rest pending for next time — and
- * an append-only add / id-targeted remove never overwrites IPs some other
- * process added to the same lists, unlike a full-replace would.
- *
- * On the first sync after a cold start, the caller clears both the table and
- * the managed lists (clearAllIpLists) before this runs, so what's upserted
- * here is a clean full-state pull rather than layered on residue from a
- * previously interrupted warmup. Draining pending adds toward Cloudflare is
- * a separate, ongoing process that continues across ticks regardless of
- * needStartUpFetch — WARMED_UP only means "the initial full pull from LAPI
- * has been captured", not "every pending add has been pushed".
+ * The D1 table is the source of truth for pending work and current list content index
  *
  * @param {import('./types.js').CrowdSecEnv} env
  * @param {import('./types.js').DecisionStreamResponse} decisions
@@ -355,17 +318,27 @@ async function syncToKv(env, decisions, needStartUpFetch) {
 async function syncToIpLists(env, decisions) {
 	logger.info('Starting IP list sync...');
 
-	const backoffUntil = await getBackoffUntil(env.CROWDSECCFBOUNCERNS);
-	if (backoffUntil && backoffUntil > new Date()) {
-		logger.warn('Skipping IP list sync: backing off after a previous rate limit', {
-			backoffUntil: backoffUntil.toISOString(),
-		});
-		return false;
-	}
-
 	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
 	const batchSize = env.IP_LIST_BATCH_SIZE ? parseInt(env.IP_LIST_BATCH_SIZE, 10) : DEFAULT_IP_LIST_BATCH_SIZE;
 	const db = env.LIST_STATE_DB;
+
+	// Split into upsert-ready entries, warning if the same IP shows up (delete always wins).
+	const { newItems, deleteItems } = planUpserts(decisions.new, decisions.deleted, (msg, ctx) => logger.warn(msg, ctx));
+
+	// Upsert new decisions (list_action='new' unless already 'listed'),
+	await upsertNews(db, newItems);
+	// then expired decisions (list_action='delete', unconditionally)
+	await upsertDeletes(db, deleteItems);
+
+	// Check if we're currently backing off due to a previous rate limit.
+	const backoffUntil = await getBackoffUntil(env.CROWDSECCFBOUNCERNS);
+	if (backoffUntil && backoffUntil > new Date()) {
+		logger.warn('Skipping Cloudflare IP list updates: backing off after a previous rate limit', {
+			backoffUntil: backoffUntil.toISOString(),
+		});
+		
+		return false;
+	}
 
 	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
 	if (lists.length === 0) {
@@ -376,20 +349,11 @@ async function syncToIpLists(env, decisions) {
 	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
 	const listIds = lists.map((l) => l.id); // already name-sorted by listManagedIpLists
 
-	// 1/2: split into upsert-ready entries, warning if the same IP shows up
-	// in both batches this tick (delete always wins).
-	const { newItems, deleteItems } = planUpserts(decisions.new, decisions.deleted, (msg, ctx) => logger.warn(msg, ctx));
-
-	// 3: upsert new decisions (list_action='new' unless already 'listed'),
-	// then expired decisions (list_action='delete', unconditionally).
-	await upsertNews(db, newItems);
-	await upsertDeletes(db, deleteItems);
-
-	// 4: apply every pending delete now — removals aren't paced/batched like
+	// Apply every pending delete now — removals aren't paced/batched like
 	// adds are, since getting a ban off a list promptly matters more than
 	// pacing removals.
 	const { deletesByList, queueOnlyDeletes } = await readPendingDeletes(db);
-	const confirmedIps = new Set(queueOnlyDeletes); // nothing to remove from Cloudflare; just drop the row
+	const confirmedIps = new Set(queueOnlyDeletes); // IP not in Lists yet, only remove from D1
 
 	// Per-list tallies for the completion summary below, so it's clear at a
 	// glance which lists were actually touched this tick and by how much.
@@ -401,32 +365,36 @@ async function syncToIpLists(env, decisions) {
 	};
 
 	let removedCount = 0;
-	for (const [listId, toDelete] of deletesByList) {
-		const listName = listNameById.get(listId) ?? listId;
-		logger.info(`Removing ${toDelete.length} item(s) from IP list ${listName}...`, {
-			list: listName,
-			removed: toDelete.length,
-		});
-		try {
-			await removeListItems(
-				env.CF_ACCOUNT_ID,
-				env.CF_API_TOKEN,
-				listId,
-				toDelete.map((t) => t.itemId)
-			);
-		} catch (e) {
-			await deleteQueueRows(db, [...confirmedIps]);
-			return handleIpListError(env, e, `removing items from IP list ${listName}`);
+	try {
+		for (const [listId, toDelete] of deletesByList) {
+			const listName = listNameById.get(listId) ?? listId;
+			logger.info(`Removing ${toDelete.length} item(s) from IP list ${listName}...`, {
+				list: listName,
+				removed: toDelete.length,
+			});
+			try {
+				await removeListItems(
+					env.CF_ACCOUNT_ID,
+					env.CF_API_TOKEN,
+					listId,
+					toDelete.map((t) => t.itemId)
+				);
+			} catch (e) {
+				return handleIpListError(env, e, `removing items from IP list ${listName}`);
+			}
+			for (const { ip } of toDelete) {
+				confirmedIps.add(ip);
+				removedCount++;
+			}
+			bumpListStat(listName, 'removed', toDelete.length);
 		}
-		for (const { ip } of toDelete) {
-			confirmedIps.add(ip);
-			removedCount++;
-		}
-		bumpListStat(listName, 'removed', toDelete.length);
+	} finally {
+		// Rows Cloudflare confirmed removed, or that were never actually pushed,
+		// are done for good — drop them from the table entirely. Runs whether
+		// the loop above completed or bailed out early on an API error, so
+		// confirmed rows never get stuck in the table waiting for next tick.
+		await deleteQueueRows(db, [...confirmedIps]);
 	}
-	// Rows Cloudflare confirmed removed, or that were never actually pushed,
-	// are done for good — drop them from the table entirely.
-	await deleteQueueRows(db, [...confirmedIps]);
 
 	// 5: place a bounded batch of pending adds, packing lists to capacity in
 	// order based on current member counts.

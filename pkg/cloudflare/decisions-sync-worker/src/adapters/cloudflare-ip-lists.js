@@ -125,9 +125,7 @@ export async function listManagedIpLists(accountId, apiToken, prefix) {
 }
 
 /**
- * Upsert expired decisions into the queue, unconditionally forcing
- * list_action='delete' — even for a row that was already 'listed', since
- * that's exactly the row we want removed.
+ * Upsert expired decisions into the queue, forcing list_action='delete' 
  * @param {D1Database} db
  * @param {{ip: string, action: string, until: string}[]} items
  */
@@ -150,12 +148,8 @@ export async function upsertDeletes(db, items) {
 }
 
 /**
- * Upsert new decisions into the queue as list_action='new' — unless the row
- * is already 'listed', in which case list_action is left untouched (only
- * action/until refresh). Without this guard, a decision CrowdSec re-sends
- * for an IP that's already placed would flip it back to 'new' and lose its
- * list_id/item_id, causing it to be (redundantly, harmlessly, but wastefully)
- * re-added on a future tick.
+ * Upsert new decisions into the queue as list_action='new'
+ *   Unless the row is already 'listed'
  * @param {D1Database} db
  * @param {{ip: string, action: string, until: string}[]} items
  */
@@ -182,9 +176,7 @@ export async function upsertNews(db, items) {
 
 /**
  * Read every row pending deletion, grouped by the list it's currently in.
- * A row with no list_id (queued 'new' then expired before ever being
- * pushed) has nothing on Cloudflare to remove — it's returned separately so
- * the caller can just drop it from the queue.
+ * IPs not in lists yet are returned separately so the caller can just drop it from the queue.
  * @param {D1Database} db
  * @returns {Promise<{deletesByList: Map<string, {ip: string, itemId: string}[]>, queueOnlyDeletes: string[]}>}
  */
