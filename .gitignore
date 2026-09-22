@@ -18,6 +18,7 @@ venv/
 crowdsec-cloudflare-worker-bouncer
 pkg/cloudflare/worker/node_modules
 pkg/cloudflare/decisions-sync-worker/node_modules
+pkg/cloudflare/*.csv
 
 # built by make
 /crowdsec-cloudflare-worker-bouncer
