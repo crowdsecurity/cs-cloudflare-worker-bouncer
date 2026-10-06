@@ -179,32 +179,6 @@ async function scheduled(event, env, _ctx) {
 				deletedDecisions: decisions.deleted.length,
 			});
 
-			// Handle HTTP 204 (LAPI has no decisions - clear the active sync target)
-			if (decisions.deleteAll) {
-				if (syncToKvEnabled) {
-					logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
-					await resetAllDecisionsInKV(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						env.CROWDSECCFBOUNCERNS
-					);
-				}
-				if (syncToIpListsEnabled) {
-					await clearAllIpLists(env);
-				}
-				// Safe to mark warmed here: it it's empty state we want
-				if (needStartUpFetch) {
-					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-					logger.info('Cache marked as warmed (LAPI has no decisions)');
-				}
-				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-				logger.info('Cleared successfully (LAPI has no decisions)', {
-					totalDuration: `${finalDuration}s`,
-				});
-				return; // Exit early - no further sync needed
-			}
-
 			let syncSucceeded;
 			if (syncToKvEnabled) {
 				await syncToKv(env, decisions, needStartUpFetch);
@@ -237,8 +211,8 @@ async function scheduled(event, env, _ctx) {
 			stack: error.stack,
 		});
 
-		// Don't throw - we want to continue running on the next cron trigger
-		// The existing decisions in KV (if any) will remain valid
+		// Swallow the error rather than rethrow
+		// No advantage throwing + we have enough logs to find out what happened
 	}
 }
 
