@@ -86,13 +86,13 @@ const SYNC_LOCK_TTL_SECONDS = 300;
 const SUPPORTED_SCOPES = ['ip', 'range', 'as', 'country'];
 
 /**
- * Check if this is the first fetch by looking for the WARMED_UP flag in KV
+ * Check if the cache needs to be warmed up by looking for the WARMED_UP flag in KV
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- * @returns {Promise<boolean>} True if this is the first fetch
+ * @returns {Promise<boolean>} True if the cache needs to be warmed up (WARMED_UP is not exactly 'true')
  */
-async function isFirstFetch(kvNamespace) {
+async function needWarmUp(kvNamespace) {
 	const warmedUpFlag = await kvNamespace.get(WARMED_UP_KEY);
-	return !warmedUpFlag;
+	return warmedUpFlag !== 'true';
 }
 
 /**
@@ -260,13 +260,13 @@ async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 		throw new Error(`LAPI request failed with status ${response.status}: ${errorText}`);
 	}
 
-	// Handle HTTP 204 No Content (LAPI has no decisions - need to delete all from KV)
+	// Handle eventual HTTP 204 No Content 
+	// it used to delete all, but we don't want that anymore
 	if (response.status === 204) {
-		logger.info('LAPI returned 204 No Content: LAPI has no decisions, will clear KV');
+		logger.warn('LAPI returned 204 No Content: not doing anything');
 		return {
 			new: [],
 			deleted: [],
-			deleteAll: true, // Signal to main sync logic to reset KV and exit
 		};
 	}
 
@@ -711,6 +711,14 @@ async function shouldReset(kvNamespace) {
 }
 
 /**
+ * Clear the RESET state in KV
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ */
+async function clearResetFlag(kvNamespace) {
+	await kvNamespace.put(RESET_KEY, 'false');
+}
+
+/**
  * List all keys in KV namespace using Cloudflare API
  * @param {string} accountId - Cloudflare account ID
  * @param {string} namespaceId - KV namespace ID
@@ -761,7 +769,7 @@ async function listAllKeys(accountId, namespaceId, apiToken) {
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace (for direct operations)
  * @returns {Promise<void>}
  */
-async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) {
+async function resetAllDecisionsInKV(accountId, namespaceId, apiToken, kvNamespace) {
 	logger.info('Starting KV reset: deleting all decision keys...');
 
 	// Step 1: List all keys in KV
@@ -779,17 +787,748 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 		await batchDeleteStringBasedDecisions(accountId, namespaceId, apiToken, keysToDelete);
 	}
 
-	// Step 4: Set RESET to false
-	await kvNamespace.put(RESET_KEY, 'false');
-	logger.info('RESET key set to false');
-
 	logger.info('KV reset completed successfully');
 }
+
+;// ./src/core/ip-list-processor.js
+/**
+ * IP List Processor
+ * Pure planning logic for the D1-backed Cloudflare IP List sync (L3/4
+ * bouncing). Only 'ip' and 'range' scoped decisions apply here — country/AS
+ * decisions aren't representable in a Cloudflare IP List.
+ *
+ * The D1 table (ip_list_state) is the single source of truth for both
+ * pending work and current membership, so planning here only ever deals
+ * with plain decision objects and plain row objects — no separate
+ * in-memory index to keep in sync with it.
+ */
+
+const IP_LIST_SCOPES = ['ip', 'range'];
+
+/**
+ * Filter a decision batch down to the scopes an IP List can represent.
+ * @param {import('../types.js').Decision[]} decisions
+ * @returns {import('../types.js').Decision[]}
+ */
+function filterIpListScopes(decisions) {
+	return decisions.filter((d) => IP_LIST_SCOPES.includes(d.scope));
+}
+
+/**
+ * Split new/deleted decisions into upsert-ready entries, resolving the case
+ * where the same IP appears in both batches from the same LAPI pull. That's
+ * an unusual signal (a decision both freshly issued and freshly expired at
+ * once) — logged so it can be traced back to LAPI's stream — but delete
+ * always wins: the two batches below are upserted in order (news, then
+ * deletes; see upsertNews/upsertDeletes), so the delete overwrites whatever
+ * the new-decision upsert would otherwise have set.
+ * @param {import('../types.js').Decision[]} newDecisions
+ * @param {import('../types.js').Decision[]} expiredDecisions
+ * @param {(msg: string, ctx?: object) => void} warn - logger.warn, injected so this stays a pure function
+ * @returns {{newItems: {ip: string, action: string, until: string}[], deleteItems: {ip: string, action: string, until: string}[]}}
+ */
+function planUpserts(newDecisions, expiredDecisions, warn) {
+	const newScoped = filterIpListScopes(newDecisions);
+	const deleteScoped = filterIpListScopes(expiredDecisions);
+
+	const deleteIps = new Set(deleteScoped.map((d) => d.value));
+	const conflicting = newScoped.filter((d) => deleteIps.has(d.value)).map((d) => d.value);
+	if (conflicting.length > 0) {
+		warn(`${conflicting.length} IP(s) appear in both new and expired decisions this tick; delete wins`, {
+			ips: conflicting,
+		});
+	}
+
+	const toEntry = (d) => ({ ip: d.value, action: d.type, until: d.until });
+	return {
+		newItems: newScoped.map(toEntry),
+		deleteItems: deleteScoped.map(toEntry),
+	};
+}
+
+/**
+ * Pack a batch of pending-add rows into managed lists in order: list 1 is
+ * filled to MAX_ITEMS_PER_LIST before list 2 is touched, etc, based on
+ * the room each list has available. A list already at capacity is
+ * skipped entirely. Items that don't fit anywhere are left un-planned
+ * (still 'new' in the queue, retried next tick).
+ * @param {{ip: string, action: string, until: string}[]} pendingAdds
+ * @param {string[]} listIds - managed list ids, in stable (name-sorted) order
+ * @param {Map<string, number>} listSizes - list_id -> available room (current size, net of this tick's pending deletes)
+ * @param {number} maxItemsPerList
+ * @returns {{addsByList: Map<string, {ip: string, action: string, until: string}[]>, unplaced: string[]}}
+ */
+function planAdds(pendingAdds, listIds, listSizes, maxItemsPerList) {
+	const sizeByList = new Map(listIds.map((id) => [id, listSizes.get(id) ?? 0]));
+	const addsByList = new Map();
+	const unplaced = [];
+
+	for (const item of pendingAdds) {
+		let target = null;
+		for (const listId of listIds) {
+			if (sizeByList.get(listId) < maxItemsPerList) {
+				target = listId;
+				break;
+			}
+		}
+
+		if (!target) {
+			unplaced.push(item.ip);
+			continue;
+		}
+
+		sizeByList.set(target, sizeByList.get(target) + 1);
+		if (!addsByList.has(target)) addsByList.set(target, []);
+		addsByList.get(target).push(item);
+	}
+
+	return { addsByList, unplaced };
+}
+
+;// ./src/adapters/cloudflare-ip-lists.js
+/**
+ * Cloudflare IP Lists Adapter
+ * Manages membership of CrowdSec-prefixed IP Lists for L3/4 (firewall rule)
+ * bouncing. List creation and the firewall rules that reference these lists
+ * are provisioned by an external process — this adapter only fills/empties
+ * list membership.
+ *
+ * A single D1 table (ip_list_state) is the source of truth for both pending
+ * work and current membership — see the D1_* functions below. Each row's
+ * list_action is one of:
+ *   'new'    - pending add, not yet pushed to any Cloudflare list
+ *   'delete' - pending removal from list_id/item_id
+ *   'listed' - currently a member of list_id (item_id is Cloudflare's id for
+ *              it there); nothing pending
+ * There is no separate index: list_id/item_id live on the row itself, so
+ * finding which list holds an IP — or how full a list currently is — is a
+ * plain query against this one table instead of a second KV-backed store.
+ *
+ * New/expired decisions are queued (list_action='new'/'delete') rather than
+ * applied to Cloudflare immediately: each sync tick processes pending
+ * deletes and adds against a bounded slice of the table. This lets warmup
+ * (which can take days at realistic decision volumes) make steady, resumable
+ * progress without ever overwriting IPs some other process added to the same
+ * lists — an append-only add and an id-targeted remove never touch anything
+ * outside what this worker itself is tracking.
+ */
+
+
+
+// Tallies real requests made against each quota-metered backend this tick —
+// D1 statements (prepare().run()/.all(), each batch() entry) and Cloudflare
+// API calls (fetch, broken down by endpoint/purpose) — so the caller can log
+// them without every call site having to track its own count. Reset at the
+// start of each syncToIpLists/clearAllIpLists run via resetRequestCounts.
+const requestCounts = {
+	d1: 0,
+	cloudflareApi: 0,
+	cloudflareApiByEndpoint: {
+		listManagedIpLists: 0,
+		addListItems: 0,
+		removeListItems: 0,
+		replaceListItems: 0,
+		resolveItemIds: 0,
+		pollBulkOperation: 0,
+	},
+};
+
+/**
+ * Reset the per-tick request tallies. Call once at the start of a sync run.
+ */
+function resetRequestCounts() {
+	requestCounts.d1 = 0;
+	requestCounts.cloudflareApi = 0;
+	for (const key of Object.keys(requestCounts.cloudflareApiByEndpoint)) {
+		requestCounts.cloudflareApiByEndpoint[key] = 0;
+	}
+}
+
+/**
+ * fetch wrapper that counts every call toward the Cloudflare API tally, both
+ * overall and per calling endpoint/purpose — so a log of the total can also
+ * show, e.g., that most of this tick's requests went to pollBulkOperation
+ * rather than to the add/remove/replace calls themselves.
+ * @param {string} endpoint - key into requestCounts.cloudflareApiByEndpoint
+ */
+async function trackedFetch(endpoint, url, init) {
+	requestCounts.cloudflareApi++;
+	requestCounts.cloudflareApiByEndpoint[endpoint] = (requestCounts.cloudflareApiByEndpoint[endpoint] ?? 0) + 1;
+	return fetch(url, init);
+}
+
+/**
+ * Run a single D1 statement and count it as one D1 request.
+ * @param {D1PreparedStatement} stmt
+ * @param {'run' | 'all'} method
+ */
+async function d1Exec(stmt, method) {
+	requestCounts.d1++;
+	return stmt[method]();
+}
+
+/**
+ * Run a D1 batch and count every statement in it — each bound statement in
+ * a batch() call is a separate row-write against D1's daily quota, even
+ * though they're sent as one network round trip.
+ * @param {D1Database} db
+ * @param {D1PreparedStatement[]} statements
+ */
+async function d1BatchExec(db, statements) {
+	requestCounts.d1 += statements.length;
+	return db.batch(statements);
+}
+
+const BACKOFF_IPLIST_UNTIL_KEY = 'BACKOFF_IPLIST_UNTIL';
+const BACKOFF_D1_UNTIL_KEY = 'BACKOFF_D1__UNTIL';
+// Substring Cloudflare's D1 binding uses for this specific quota error, so we
+// can back off precisely for this cause rather than for any D1 write failure
+// (e.g. a transient error we'd rather just retry next tick).
+const D1_DAILY_WRITE_LIMIT_MESSAGE = "exceeded D1's free tier daily row write limit";
+// Operator-chosen ceiling for a single custom list (Cloudflare's large IP
+// Lists have no fixed per-list item cap; this just bounds how full we pack
+// one before moving to the next).
+const MAX_ITEMS_PER_LIST = 300000;
+const BULK_POLL_INTERVAL_MS = 1000;
+const BULK_POLL_TIMEOUT_MS = 120000;
+
+/**
+ * Error thrown by list-mutating calls on an HTTP failure, with enough detail
+ * for the caller to tell a rate limit (429, with a documented Retry-After)
+ * apart from anything else (quota exceeded, malformed request, transient
+ * 5xx, ...), which Cloudflare does not otherwise let us distinguish from the
+ * response body alone.
+ */
+class CloudflareApiError extends Error {
+	constructor(message, { status, retryAfterSeconds, body }) {
+		super(message);
+		this.name = 'CloudflareApiError';
+		this.status = status;
+		this.retryAfterSeconds = retryAfterSeconds;
+		this.body = body;
+	}
+}
+
+/**
+ * @param {Response} response
+ * @returns {Promise<never>}
+ */
+async function throwApiError(message, response) {
+	const body = await response.text();
+	const retryAfterHeader = response.headers.get('retry-after');
+	const retryAfterSeconds =
+		response.status === 429 && retryAfterHeader !== null ? parseInt(retryAfterHeader, 10) : undefined;
+	throw new CloudflareApiError(`${message}: ${response.status} ${body}`, {
+		status: response.status,
+		retryAfterSeconds,
+		body,
+	});
+}
+
+function cloudflare_ip_lists_buildApiHeaders(apiToken) {
+	return {
+		'Authorization': `Bearer ${apiToken}`,
+		'Content-Type': 'application/json',
+	};
+}
+
+/**
+ * Split an array into fixed-size chunks.
+ * @template T
+ * @param {T[]} arr
+ * @param {number} size
+ * @returns {T[][]}
+ */
+function chunk(arr, size) {
+	const chunks = [];
+	for (let i = 0; i < arr.length; i += size) {
+		chunks.push(arr.slice(i, i + size));
+	}
+	return chunks;
+}
+
+/**
+ * Discover the IP Lists this worker is allowed to manage: every custom list
+ * whose name starts with the configured prefix. Lists are sorted by name so
+ * pack-to-full placement (list 1 first) is stable across runs.
+ * @param {string} accountId
+ * @param {string} apiToken
+ * @param {string} prefix
+ * @returns {Promise<{id: string, name: string}[]>}
+ */
+async function listManagedIpLists(accountId, apiToken, prefix) {
+	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists`;
+	const response = await trackedFetch('listManagedIpLists', url, { method: 'GET', headers: cloudflare_ip_lists_buildApiHeaders(apiToken) });
+
+	if (!response.ok) {
+		await throwApiError('Failed to list IP Lists', response);
+	}
+
+	const data = await response.json();
+	const lists = (data.result || [])
+		.filter((list) => list.kind === 'ip' && list.name.startsWith(prefix))
+		.map((list) => ({ id: list.id, name: list.name }))
+		.sort((a, b) => a.name.localeCompare(b.name));
+
+	logger.debug(`Discovered ${lists.length} managed IP list(s) with prefix "${prefix}"`);
+
+	return lists;
+}
+
+// Chunk size for the JSON-array upserts below. Binding the whole batch as
+// one json_each(?) parameter means statement count no longer scales with row
+// count the way the old one-param-per-column VALUES list did — each
+// statement now binds exactly 1 param, so the 100-bound-param limit is moot.
+// The real ceiling is the serialized JSON blob's size: at ~75 bytes/row
+// (ip + action + until) this keeps it around 75KB, comfortably under both
+// D1's 100KB SQL statement length limit (it's undocumented whether bound
+// parameter bytes count toward that figure, so this stays conservative
+// rather than assuming they don't) and the 2MB max bound-value size.
+const D1_MAX_ROWS_PER_JSON_STATEMENT = 1000;
+
+/**
+ * Upsert expired decisions into the queue, forcing list_action='delete'.
+ * @param {D1Database} db
+ * @param {{ip: string, action: string, until: string}[]} items
+ */
+async function upsertDeletes(db, items) {
+	if (items.length === 0) return;
+
+	const chunks = chunk(items, D1_MAX_ROWS_PER_JSON_STATEMENT);
+	const statements = chunks.map((rows) =>
+		db
+			.prepare(
+				// The WHERE true is required, not decorative: SQLite's parser
+				// otherwise can't tell this UPSERT's "ON CONFLICT" apart from
+				// a join's "ON" after INSERT...SELECT, and fails with a syntax
+				// error right at "ON CONFLICT" (confirmed locally) — this is
+				// SQLite's own documented workaround for that ambiguity.
+				`INSERT INTO ip_list_state (ip, action, until, list_action)
+				 SELECT value ->> '$.ip', value ->> '$.action', value ->> '$.until', 'delete'
+				 FROM json_each(?)
+				 WHERE true
+				 ON CONFLICT(ip) DO UPDATE SET action = excluded.action, until = excluded.until, list_action = 'delete'`
+			)
+			.bind(JSON.stringify(rows))
+	);
+
+	await d1BatchExec(db, statements);
+}
+
+/**
+ * Upsert new decisions into the queue as list_action='new', unless the row
+ * is already 'listed'.
+ * @param {D1Database} db
+ * @param {{ip: string, action: string, until: string}[]} items
+ */
+async function upsertNews(db, items) {
+	if (items.length === 0) return;
+
+	const chunks = chunk(items, D1_MAX_ROWS_PER_JSON_STATEMENT);
+	const statements = chunks.map((rows) =>
+		db
+			.prepare(
+				// WHERE true: is requiered //see upsertDeletes' comment above the same line.
+				`INSERT INTO ip_list_state (ip, action, until, list_action)
+				 SELECT value ->> '$.ip', value ->> '$.action', value ->> '$.until', 'new'
+				 FROM json_each(?)
+				 WHERE true
+				 ON CONFLICT(ip) DO UPDATE SET
+				   action = excluded.action,
+				   until = excluded.until,
+				   list_action = CASE WHEN ip_list_state.list_action != 'listed' THEN excluded.list_action ELSE ip_list_state.list_action END`
+			)
+			.bind(JSON.stringify(rows))
+	);
+
+	await d1BatchExec(db, statements);
+}
+
+/**
+ * Read every row pending deletion, grouped by the list it's currently in.
+ * IPs not in lists yet are returned separately so the caller can just drop it from the queue.
+ * @param {D1Database} db
+ * @returns {Promise<{deletesByList: Map<string, {ip: string, itemId: string}[]>, queueOnlyDeletes: string[]}>}
+ */
+async function readPendingDeletes(db) {
+	const result = await d1Exec(db.prepare("SELECT ip, list_id, item_id FROM ip_list_state WHERE list_action = 'delete'"), 'all');
+
+	const deletesByList = new Map();
+	const queueOnlyDeletes = [];
+
+	for (const row of result.results || []) {
+		if (!row.list_id || !row.item_id) {
+			queueOnlyDeletes.push(row.ip);
+			continue;
+		}
+		if (!deletesByList.has(row.list_id)) {
+			deletesByList.set(row.list_id, []);
+		}
+		deletesByList.get(row.list_id).push({ ip: row.ip, itemId: row.item_id });
+	}
+
+	return { deletesByList, queueOnlyDeletes };
+}
+
+/**
+ * Read every row currently marked 'listed', grouped by list. Used only by
+ * clearAllIpLists (reset) to empty every managed list wholesale —
+ * the normal per-tick flow never needs "all listed rows" in one shot.
+ * @param {D1Database} db
+ * @returns {Promise<Map<string, {ip: string, itemId: string}[]>>} list_id -> members
+ */
+async function readAllListed(db) {
+	const result = await d1Exec(db.prepare("SELECT ip, list_id, item_id FROM ip_list_state WHERE list_action = 'listed'"), 'all');
+
+	const byList = new Map();
+	for (const row of result.results || []) {
+		if (!byList.has(row.list_id)) {
+			byList.set(row.list_id, []);
+		}
+		byList.get(row.list_id).push({ ip: row.ip, itemId: row.item_id });
+	}
+	return byList;
+}
+
+/**
+ * Remove a batch of rows entirely (used once their deletion — or lack of
+ * anything to delete — has been confirmed).
+ * @param {D1Database} db
+ * @param {string[]} ips
+ */
+async function deleteQueueRows(db, ips) {
+	if (ips.length === 0) return;
+
+	// Each bound ip is 1 param, so up to 100 fit in one IN (...) statement.
+	const chunks = chunk(ips, 100);
+	const statements = chunks.map((rows) => {
+		const placeholders = rows.map(() => '?').join(', ');
+		return db.prepare(`DELETE FROM ip_list_state WHERE ip IN (${placeholders})`).bind(...rows);
+	});
+
+	await d1BatchExec(db, statements);
+}
+
+/**
+ * Read up to `limit` rows still pending an add (list_action='new').
+ * @param {D1Database} db
+ * @param {number} limit
+ * @returns {Promise<{ip: string, action: string, until: string}[]>}
+ */
+async function readPendingAdds(db, limit) {
+	const stmt = db.prepare("SELECT ip, action, until FROM ip_list_state WHERE list_action = 'new' LIMIT ?").bind(limit);
+	const result = await d1Exec(stmt, 'all');
+	return result.results || [];
+}
+
+/**
+ * Mark a batch of rows as confirmed members of a list, once Cloudflare has
+ * accepted the add.
+ * @param {D1Database} db
+ * @param {string} listId
+ * @param {{ip: string, itemId: string}[]} placed
+ */
+async function markListed(db, listId, placed) {
+	if (placed.length === 0) return;
+
+	const stmt = db.prepare("UPDATE ip_list_state SET list_action = 'listed', list_id = ?, item_id = ? WHERE ip = ?");
+	await d1BatchExec(db, placed.map((p) => stmt.bind(listId, p.itemId, p.ip)));
+}
+
+/**
+ * Delete every row from the D1 queue table. Used when LAPI reports no
+ * decisions at all (HTTP 204), or on the first sync after a cold start,
+ * mirroring the KV path's resetAllDecisions.
+ * @param {D1Database} db
+ */
+async function clearQueue(db) {
+	await d1Exec(db.prepare('DELETE FROM ip_list_state'), 'run');
+}
+
+/**
+ * Append items to a list on Cloudflare without touching what's already
+ * there, and poll the resulting bulk operation until it completes.
+ * Cloudflare allows only one pending bulk operation per account, so callers
+ * must await this before starting the next list's update.
+ * @param {string} accountId
+ * @param {string} apiToken
+ * @param {string} listId
+ * @param {string[]} ips
+ * @returns {Promise<Map<string, string>>} ip -> Cloudflare item id, for the newly added items
+ */
+async function addListItems(accountId, apiToken, listId, ips) {
+	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists/${listId}/items`;
+
+	const response = await trackedFetch('addListItems', url, {
+		method: 'POST',
+		headers: cloudflare_ip_lists_buildApiHeaders(apiToken),
+		body: JSON.stringify(ips.map((ip) => ({ ip }))),
+	});
+
+	if (!response.ok) {
+		await throwApiError(`Failed to add items to list ${listId}`, response);
+	}
+
+	const data = await response.json();
+	const operationId = data.result?.operation_id;
+	if (operationId) {
+		await pollBulkOperation(accountId, apiToken, operationId);
+	}
+
+	return resolveItemIds(accountId, apiToken, listId, ips);
+}
+
+/**
+ * Remove items from a list by Cloudflare item id, and poll the resulting
+ * bulk operation until it completes.
+ * @param {string} accountId
+ * @param {string} apiToken
+ * @param {string} listId
+ * @param {string[]} itemIds
+ */
+async function removeListItems(accountId, apiToken, listId, itemIds) {
+	if (itemIds.length === 0) return;
+
+	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists/${listId}/items`;
+
+	const response = await trackedFetch('removeListItems', url, {
+		method: 'DELETE',
+		headers: cloudflare_ip_lists_buildApiHeaders(apiToken),
+		body: JSON.stringify({ items: itemIds.map((id) => ({ id })) }),
+	});
+
+	if (!response.ok) {
+		await throwApiError(`Failed to remove items from list ${listId}`, response);
+	}
+
+	const data = await response.json();
+	const operationId = data.result?.operation_id;
+	if (operationId) {
+		await pollBulkOperation(accountId, apiToken, operationId);
+	}
+}
+
+/**
+ * Replace a list's entire membership in one request (removes everything not
+ * in `ips`, adds everything in `ips` that isn't already there), and poll the
+ * resulting bulk operation until it completes. One request either way, but
+ * every item in `ips` counts against Cloudflare's item-modifications quota —
+ * unlike addListItems/removeListItems, which only count the actual delta —
+ * so callers should only reach for this when the full list is cheaper than
+ * the delta (see chooseListUpdateStrategy).
+ * @param {string} accountId
+ * @param {string} apiToken
+ * @param {string} listId
+ * @param {string[]} ips - the list's full desired membership after this call
+ * @returns {Promise<Map<string, string>>} ip -> Cloudflare item id, for every item in `ips`
+ */
+async function replaceListItems(accountId, apiToken, listId, ips) {
+	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists/${listId}/items`;
+
+	const response = await trackedFetch('replaceListItems', url, {
+		method: 'PUT',
+		headers: cloudflare_ip_lists_buildApiHeaders(apiToken),
+		body: JSON.stringify(ips.map((ip) => ({ ip }))),
+	});
+
+	if (!response.ok) {
+		await throwApiError(`Failed to replace items on list ${listId}`, response);
+	}
+
+	const data = await response.json();
+	const operationId = data.result?.operation_id;
+	if (operationId) {
+		await pollBulkOperation(accountId, apiToken, operationId);
+	}
+
+	return resolveItemIds(accountId, apiToken, listId, ips);
+}
+
+/**
+ * Decide whether replacing a list's entire membership in one PUT is cheaper,
+ * in Cloudflare item-modifications (the 1M/12h quota), than adding/removing
+ * just the delta via separate POST/DELETE calls. PUT counts every item in
+ * the new body as a modification; POST+DELETE only count what actually
+ * changed — so PUT only wins when the list is smaller than the delta being
+ * applied to it (e.g. still filling up during warmup), never once a list is
+ * large and mostly stable.
+ * @param {number} currentSize - members in the list before this tick's changes
+ * @param {number} addCount
+ * @param {number} removeCount
+ * @returns {'put' | 'post-delete'}
+ */
+function chooseListUpdateStrategy(currentSize, addCount, removeCount) {
+	const finalSize = currentSize - removeCount + addCount;
+	const deltaCost = addCount + removeCount;
+	return finalSize < deltaCost ? 'put' : 'post-delete';
+}
+
+/**
+ * Cloudflare's add-items response doesn't echo back which item id was
+ * assigned to which IP, so after an add completes we page through the
+ * list's current items to resolve ip -> item id for just the IPs we added.
+ * @param {string} accountId
+ * @param {string} apiToken
+ * @param {string} listId
+ * @param {string[]} ips - the IPs we just added, to resolve ids for
+ * @returns {Promise<Map<string, string>>}
+ */
+async function resolveItemIds(accountId, apiToken, listId, ips) {
+	const wanted = new Set(ips);
+	const found = new Map();
+	let cursor = null;
+
+	do {
+		const url = new URL(`https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists/${listId}/items`);
+		if (cursor) url.searchParams.set('cursor', cursor);
+
+		const response = await trackedFetch('resolveItemIds', url, { method: 'GET', headers: cloudflare_ip_lists_buildApiHeaders(apiToken) });
+		if (!response.ok) {
+			await throwApiError(`Failed to read back items for list ${listId}`, response);
+		}
+
+		const data = await response.json();
+		for (const item of data.result || []) {
+			if (wanted.has(item.ip)) {
+				found.set(item.ip, item.id);
+			}
+		}
+
+		cursor = found.size < wanted.size ? data.result_info?.cursor || null : null;
+	} while (cursor);
+
+	if (found.size < wanted.size) {
+		const missing = [...wanted].filter((ip) => !found.has(ip));
+		logger.error(`Could not resolve Cloudflare item id for ${missing.length} added IP(s) on list ${listId}`, { missing });
+	}
+
+	return found;
+}
+
+/**
+ * Poll a bulk-operation status endpoint until it completes or fails.
+ * @param {string} accountId
+ * @param {string} apiToken
+ * @param {string} operationId
+ */
+async function pollBulkOperation(accountId, apiToken, operationId) {
+	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists/bulk_operations/${operationId}`;
+	const deadline = Date.now() + BULK_POLL_TIMEOUT_MS;
+
+	while (Date.now() < deadline) {
+		const response = await trackedFetch('pollBulkOperation', url, { method: 'GET', headers: cloudflare_ip_lists_buildApiHeaders(apiToken) });
+		if (!response.ok) {
+			await throwApiError(`Failed to poll bulk operation ${operationId}`, response);
+		}
+
+		const data = await response.json();
+		const status = data.result?.status;
+
+		if (status === 'completed') {
+			return;
+		}
+		if (status === 'failed') {
+			throw new Error(`Bulk operation ${operationId} failed: ${data.result?.error || 'unknown error'}`);
+		}
+
+		await new Promise((resolve) => setTimeout(resolve, BULK_POLL_INTERVAL_MS));
+	}
+
+	throw new Error(`Timed out waiting for bulk operation ${operationId} to complete`);
+}
+
+/**
+ * Read the current IP-list backoff deadline, if any.
+ * @param {KVNamespace} kvNamespace
+ * @returns {Promise<Date | null>} null if there's no active backoff
+ */
+async function getIpListBackoffUntil(kvNamespace) {
+	const raw = await kvNamespace.get(BACKOFF_IPLIST_UNTIL_KEY);
+	if (!raw) return null;
+
+	const until = new Date(raw);
+	if (Number.isNaN(until.getTime())) return null;
+
+	return until;
+}
+
+/**
+ * Record that IP list writes should not be attempted again until the given
+ * number of seconds from now — set after a 429 with a Retry-After header.
+ * @param {KVNamespace} kvNamespace
+ * @param {number} retryAfterSeconds
+ */
+async function setIpListBackoff(kvNamespace, retryAfterSeconds) {
+	const until = new Date(Date.now() + retryAfterSeconds * 1000);
+	await kvNamespace.put(BACKOFF_IPLIST_UNTIL_KEY, until.toISOString());
+}
+
+/**
+ * Clear the backoff deadline, e.g. once it has passed or a sync run
+ * completes without hitting a rate limit.
+ * @param {KVNamespace} kvNamespace
+ */
+async function clearIpListBackoff(kvNamespace) {
+	await kvNamespace.delete(BACKOFF_IPLIST_UNTIL_KEY);
+}
+
+/**
+ * True if `e` is D1's free-tier daily row-write quota error.
+ * @param {unknown} e
+ * @returns {boolean}
+ */
+function isD1DailyWriteLimitError(e) {
+	return e instanceof Error && e.message.includes(D1_DAILY_WRITE_LIMIT_MESSAGE);
+}
+
+/**
+ * Read the current D1 backoff deadline, if any.
+ * @param {KVNamespace} kvNamespace
+ * @returns {Promise<Date | null>} null if there's no active backoff
+ */
+async function getD1BackoffUntil(kvNamespace) {
+	const raw = await kvNamespace.get(BACKOFF_D1_UNTIL_KEY);
+	if (!raw) return null;
+
+	const until = new Date(raw);
+	if (Number.isNaN(until.getTime())) return null;
+
+	return until;
+}
+
+// Small safety margin past the actual UTC-midnight reset, in case Cloudflare
+// applies it a little late relative to our clock — avoids retrying into a
+// quota that hasn't actually reset yet.
+const BACKOFF_D1_SAFETY_MARGIN_MS = 10 * 60 * 1000;
+
+/**
+ * Record that D1 should not be touched again until shortly after the next
+ * UTC midnight, when D1's free-tier daily row-write quota resets.
+ * @param {KVNamespace} kvNamespace
+ */
+async function setD1BackoffUntilMidnightUTC(kvNamespace) {
+	const until = new Date();
+	until.setUTCHours(24, 0, 0, 0); // next midnight UTC (today if already before it, rolls to tomorrow if past)
+	until.setTime(until.getTime() + BACKOFF_D1_SAFETY_MARGIN_MS);
+	await kvNamespace.put(BACKOFF_D1_UNTIL_KEY, until.toISOString());
+}
+
+/**
+ * Clear the D1 backoff deadline, e.g. once it has passed.
+ * @param {KVNamespace} kvNamespace
+ */
+async function clearD1Backoff(kvNamespace) {
+	await kvNamespace.delete(BACKOFF_D1_UNTIL_KEY);
+}
+
+
 
 ;// ./src/index.js
 /**
  * CrowdSec Autonomous Decisions Sync Worker
- * Periodically fetches security decisions from CrowdSec LAPI and updates Cloudflare KV (CROWDSECCFBOUNCERNS) storage
+ * Periodically fetches security decisions from CrowdSec LAPI and updates
+ * exactly one sync target: Cloudflare KV (SYNC_TO_LIST_NOT_KV=false, the
+ * default) or Cloudflare IP Lists (SYNC_TO_LIST_NOT_KV=true).
  */
 
 
@@ -797,226 +1536,552 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 
 
 
-/* harmony default export */ const src = ({
-	/**
-	 * Scheduled handler
-	 * @param {ScheduledEvent} event - The scheduled event
-	 * @param {import('./types.js').CrowdSecEnv} env - Environment bindings (secrets, KV namespaces, etc.)
-	 * @param {ExecutionContext} _ctx - Execution context
-	 */
-	async scheduled(event, env, _ctx) {
-		const startTime = Date.now();
 
-		logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
+
+const DEFAULT_IP_LIST_PREFIX = 'crowdsec_';
+const DEFAULT_IP_LIST_BATCH_SIZE = 1000;
+
+/**
+ * Scheduled handler
+ * @param {ScheduledEvent} event - The scheduled event
+ * @param {import('./types.js').CrowdSecEnv} env - Environment bindings (secrets, KV namespaces, etc.)
+ * @param {ExecutionContext} _ctx - Execution context
+ */
+async function scheduled(event, env, _ctx) {
+	const startTime = Date.now();
+
+	logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
+
+	try {
+		// By Default, the worker syncs to KV unless explicitly configured to sync to IP Lists (SYNC_TO_LIST_NOT_KV=true).
+		const syncToListsMode = env.SYNC_TO_LIST_NOT_KV === 'true';
+		// Logic variables to make code more readable along the way
+		const syncToKvEnabled = !syncToListsMode;
+		const syncToIpListsEnabled = syncToListsMode;
+
+		// Validate required environment variables
+		if (!env.LAPI_URL) {
+			logger.error('LAPI_URL environment variable is not set');
+			return;
+		}
+
+		if (!env.LAPI_KEY) {
+			logger.error('LAPI_KEY secret is not set');
+			return;
+		}
+
+		// CROWDSECCFBOUNCERNS is required in both modes: KV or IP Lists.
+		if (!env.CROWDSECCFBOUNCERNS) {
+			logger.error('CROWDSECCFBOUNCERNS KV namespace is not bound');
+			return;
+		}
+
+		if (!env.CF_ACCOUNT_ID) {
+			logger.error('CF_ACCOUNT_ID environment variable is not set');
+			return;
+		}
+
+		// CF_KV_NAMESPACE_ID is only used for bulk KV API calls
+		if (syncToKvEnabled && !env.CF_KV_NAMESPACE_ID) {
+			logger.error('CF_KV_NAMESPACE_ID environment variable is not set (required when syncing to KV)');
+			return;
+		}
+
+		if (syncToIpListsEnabled && !env.LIST_STATE_DB) {
+			logger.error('LIST_STATE_DB D1 database is not bound (required when syncing to IP Lists)');
+			return;
+		}
+
+		if (!env.CF_API_TOKEN) {
+			logger.error('CF_API_TOKEN secret is not set (required for bulk KV/IP list operations)');
+			return;
+		}
+
+		const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
+
+		// Lock to avoid overlapping syncs from multiple cron ticks or manual runs.
+		const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
+		if (!lockAcquired) {
+			logger.info('Sync already in progress, skipping this run');
+			return;
+		}
 
 		try {
-			// Validate required environment variables
-			if (!env.LAPI_URL) {
-				logger.error('LAPI_URL environment variable is not set');
-				return;
-			}
-
-			if (!env.LAPI_KEY) {
-				logger.error('LAPI_KEY secret is not set');
-				return;
-			}
-
-			if (!env.CROWDSECCFBOUNCERNS) {
-				logger.error('CROWDSECCFBOUNCERNS KV namespace is not bound');
-				return;
-			}
-
-			if (!env.CF_ACCOUNT_ID) {
-				logger.error('CF_ACCOUNT_ID environment variable is not set');
-				return;
-			}
-
-			if (!env.CF_KV_NAMESPACE_ID) {
-				logger.error('CF_KV_NAMESPACE_ID environment variable is not set');
-				return;
-			}
-
-			if (!env.CF_API_TOKEN) {
-				logger.error('CF_API_TOKEN secret is not set (required for bulk KV operations)');
-				return;
-			}
-
-			const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
-
-			// Acquire the sync lock so an overlapping cron tick (or a manual run
-			// while a previous one is still in flight) doesn't fan out into a
-			// full-sync storm against LAPI. Released in finally below; TTL is
-			// only a backstop for a hard crash.
-			const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
-			if (!lockAcquired) {
-				logger.info('Sync already in progress, skipping this run');
-				return;
-			}
-
-			try {
-				// Check if reset is requested
-				const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
-				if (resetRequested) {
-					logger.info('RESET requested: clearing all decision keys from KV...');
-					await resetAllDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						env.CROWDSECCFBOUNCERNS
-					);
-					logger.info('KV reset completed, proceeding with fresh decision sync');
-				}
-
-				// Determine if this is the first fetch
-				const isFirst = await isFirstFetch(env.CROWDSECCFBOUNCERNS);
-				logger.info('Fetch type determined', { isFirstFetch: isFirst });
-
-				// Parse optional filter configuration
-				const scenariosContaining = env.INCLUDE_SCENARIOS ? env.INCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
-				const scenariosNotContaining = env.EXCLUDE_SCENARIOS ? env.EXCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
-				const origins = env.ONLY_INCLUDE_ORIGINS ? env.ONLY_INCLUDE_ORIGINS.split(',').map((s) => s.trim()) : [];
-
-				// Fetch decisions from LAPI
-				const decisions = await fetchDecisionsStream(lapiUrl, env.LAPI_KEY, {
-					startup: isFirst,
-					scenariosContaining,
-					scenariosNotContaining,
-					origins,
-				});
-
-				// Log summary
-				const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-				logger.info('Decision stream completed successfully', {
-					duration: `${duration}s`,
-					newDecisions: decisions.new.length,
-					deletedDecisions: decisions.deleted.length,
-				});
-
-				// Handle HTTP 204 (LAPI has no decisions - delete all from KV)
-				if (decisions.deleteAll) {
-					logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
-					await resetAllDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						env.CROWDSECCFBOUNCERNS
-					);
-					// Safe to mark warmed here: KV is now in its intended empty state,
-					// so a crash at this point doesn't leave decisions unwritten.
-					if (isFirst) {
-						await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-						logger.info('Cache marked as warmed (LAPI has no decisions)');
-					}
-					const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-					logger.info('KV cleared successfully (LAPI has no decisions)', {
-						totalDuration: `${finalDuration}s`,
+			// If D1 is out of its daily write-row quota, nothing in IP-list mode can proceed 
+			if (syncToIpListsEnabled) {
+				const d1BackoffUntil = await getD1BackoffUntil(env.CROWDSECCFBOUNCERNS);
+				if (d1BackoffUntil && d1BackoffUntil > new Date()) {
+					logger.warn('Skipping sync entirely: D1 daily write-row quota exceeded, waiting for reset', {
+						backoffUntil: d1BackoffUntil.toISOString(),
 					});
-					return; // Exit early - no further sync needed
+					return;
 				}
-
-				// ====================
-				// SYNC TO KV STORE
-				// ====================
-
-				logger.info('Starting KV sync...');
-
-				// Step 1: Get existing IP_RANGES from KV
-				const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
-
-				// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
-				let existingStringDecisions = new Map();
-
-				if (!isFirst) {
-					// On incremental updates, check existing values to avoid redundant writes
-					logger.debug('Incremental update: checking existing decisions in KV');
-					const allStringKeys = [
-						...decisions.new
-							.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-							.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-						...decisions.deleted
-							.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-							.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-					];
-
-					// Remove duplicates
-					const uniqueStringKeys = [...new Set(allStringKeys)];
-
-					// Fetch existing string decisions from KV using bulk API
-					existingStringDecisions = await batchGetStringBasedDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						uniqueStringKeys
-					);
-				} else {
-					logger.debug('First run: skipping existence check (KV is empty)');
-				}
-
-				// Step 3: Process new decisions
-				const newProcessed = processNewDecisions(decisions.new, existingStringDecisions, existingRanges);
-				// Step 4: Process deleted decisions
-				const deletedProcessed = processDeletedDecisions(decisions.deleted, existingStringDecisions, existingRanges);
-				// Step 5: Merge ranges (deletions already applied in step 4, now adding new ranges)
-				const finalRanges = mergeRanges(deletedProcessed.updatedRanges, newProcessed.jsonEntries);
-				// Step 6: Write new/updated string decisions (IP, AS, Country) to KV using bulk API
-				if (newProcessed.stringEntries.length > 0) {
-					logger.info('Writing string-based decisions to KV...', { count: newProcessed.stringEntries.length });
-					await batchWriteStringBasedDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						newProcessed.stringEntries
-					);
-				}
-				// Step 7: Delete string decisions from KV using bulk API
-				if (deletedProcessed.stringKeysToDelete.length > 0) {
-					logger.info('Deleting string decisions from KV...', { count: deletedProcessed.stringKeysToDelete.length });
-					await batchDeleteStringBasedDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						deletedProcessed.stringKeysToDelete
-					);
-				}
-				// Step 8: Update IP_RANGES if changed
-				if (hasRangesChanged(existingRanges, finalRanges)) {
-					logger.info('IP_RANGES changed, updating KV...');
-					await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
-				}
-
-				// Step 9: Mark cache as warmed ONLY after all KV writes have succeeded.
-				// If this runs before the writes, a mid-sync crash leaves WARMED_UP=true
-				// with an empty KV, and the next run does an incremental fetch that
-				// never backfills the missed decisions — a silent enforcement gap.
-				if (isFirst) {
-					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-					logger.info('Cache marked as warmed (first sync complete)');
-				}
-
-				// Final summary
-				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-
-				logger.info('KV sync completed successfully', {
-					totalDuration: `${finalDuration}s`,
-					stringWritten: newProcessed.stringEntries.length,
-					stringDeleted: deletedProcessed.stringKeysToDelete.length,
-					rangesCount: Object.keys(finalRanges).length,
-				});
-			} finally {
-				await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
 			}
-		} catch (error) {
-			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-			logger.error('Decision sync failed', {
-				duration: `${duration}s`,
-				error: error.message,
-				stack: error.stack,
+
+			// Determine if this is the first fetch
+			const needStartUpFetch = await needWarmUp(env.CROWDSECCFBOUNCERNS);
+			logger.info('Pull All decisions ?', { startup: needStartUpFetch });
+
+			// Check if reset is requested
+			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
+
+			// Clear residual decisions before a fresh pull or on an explicit RESET
+			if ((resetRequested) && syncToKvEnabled) {
+				logger.info('Clearing all decision keys from KV before fresh sync...');
+				await resetAllDecisionsInKV(
+					env.CF_ACCOUNT_ID,
+					env.CF_KV_NAMESPACE_ID,
+					env.CF_API_TOKEN,
+					env.CROWDSECCFBOUNCERNS
+				);
+			}
+			if ((resetRequested) && syncToIpListsEnabled) {
+				logger.info('Clearing all managed IP lists and the sync queue before fresh sync...');
+				await clearAllIpLists(env);
+			}
+
+			if (resetRequested) {
+				await clearResetFlag(env.CROWDSECCFBOUNCERNS);
+			}
+
+			// Parse optional filter configuration
+			const scenariosContaining = env.INCLUDE_SCENARIOS ? env.INCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
+			const scenariosNotContaining = env.EXCLUDE_SCENARIOS ? env.EXCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
+			const origins = env.ONLY_INCLUDE_ORIGINS ? env.ONLY_INCLUDE_ORIGINS.split(',').map((s) => s.trim()) : [];
+
+			// Fetch decisions from LAPI
+			const decisions = await fetchDecisionsStream(lapiUrl, env.LAPI_KEY, {
+				startup: needStartUpFetch,
+				scenariosContaining,
+				scenariosNotContaining,
+				origins,
 			});
 
-			// Don't throw - we want to continue running on the next cron trigger
-			// The existing decisions in KV (if any) will remain valid
+			// Log summary
+			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+			logger.info('Decision stream completed successfully', {
+				duration: `${duration}s`,
+				newDecisions: decisions.new.length,
+				deletedDecisions: decisions.deleted.length,
+			});
+
+			let syncSucceeded;
+			if (syncToKvEnabled) {
+				await syncToKv(env, decisions, needStartUpFetch);
+				// syncToKv throws on failure, so reaching this point means it succeeded
+				syncSucceeded = true;
+			} else {
+				// Partial sync possible: in D1 but not in lists yet
+				syncSucceeded = await syncToIpLists(env, decisions);
+			}
+
+			// Mark cache as warmed ONLY after the sync target has captured this run's decisions. 
+			if (needStartUpFetch && syncSucceeded) {
+				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+				logger.info('Cache marked as warmed (first sync complete)');
+			} else if (needStartUpFetch) {
+				logger.warn('First sync incomplete (IP list sync failed); cache not marked as warmed yet');
+			}
+
+			// Final summary
+			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+			logger.info('Decision sync completed successfully', { totalDuration: `${finalDuration}s` });
+		} finally {
+			await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
 		}
-	},
-});
+	} catch (error) {
+		const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+		logger.error('Decision sync failed', {
+			duration: `${duration}s`,
+			error: error.message,
+			stack: error.stack,
+		});
+
+		// Swallow the error rather than rethrow
+		// No advantage throwing + we have enough logs to find out what happened
+	}
+}
+
+/**
+ * Sync decisions to the Worker's KV store (used by the L7 bouncer worker).
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @param {import('./types.js').DecisionStreamResponse} decisions
+ * @param {boolean} needStartUpFetch
+ */
+async function syncToKv(env, decisions, needStartUpFetch) {
+	logger.info('Starting KV sync...');
+
+	// Step 1: Get existing IP_RANGES from KV
+	const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
+
+	// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
+	let existingStringDecisions = new Map();
+
+	if (!needStartUpFetch) {
+		// On incremental updates, check existing values to avoid redundant writes
+		logger.debug('Incremental update: checking existing decisions in KV');
+		const allStringKeys = [
+			...decisions.new
+				.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+				.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+			...decisions.deleted
+				.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+				.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+		];
+
+		// Remove duplicates
+		const uniqueStringKeys = [...new Set(allStringKeys)];
+
+		// Fetch existing string decisions from KV using bulk API
+		existingStringDecisions = await batchGetStringBasedDecisions(
+			env.CF_ACCOUNT_ID,
+			env.CF_KV_NAMESPACE_ID,
+			env.CF_API_TOKEN,
+			uniqueStringKeys
+		);
+	} else {
+		logger.debug('Startup fetch: skipping existence check (KV is empty)');
+	}
+
+	// Step 3: Process new decisions
+	const newProcessed = processNewDecisions(decisions.new, existingStringDecisions, existingRanges);
+	// Step 4: Process deleted decisions
+	const deletedProcessed = processDeletedDecisions(decisions.deleted, existingStringDecisions, existingRanges);
+	// Step 5: Merge ranges (deletions already applied in step 4, now adding new ranges)
+	const finalRanges = mergeRanges(deletedProcessed.updatedRanges, newProcessed.jsonEntries);
+	// Step 6: Write new/updated string decisions (IP, AS, Country) to KV using bulk API
+	if (newProcessed.stringEntries.length > 0) {
+		logger.info('Writing string-based decisions to KV...', { count: newProcessed.stringEntries.length });
+		await batchWriteStringBasedDecisions(env.CF_ACCOUNT_ID, env.CF_KV_NAMESPACE_ID, env.CF_API_TOKEN, newProcessed.stringEntries);
+	}
+	// Step 7: Delete string decisions from KV using bulk API
+	if (deletedProcessed.stringKeysToDelete.length > 0) {
+		logger.info('Deleting string decisions from KV...', { count: deletedProcessed.stringKeysToDelete.length });
+		await batchDeleteStringBasedDecisions(
+			env.CF_ACCOUNT_ID,
+			env.CF_KV_NAMESPACE_ID,
+			env.CF_API_TOKEN,
+			deletedProcessed.stringKeysToDelete
+		);
+	}
+	// Step 8: Update IP_RANGES if changed
+	if (hasRangesChanged(existingRanges, finalRanges)) {
+		logger.info('IP_RANGES changed, updating KV...');
+		await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
+	}
+
+	logger.info('KV sync completed successfully', {
+		stringWritten: newProcessed.stringEntries.length,
+		stringDeleted: deletedProcessed.stringKeysToDelete.length,
+		rangesCount: Object.keys(finalRanges).length,
+	});
+}
+
+/**
+ * Sync decisions to Cloudflare IP Lists (used for L3/4 bouncing). 
+ *
+ * The D1 table is the source of truth for pending work and current list content index
+ *
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @param {import('./types.js').DecisionStreamResponse} decisions
+ * @returns {Promise<boolean>} true unless this tick stopped early (rate
+ *   limit or error) — an unplaced/still-pending remainder is normal,
+ *   expected progress, not a failure.
+ */
+async function syncToIpLists(env, decisions) {
+	logger.info('Starting IP list sync...');
+	resetRequestCounts();
+	try {
+		return await syncToIpListsInner(env, decisions);
+	} finally {
+		logger.info('IP list sync request tally', {
+			d1Requests: requestCounts.d1,
+			cloudflareApiRequests: requestCounts.cloudflareApi,
+			cloudflareApiByEndpoint: { ...requestCounts.cloudflareApiByEndpoint },
+			ipListBatchSize: env.IP_LIST_BATCH_SIZE ? parseInt(env.IP_LIST_BATCH_SIZE, 10) : DEFAULT_IP_LIST_BATCH_SIZE,
+		});
+	}
+}
+
+/**
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @param {import('./types.js').DecisionStreamResponse} decisions
+ * @returns {Promise<boolean>}
+ */
+async function syncToIpListsInner(env, decisions) {
+	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
+	const batchSize = env.IP_LIST_BATCH_SIZE ? parseInt(env.IP_LIST_BATCH_SIZE, 10) : DEFAULT_IP_LIST_BATCH_SIZE;
+	const db = env.LIST_STATE_DB;
+
+	// Split into upsert-ready entries, warning if the same IP shows up (delete always wins).
+	const { newItems, deleteItems } = planUpserts(decisions.new, decisions.deleted, (msg, ctx) => logger.warn(msg, ctx));
+
+	let deletesByList, queueOnlyDeletes;
+	try {
+		// Upsert new decisions (list_action='new' unless already 'listed'),
+		await upsertNews(db, newItems);
+		// then expired decisions (list_action='delete', unconditionally)
+		await upsertDeletes(db, deleteItems);
+
+		// Apply every pending delete that's D1-only
+		({ deletesByList, queueOnlyDeletes } = await readPendingDeletes(db));
+		await deleteQueueRows(db, queueOnlyDeletes);
+	} catch (e) {
+		if (isD1DailyWriteLimitError(e)) {
+			await setD1BackoffUntilMidnightUTC(env.CROWDSECCFBOUNCERNS);
+			logger.warn('D1 daily write-row quota exceeded while queuing this tick\'s changes; pausing all D1 writes until midnight UTC');
+			logger.warn('May be desynchronized with current CrowdSec endpoint !');
+			return false;
+		}
+		throw e;
+	}
+
+	// Check if we're currently backing off due to a previous rate limit.
+	const backoffUntil = await getIpListBackoffUntil(env.CROWDSECCFBOUNCERNS);
+	if (backoffUntil && backoffUntil > new Date()) {
+		logger.warn('Skipping Cloudflare IP list updates: backing off after a previous rate limit', {
+			backoffUntil: backoffUntil.toISOString(),
+		});
+
+		return false;
+	}
+
+	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
+	if (lists.length === 0) {
+		logger.warn(`No IP Lists found with prefix "${prefix}"; skipping IP list sync`);
+		// Nothing we can do without any managed lists; don't block warming on it.
+		return true;
+	}
+	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
+	const listIds = lists.map((l) => l.id); // already name-sorted by listManagedIpLists
+
+	// listedByList gives both the current members (needed to build a PUT
+	// body) and the current size (needed to plan adds) in one D1 read, so
+	// it replaces the old separate readListSizes call.
+	const listedByList = await readAllListed(db);
+	const currentSize = (listId) => listedByList.get(listId)?.length ?? 0;
+
+	logger.info(
+		'IP list capacity before sync',
+		Object.fromEntries(
+			listIds.map((id) => [listNameById.get(id) ?? id, `${currentSize(id)}/${MAX_ITEMS_PER_LIST}`])
+		)
+	);
+
+	// Plan adds against (current size - this list's pending deletes), i.e.
+	// the room that will actually be available once this tick's deletes are
+	// applied — computed up front so deletes and adds for the same list can
+	// be merged into a single Cloudflare request below, instead of applying
+	// all deletes first and only then seeing how much room adds have left.
+	const pendingAdds = await readPendingAdds(db, batchSize);
+	const availableSize = new Map(listIds.map((id) => [id, currentSize(id) - (deletesByList.get(id)?.length ?? 0)]));
+	const { addsByList, unplaced } = pendingAdds.length > 0
+		? planAdds(pendingAdds, listIds, availableSize, MAX_ITEMS_PER_LIST)
+		: { addsByList: new Map(), unplaced: [] };
+	if (unplaced.length > 0) {
+		// Every managed list is full and these IPs are going unprotected
+		// until room frees up. That's expected if the account's plan caps
+		// how many IP Lists it can have (the single-list case below) — but
+		// it can also mean an extra crowdsec_-prefixed list was never
+		// created, so say both rather than just logging a bare count.
+		logger.warn(
+			`${unplaced.length} pending IP(s) have no room in any managed list; left pending and NOT yet protected`,
+			{
+				managedLists: listIds.length,
+				hint:
+					listIds.length === 1
+						? 'Only one managed list was found and it is full. If your Cloudflare plan allows more IP Lists, creating another crowdsec_-prefixed one will give this worker more room; if your plan caps you at one list, this is expected and these IPs will stay pending until some currently-listed IPs expire.'
+						: 'All managed lists are full. Consider creating another crowdsec_-prefixed IP List if your Cloudflare plan allows it.',
+			}
+		);
+	}
+
+	const updatedLists = new Map(); // listName -> { added, removed }
+	const bumpListStat = (listName, key, n) => {
+		const stat = updatedLists.get(listName) || { added: 0, removed: 0 };
+		stat[key] += n;
+		updatedLists.set(listName, stat);
+	};
+
+	const touchedListIds = new Set([...deletesByList.keys(), ...addsByList.keys()]);
+	let removedCount = 0;
+	let addedCount = 0;
+
+	for (const listId of touchedListIds) {
+		const listName = listNameById.get(listId) ?? listId;
+		const toDelete = deletesByList.get(listId) ?? [];
+		const toAdd = addsByList.get(listId) ?? [];
+		const deleteIps = new Set(toDelete.map((d) => d.ip));
+
+		const strategy = chooseListUpdateStrategy(currentSize(listId), toAdd.length, toDelete.length);
+		logger.info(`Updating IP list ${listName} via ${strategy}...`, {
+			list: listName,
+			added: toAdd.length,
+			removed: toDelete.length,
+		});
+
+		/** @type {Map<string, string>} ip -> item id, for every row this tick confirms as listed */
+		let itemIdByIp;
+		try {
+			if (strategy === 'put') {
+				// Full replace: body is everything currently listed, minus
+				// this tick's deletes, plus this tick's adds. Every id in the
+				// response is re-resolved below — PUT can reassign ids even
+				// for IPs that were already there.
+				const keptIps = (listedByList.get(listId) ?? []).map((m) => m.ip).filter((ip) => !deleteIps.has(ip));
+				const finalIps = [...keptIps, ...toAdd.map((a) => a.ip)];
+				itemIdByIp = await replaceListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, finalIps);
+			} else {
+				itemIdByIp = new Map();
+				if (toDelete.length > 0) {
+					await removeListItems(
+						env.CF_ACCOUNT_ID,
+						env.CF_API_TOKEN,
+						listId,
+						toDelete.map((t) => t.itemId)
+					);
+				}
+				if (toAdd.length > 0) {
+					const added = await addListItems(
+						env.CF_ACCOUNT_ID,
+						env.CF_API_TOKEN,
+						listId,
+						toAdd.map((a) => a.ip)
+					);
+					itemIdByIp = added;
+				}
+			}
+		} catch (e) {
+			// Deletes/adds already committed for earlier lists in this loop
+			// stay applied; this list's pending work stays queued for next
+			// tick, and the loop stops here rather than risk cascading
+			// failures against a Cloudflare API that's already erroring.
+			return handleIpListError(env, e, `updating IP list ${listName} (${strategy})`);
+		}
+
+		// D1 bookkeeping for what Cloudflare just confirmed. A failure here
+		// means Cloudflare and D1 now disagree for these rows until the next
+		// startup/reset pull — flagged loudly rather than looking like an
+		// ordinary sync failure.
+		try {
+			if (strategy === 'put') {
+				const placed = [...itemIdByIp.entries()].map(([ip, itemId]) => ({ ip, itemId }));
+				await markListed(db, listId, placed);
+				if (toDelete.length > 0) {
+					await deleteQueueRows(db, toDelete.map((d) => d.ip));
+				}
+			} else {
+				if (toDelete.length > 0) {
+					await deleteQueueRows(db, toDelete.map((d) => d.ip));
+				}
+				if (toAdd.length > 0) {
+					const placed = toAdd.map((a) => ({ ip: a.ip, itemId: itemIdByIp.get(a.ip) })).filter((p) => p.itemId);
+					await markListed(db, listId, placed);
+				}
+			}
+		} catch (e) {
+			logger.error('D1 write failed after Cloudflare confirmed an IP list update; D1 and the IP lists are now out of sync for this list until the next startup/reset pull', {
+				list: listName,
+				strategy,
+				error: e.message,
+			});
+			if (isD1DailyWriteLimitError(e)) {
+				await setD1BackoffUntilMidnightUTC(env.CROWDSECCFBOUNCERNS);
+				logger.warn('D1 daily write-row quota exceeded; pausing all D1 writes until midnight UTC');
+			}
+			throw e;
+		}
+
+		removedCount += toDelete.length;
+		addedCount += toAdd.length;
+		bumpListStat(listName, 'removed', toDelete.length);
+		bumpListStat(listName, 'added', toAdd.length);
+	}
+
+	// Made it through this tick without hitting a rate limit or a D1 write
+	// clearing backoff deadlines since this tick completed successfully
+	await clearIpListBackoff(env.CROWDSECCFBOUNCERNS);
+	await clearD1Backoff(env.CROWDSECCFBOUNCERNS);
+
+	logger.info('IP list sync completed successfully', {
+		removed: removedCount,
+		added: addedCount,
+		listsUpdated: [...updatedLists.entries()].map(([list, stat]) => ({ list, ...stat })),
+		unplaced: unplaced.length,
+	});
+
+	return true;
+}
+
+/**
+ * Shared handling for a failed IP list mutation: distinguish a rate limit
+ * (which we can back off for a known duration) from anything else (which we
+ * can't reliably identify, so we just stop and retry next tick).
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @param {unknown} e
+ * @param {string} what - human-readable description of the failed operation
+ * @returns {Promise<false>}
+ */
+async function handleIpListError(env, e, what) {
+	if (e instanceof CloudflareApiError && e.status === 429 && e.retryAfterSeconds !== undefined) {
+		logger.warn(`Rate limited ${what}; backing off`, { retryAfterSeconds: e.retryAfterSeconds });
+		await setIpListBackoff(env.CROWDSECCFBOUNCERNS, e.retryAfterSeconds);
+	} else {
+		// Anything else (quota exceeded, malformed request, transient 5xx,
+		// ...) — Cloudflare doesn't give us a reliable way to tell these apart
+		// from the response alone, so stop for this run and retry next sync
+		// rather than risk cascading failures.
+		logger.error(`Failed ${what}; stopping IP list sync for this run`, {
+			error: e instanceof Error ? e.message : String(e),
+			status: e instanceof CloudflareApiError ? e.status : undefined,
+			body: e instanceof CloudflareApiError ? e.body : undefined,
+		});
+	}
+	return false;
+}
+
+/**
+ * Empty every managed IP list and the D1 table entirely. Used when LAPI
+ * reports no decisions at all (HTTP 204), mirroring the KV path's
+ * resetAllDecisions.
+ * @param {import('./types.js').CrowdSecEnv} env
+ */
+async function clearAllIpLists(env) {
+	logger.info('Clearing all managed IP lists...');
+	resetRequestCounts();
+
+	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
+	const db = env.LIST_STATE_DB;
+	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
+	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
+	const listedByList = await readAllListed(db);
+
+	const clearedLists = [];
+	for (const [listId, members] of listedByList) {
+		if (members.length === 0) continue;
+		const listName = listNameById.get(listId) ?? listId;
+
+		logger.info(`Emptying IP list ${listName}...`, { list: listName, removed: members.length });
+		await removeListItems(
+			env.CF_ACCOUNT_ID,
+			env.CF_API_TOKEN,
+			listId,
+			members.map((m) => m.itemId)
+		);
+		clearedLists.push({ list: listName, removed: members.length });
+	}
+
+	await clearQueue(db);
+
+	logger.info('All managed IP lists cleared successfully', {
+		listCount: lists.length,
+		listsUpdated: clearedLists,
+		d1Requests: requestCounts.d1,
+		cloudflareApiRequests: requestCounts.cloudflareApi,
+		cloudflareApiByEndpoint: { ...requestCounts.cloudflareApiByEndpoint },
+	});
+}
+
+/* harmony default export */ const src = ({ scheduled });
 
 export { src as default };

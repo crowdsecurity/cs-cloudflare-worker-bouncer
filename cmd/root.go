@@ -230,7 +230,7 @@ func handleConfigTokens(configTokens, configOutputPath, configPath string) error
 	return nil
 }
 
-func deployInfraForManagers(g *errgroup.Group, cfManagers []*cf.CloudflareAccountManager, deleteOnly, setupAutonomous bool, crowdSecConfig cfg.CrowdSecConfig, cronSchedule string) {
+func deployInfraForManagers(g *errgroup.Group, cfManagers []*cf.CloudflareAccountManager, deleteOnly, setupAutonomous bool, crowdSecConfig cfg.CrowdSecConfig, decisionsSyncWorkerCfg cfg.DecisionsSyncWorkerConfig) {
 	for _, cfManager := range cfManagers {
 		manager := cfManager
 		g.Go(func() error {
@@ -249,7 +249,7 @@ func deployInfraForManagers(g *errgroup.Group, cfManagers []*cf.CloudflareAccoun
 			// Deploy decisions sync worker if autonomous setup (-S flag)
 			if setupAutonomous {
 				log.Infof("Autonomous setup mode, deploying decisions sync worker for account %s", manager.AccountCfg.Name)
-				if err := manager.DeployDecisionsSyncWorker(crowdSecConfig, cronSchedule); err != nil {
+				if err := manager.DeployDecisionsSyncWorker(crowdSecConfig, decisionsSyncWorkerCfg); err != nil {
 					return fmt.Errorf("unable to deploy decisions sync worker: %w for account %s", err, manager.AccountCfg.Name)
 				}
 				// Setup Turnstile widgets (without rotation, as there's no long-running process)
@@ -340,7 +340,7 @@ func Execute(opts ExecuteOptions) error {
 
 	isDeleteOnly := opts.DeleteOnly != nil && *opts.DeleteOnly
 	isSetupAutonomous := opts.SetupAutonomous != nil && *opts.SetupAutonomous
-	deployInfraForManagers(g, cfManagers, isDeleteOnly, isSetupAutonomous, conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker.Cron)
+	deployInfraForManagers(g, cfManagers, isDeleteOnly, isSetupAutonomous, conf.CrowdSecConfig, conf.CloudflareConfig.DecisionsSyncWorker)
 	if err := g.Wait(); err != nil {
 		return err
 	}
