@@ -297,7 +297,7 @@ export async function listAllKeys(accountId, namespaceId, apiToken) {
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace (for direct operations)
  * @returns {Promise<void>}
  */
-export async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) {
+export async function resetAllDecisionsInKV(accountId, namespaceId, apiToken, kvNamespace) {
 	logger.info('Starting KV reset: deleting all decision keys...');
 
 	// Step 1: List all keys in KV

@@ -56,12 +56,12 @@ export function planUpserts(newDecisions, expiredDecisions, warn) {
 /**
  * Pack a batch of pending-add rows into managed lists in order: list 1 is
  * filled to MAX_ITEMS_PER_LIST before list 2 is touched, etc, based on
- * current member counts (readListSizes). A list already at capacity is
+ * the room each list has available. A list already at capacity is
  * skipped entirely. Items that don't fit anywhere are left un-planned
  * (still 'new' in the queue, retried next tick).
  * @param {{ip: string, action: string, until: string}[]} pendingAdds
  * @param {string[]} listIds - managed list ids, in stable (name-sorted) order
- * @param {Map<string, number>} listSizes - list_id -> current member count
+ * @param {Map<string, number>} listSizes - list_id -> available room (current size, net of this tick's pending deletes)
  * @param {number} maxItemsPerList
  * @returns {{addsByList: Map<string, {ip: string, action: string, until: string}[]>, unplaced: string[]}}
  */
