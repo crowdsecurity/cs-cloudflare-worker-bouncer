@@ -260,13 +260,13 @@ async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 		throw new Error(`LAPI request failed with status ${response.status}: ${errorText}`);
 	}
 
-	// Handle HTTP 204 No Content (LAPI has no decisions - need to delete all from KV)
+	// Handle eventual HTTP 204 No Content 
+	// it used to delete all, but we don't want that anymore
 	if (response.status === 204) {
-		logger.info('LAPI returned 204 No Content: LAPI has no decisions, will clear KV');
+		logger.warn('LAPI returned 204 No Content: not doing anything');
 		return {
 			new: [],
 			deleted: [],
-			deleteAll: true, // Signal to main sync logic to reset KV and exit
 		};
 	}
 
@@ -1088,13 +1088,6 @@ const D1_MAX_ROWS_PER_JSON_STATEMENT = 1000;
 
 /**
  * Upsert expired decisions into the queue, forcing list_action='delete'.
- * Binds the whole chunk as a single JSON-array parameter and expands it
- * server-side via json_each, so one statement handles up to
- * D1_MAX_ROWS_PER_JSON_STATEMENT rows instead of the ~25 a one-param-per-
- * column VALUES list would allow — each D1 statement (batch() entry
- * included) counts toward the 50-queries-per-invocation Free tier cap
- * regardless of how many rows it touches, so this is what actually keeps a
- * large tick from burning through that budget on upserts alone.
  * @param {D1Database} db
  * @param {{ip: string, action: string, until: string}[]} items
  */
@@ -1124,8 +1117,7 @@ async function upsertDeletes(db, items) {
 
 /**
  * Upsert new decisions into the queue as list_action='new', unless the row
- * is already 'listed'. Same single-JSON-param shape as upsertDeletes — see
- * its doc comment for why.
+ * is already 'listed'.
  * @param {D1Database} db
  * @param {{ip: string, action: string, until: string}[]} items
  */
@@ -1136,7 +1128,7 @@ async function upsertNews(db, items) {
 	const statements = chunks.map((rows) =>
 		db
 			.prepare(
-				// WHERE true: see upsertDeletes' comment above the same line.
+				// WHERE true: is requiered //see upsertDeletes' comment above the same line.
 				`INSERT INTO ip_list_state (ip, action, until, list_action)
 				 SELECT value ->> '$.ip', value ->> '$.action', value ->> '$.until', 'new'
 				 FROM json_each(?)
@@ -1180,7 +1172,7 @@ async function readPendingDeletes(db) {
 
 /**
  * Read every row currently marked 'listed', grouped by list. Used only by
- * clearAllIpLists (warmup/reset/204) to empty every managed list wholesale —
+ * clearAllIpLists (reset) to empty every managed list wholesale —
  * the normal per-tick flow never needs "all listed rows" in one shot.
  * @param {D1Database} db
  * @returns {Promise<Map<string, {ip: string, itemId: string}[]>>} list_id -> members
@@ -1673,32 +1665,6 @@ async function scheduled(event, env, _ctx) {
 				deletedDecisions: decisions.deleted.length,
 			});
 
-			// Handle HTTP 204 (LAPI has no decisions - clear the active sync target)
-			if (decisions.deleteAll) {
-				if (syncToKvEnabled) {
-					logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
-					await resetAllDecisionsInKV(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						env.CROWDSECCFBOUNCERNS
-					);
-				}
-				if (syncToIpListsEnabled) {
-					await clearAllIpLists(env);
-				}
-				// Safe to mark warmed here: it it's empty state we want
-				if (needStartUpFetch) {
-					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-					logger.info('Cache marked as warmed (LAPI has no decisions)');
-				}
-				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-				logger.info('Cleared successfully (LAPI has no decisions)', {
-					totalDuration: `${finalDuration}s`,
-				});
-				return; // Exit early - no further sync needed
-			}
-
 			let syncSucceeded;
 			if (syncToKvEnabled) {
 				await syncToKv(env, decisions, needStartUpFetch);
@@ -1709,12 +1675,7 @@ async function scheduled(event, env, _ctx) {
 				syncSucceeded = await syncToIpLists(env, decisions);
 			}
 
-			// Mark cache as warmed ONLY after the sync target has captured
-			// this run's decisions. If this runs before every write actually
-			// landed, a mid-sync crash leaves WARMED_UP=true with some
-			// decisions never applied, and the next run does an incremental
-			// fetch that never backfills what was missed — a silent
-			// enforcement gap.
+			// Mark cache as warmed ONLY after the sync target has captured this run's decisions. 
 			if (needStartUpFetch && syncSucceeded) {
 				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
 				logger.info('Cache marked as warmed (first sync complete)');
@@ -1736,8 +1697,8 @@ async function scheduled(event, env, _ctx) {
 			stack: error.stack,
 		});
 
-		// Don't throw - we want to continue running on the next cron trigger
-		// The existing decisions in KV (if any) will remain valid
+		// Swallow the error rather than rethrow
+		// No advantage throwing + we have enough logs to find out what happened
 	}
 }
 
