@@ -325,6 +325,7 @@ async function syncToIpLists(env, decisions) {
 async function syncToIpListsInner(env, decisions) {
 	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
 	const batchSize = env.IP_LIST_BATCH_SIZE ? parseInt(env.IP_LIST_BATCH_SIZE, 10) : DEFAULT_IP_LIST_BATCH_SIZE;
+	const maxItemsPerList = env.IP_LIST_MAX_ITEMS_PER_LIST ? parseInt(env.IP_LIST_MAX_ITEMS_PER_LIST, 10) : MAX_ITEMS_PER_LIST;
 	const db = env.LIST_STATE_DB;
 
 	// Split into upsert-ready entries, warning if the same IP shows up (delete always wins).
@@ -368,19 +369,37 @@ async function syncToIpListsInner(env, decisions) {
 	}
 	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
 	const listIds = lists.map((l) => l.id); // already name-sorted by listManagedIpLists
+	const numItemsById = new Map(lists.map((l) => [l.id, l.numItems]));
 
 	// listedByList gives both the current members (needed to build a PUT
 	// body) and the current size (needed to plan adds) in one D1 read, so
-	// it replaces the old separate readListSizes call.
+	// it replaces the old separate readListSizes call. D1 stays the source
+	// of truth for planning (packing decisions below), since it's what lets
+	// warmup/pacing stay resumable without a live Cloudflare read every
+	// tick — but Cloudflare's own num_items (from the listManagedIpLists
+	// call above, no extra request) is what actually reflects the list, so
+	// that's what gets logged, with a warning if the two disagree.
 	const listedByList = await readAllListed(db);
 	const currentSize = (listId) => listedByList.get(listId)?.length ?? 0;
 
 	logger.info(
 		'IP list capacity before sync',
 		Object.fromEntries(
-			listIds.map((id) => [listNameById.get(id) ?? id, `${currentSize(id)}/${MAX_ITEMS_PER_LIST}`])
+			listIds.map((id) => [listNameById.get(id) ?? id, `${numItemsById.get(id) ?? 0}/${maxItemsPerList}`])
 		)
 	);
+	for (const id of listIds) {
+		const listName = listNameById.get(id) ?? id;
+		const cloudflareCount = numItemsById.get(id) ?? 0;
+		const d1Count = currentSize(id);
+		if (cloudflareCount !== d1Count) {
+			logger.warn(`D1 and IP list ${listName} disagree on membership count; they may be out of sync`, {
+				list: listName,
+				cloudflareCount,
+				d1Count,
+			});
+		}
+	}
 
 	// Plan adds against (current size - this list's pending deletes), i.e.
 	// the room that will actually be available once this tick's deletes are
@@ -390,7 +409,7 @@ async function syncToIpListsInner(env, decisions) {
 	const pendingAdds = await readPendingAdds(db, batchSize);
 	const availableSize = new Map(listIds.map((id) => [id, currentSize(id) - (deletesByList.get(id)?.length ?? 0)]));
 	const { addsByList, unplaced } = pendingAdds.length > 0
-		? planAdds(pendingAdds, listIds, availableSize, MAX_ITEMS_PER_LIST)
+		? planAdds(pendingAdds, listIds, availableSize, maxItemsPerList)
 		: { addsByList: new Map(), unplaced: [] };
 	if (unplaced.length > 0) {
 		// Every managed list is full and these IPs are going unprotected

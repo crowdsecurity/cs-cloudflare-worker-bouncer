@@ -162,11 +162,14 @@ function chunk(arr, size) {
 /**
  * Discover the IP Lists this worker is allowed to manage: every custom list
  * whose name starts with the configured prefix. Lists are sorted by name so
- * pack-to-full placement (list 1 first) is stable across runs.
+ * pack-to-full placement (list 1 first) is stable across runs. Includes each
+ * list's num_items straight from this same response — Cloudflare's own
+ * count of its current membership — so callers can log/compare it against
+ * D1's belief about list size without an extra request.
  * @param {string} accountId
  * @param {string} apiToken
  * @param {string} prefix
- * @returns {Promise<{id: string, name: string}[]>}
+ * @returns {Promise<{id: string, name: string, numItems: number}[]>}
  */
 export async function listManagedIpLists(accountId, apiToken, prefix) {
 	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists`;
@@ -179,7 +182,7 @@ export async function listManagedIpLists(accountId, apiToken, prefix) {
 	const data = await response.json();
 	const lists = (data.result || [])
 		.filter((list) => list.kind === 'ip' && list.name.startsWith(prefix))
-		.map((list) => ({ id: list.id, name: list.name }))
+		.map((list) => ({ id: list.id, name: list.name, numItems: list.num_items ?? 0 }))
 		.sort((a, b) => a.name.localeCompare(b.name));
 
 	logger.debug(`Discovered ${lists.length} managed IP list(s) with prefix "${prefix}"`);

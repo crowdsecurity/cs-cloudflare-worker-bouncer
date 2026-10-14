@@ -89,6 +89,18 @@ export interface CrowdSecEnv {
 	 * @default "1000"
 	 */
 	IP_LIST_BATCH_SIZE?: string;
+
+	/**
+	 * Ceiling on how many IPs this worker will pack into a single managed
+	 * list before moving on to the next one (pack-to-full, in list-name
+	 * order). Cloudflare's large "IP Lists" have no fixed per-list item cap
+	 * of their own, so this is purely an operator choice — override it if
+	 * you want smaller/larger lists than the built-in default. Only used
+	 * when SYNC_TO_LIST_NOT_KV is "true".
+	 * @optional
+	 * @default "300000"
+	 */
+	IP_LIST_MAX_ITEMS_PER_LIST?: string;
 }
 
 /**
