@@ -287,8 +287,8 @@ export async function readPendingDeletes(db) {
 
 /**
  * Read every row currently marked 'listed', grouped by list. Used only by
- * clearAllIpLists (reset) to empty every managed list wholesale —
- * the normal per-tick flow never needs "all listed rows" in one shot.
+ * the per-tick PUT (full replace) path, which needs each member's actual ip
+ * (and item id, to resolve the response) to build the replacement body.
  * @param {D1Database} db
  * @returns {Promise<Map<string, {ip: string, itemId: string}[]>>} list_id -> members
  */
@@ -303,6 +303,23 @@ export async function readAllListed(db) {
 		byList.get(row.list_id).push({ ip: row.ip, itemId: row.item_id });
 	}
 	return byList;
+}
+
+/**
+ * Which managed list_ids currently have at least one 'listed' row. Used only
+ * by clearAllIpLists (reset) — emptying a list via replaceListItems needs no
+ * per-row data (no itemIds, no ips), just which lists aren't already empty,
+ * so this avoids paging every listed row (potentially hundreds of thousands)
+ * into Worker memory just to find out.
+ * @param {D1Database} db
+ * @returns {Promise<Set<string>>} list_ids with at least one 'listed' row
+ */
+export async function readListedListIds(db) {
+	const result = await d1Exec(
+		db.prepare("SELECT DISTINCT list_id FROM ip_list_state WHERE list_action = 'listed'"),
+		'all'
+	);
+	return new Set((result.results || []).map((row) => row.list_id));
 }
 
 /**
@@ -482,6 +499,7 @@ export function chooseListUpdateStrategy(currentSize, addCount, removeCount) {
  * Cloudflare's add-items response doesn't echo back which item id was
  * assigned to which IP, so after an add completes we page through the
  * list's current items to resolve ip -> item id for just the IPs we added.
+ * // in the future we could keep d1 consistency too if we keep browsing the whole list anyways
  * @param {string} accountId
  * @param {string} apiToken
  * @param {string} listId

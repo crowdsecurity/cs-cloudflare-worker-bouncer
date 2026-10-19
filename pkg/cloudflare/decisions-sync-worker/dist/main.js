@@ -1175,8 +1175,8 @@ async function readPendingDeletes(db) {
 
 /**
  * Read every row currently marked 'listed', grouped by list. Used only by
- * clearAllIpLists (reset) to empty every managed list wholesale —
- * the normal per-tick flow never needs "all listed rows" in one shot.
+ * the per-tick PUT (full replace) path, which needs each member's actual ip
+ * (and item id, to resolve the response) to build the replacement body.
  * @param {D1Database} db
  * @returns {Promise<Map<string, {ip: string, itemId: string}[]>>} list_id -> members
  */
@@ -1191,6 +1191,23 @@ async function readAllListed(db) {
 		byList.get(row.list_id).push({ ip: row.ip, itemId: row.item_id });
 	}
 	return byList;
+}
+
+/**
+ * Which managed list_ids currently have at least one 'listed' row. Used only
+ * by clearAllIpLists (reset) — emptying a list via replaceListItems needs no
+ * per-row data (no itemIds, no ips), just which lists aren't already empty,
+ * so this avoids paging every listed row (potentially hundreds of thousands)
+ * into Worker memory just to find out.
+ * @param {D1Database} db
+ * @returns {Promise<Set<string>>} list_ids with at least one 'listed' row
+ */
+async function readListedListIds(db) {
+	const result = await d1Exec(
+		db.prepare("SELECT DISTINCT list_id FROM ip_list_state WHERE list_action = 'listed'"),
+		'all'
+	);
+	return new Set((result.results || []).map((row) => row.list_id));
 }
 
 /**
@@ -1370,6 +1387,7 @@ function chooseListUpdateStrategy(currentSize, addCount, removeCount) {
  * Cloudflare's add-items response doesn't echo back which item id was
  * assigned to which IP, so after an add completes we page through the
  * list's current items to resolve ip -> item id for just the IPs we added.
+ * // in the future we could keep d1 consistency too if we keep browsing the whole list anyways
  * @param {string} accountId
  * @param {string} apiToken
  * @param {string} listId
@@ -1623,7 +1641,7 @@ async function scheduled(event, env, _ctx) {
 
 			// Determine if this is the first fetch
 			const needStartUpFetch = await needWarmUp(env.CROWDSECCFBOUNCERNS);
-			logger.info('Pull All decisions ?', { startup: needStartUpFetch });
+			logger.info('Determined fetch mode', { startup: needStartUpFetch });
 
 			// Check if reset is requested
 			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
@@ -1668,6 +1686,23 @@ async function scheduled(event, env, _ctx) {
 				deletedDecisions: decisions.deleted.length,
 			});
 
+			// IP-list mode: mark warmed as soon as the LAPI pull itself
+			// succeeded (we're past the await above), not gated on the
+			// Cloudflare-side push. D1 is the durable queue for this mode —
+			// upsertNews/upsertDeletes (inside syncToIpLists, called next)
+			// write this tick's full decisions into it before any Cloudflare
+			// API call happens, so a later rate limit/backoff loses nothing.
+			// Repeating startup=true every tick just because one Cloudflare
+			// push got rate-limited would otherwise re-pull and re-upsert the
+			// entire LAPI decision set on every tick during warmup — pure
+			// waste, since D1 already has it after the first successful pull.
+			// (If D1 itself fails to absorb the payload, syncToIpLists logs a
+			// loud warning about that specific case — see its D1 upsert catch.)
+			if (needStartUpFetch && syncToIpListsEnabled) {
+				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+				logger.info('Cache marked as warmed (LAPI startup pull complete; D1 continues draining into lists over subsequent ticks)');
+			}
+
 			let syncSucceeded;
 			if (syncToKvEnabled) {
 				await syncToKv(env, decisions, needStartUpFetch);
@@ -1675,20 +1710,35 @@ async function scheduled(event, env, _ctx) {
 				syncSucceeded = true;
 			} else {
 				// Partial sync possible: in D1 but not in lists yet
-				syncSucceeded = await syncToIpLists(env, decisions);
+				syncSucceeded = await syncToIpLists(env, decisions, needStartUpFetch);
 			}
 
-			// Mark cache as warmed ONLY after the sync target has captured this run's decisions. 
-			if (needStartUpFetch && syncSucceeded) {
+			// KV mode: syncToKv is not a durable queue, so warmed is only
+			// marked once it has fully written this run's decisions — marking
+			// it earlier on a partial failure would leave KV half-populated
+			// but flagged warmed, and the next run would do an incremental
+			// fetch that never backfills what's missing (silent gap).
+			if (needStartUpFetch && syncToKvEnabled && syncSucceeded) {
 				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
 				logger.info('Cache marked as warmed (first sync complete)');
-			} else if (needStartUpFetch) {
-				logger.warn('First sync incomplete (IP list sync failed); cache not marked as warmed yet');
+			} else if (needStartUpFetch && syncToKvEnabled) {
+				logger.warn('First sync incomplete (KV sync failed); cache not marked as warmed yet');
 			}
 
-			// Final summary
+			// Final summary. "Completed" just means this tick finished without
+			// throwing — syncSucceeded says whether it actually did its job
+			// (false for a rate-limited/backed-off IP list tick that made no
+			// progress), so the level and message reflect that rather than
+			// reading as an all-clear regardless of outcome.
 			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-			logger.info('Decision sync completed successfully', { totalDuration: `${finalDuration}s` });
+			if (syncSucceeded) {
+				logger.info('Decision sync tick finished', { totalDuration: `${finalDuration}s`, syncSucceeded });
+			} else {
+				logger.warn('Decision sync tick finished without syncing (see warnings above for why)', {
+					totalDuration: `${finalDuration}s`,
+					syncSucceeded,
+				});
+			}
 		} finally {
 			await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
 		}
@@ -1787,15 +1837,18 @@ async function syncToKv(env, decisions, needStartUpFetch) {
  *
  * @param {import('./types.js').CrowdSecEnv} env
  * @param {import('./types.js').DecisionStreamResponse} decisions
+ * @param {boolean} needStartUpFetch - true if this tick's LAPI pull was the
+ *   startup (full) pull, used only to decide whether a D1 write failure here
+ *   gets the loud "warmed but D1 not fully populated" warning below.
  * @returns {Promise<boolean>} true unless this tick stopped early (rate
  *   limit or error) — an unplaced/still-pending remainder is normal,
  *   expected progress, not a failure.
  */
-async function syncToIpLists(env, decisions) {
+async function syncToIpLists(env, decisions, needStartUpFetch) {
 	logger.info('Starting IP list sync...');
 	resetRequestCounts();
 	try {
-		return await syncToIpListsInner(env, decisions);
+		return await syncToIpListsInner(env, decisions, needStartUpFetch);
 	} finally {
 		logger.info('IP list sync request tally', {
 			d1Requests: requestCounts.d1,
@@ -1809,9 +1862,10 @@ async function syncToIpLists(env, decisions) {
 /**
  * @param {import('./types.js').CrowdSecEnv} env
  * @param {import('./types.js').DecisionStreamResponse} decisions
+ * @param {boolean} needStartUpFetch
  * @returns {Promise<boolean>}
  */
-async function syncToIpListsInner(env, decisions) {
+async function syncToIpListsInner(env, decisions, needStartUpFetch) {
 	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
 	const batchSize = env.IP_LIST_BATCH_SIZE ? parseInt(env.IP_LIST_BATCH_SIZE, 10) : DEFAULT_IP_LIST_BATCH_SIZE;
 	const maxItemsPerList = env.IP_LIST_MAX_ITEMS_PER_LIST ? parseInt(env.IP_LIST_MAX_ITEMS_PER_LIST, 10) : MAX_ITEMS_PER_LIST;
@@ -1831,6 +1885,19 @@ async function syncToIpListsInner(env, decisions) {
 		({ deletesByList, queueOnlyDeletes } = await readPendingDeletes(db));
 		await deleteQueueRows(db, queueOnlyDeletes);
 	} catch (e) {
+		// The LAPI pull itself already succeeded by this point (it's awaited
+		// before this function is even called), and the caller marks warmed
+		// unconditionally on that basis — see scheduled(). So if this was the
+		// startup tick and D1 failed to absorb the full payload, the cache is
+		// now marked warmed despite D1 NOT actually holding everything LAPI
+		// just sent: flag that mismatch loudly, since it won't self-heal (a
+		// future tick won't know to re-pull) the way an ordinary failure would.
+		if (needStartUpFetch) {
+			logger.error(
+				'STARTUP D1 WRITE FAILED: warmed flag is being set because the LAPI pull succeeded, but D1 could not store this tick\'s full decision set. D1 and LAPI are now out of sync until a manual RESET triggers a fresh pull.',
+				{ error: e.message }
+			);
+		}
 		if (isD1DailyWriteLimitError(e)) {
 			await setD1BackoffUntilMidnightUTC(env.CROWDSECCFBOUNCERNS);
 			logger.warn('D1 daily write-row quota exceeded while queuing this tick\'s changes; pausing all D1 writes until midnight UTC');
@@ -1871,12 +1938,13 @@ async function syncToIpListsInner(env, decisions) {
 	const listedByList = await readAllListed(db);
 	const currentSize = (listId) => listedByList.get(listId)?.length ?? 0;
 
-	logger.info(
-		'IP list capacity before sync',
-		Object.fromEntries(
-			listIds.map((id) => [listNameById.get(id) ?? id, `${numItemsById.get(id) ?? 0}/${maxItemsPerList}`])
-		)
-	);
+	logger.info('IP list capacity before sync', {
+		lists: listIds.map((id) => ({
+			list: listNameById.get(id) ?? id,
+			size: numItemsById.get(id) ?? 0,
+			max: maxItemsPerList,
+		})),
+	});
 	for (const id of listIds) {
 		const listName = listNameById.get(id) ?? id;
 		const cloudflareCount = numItemsById.get(id) ?? 0;
@@ -1936,7 +2004,12 @@ async function syncToIpListsInner(env, decisions) {
 		const deleteIps = new Set(toDelete.map((d) => d.ip));
 
 		const strategy = chooseListUpdateStrategy(currentSize(listId), toAdd.length, toDelete.length);
-		logger.info(`Updating IP list ${listName} via ${strategy}...`, {
+		// strategy is 'put' (one full-replace request) or 'post-delete' (an
+		// add request and/or a remove request) — 'post-delete' names the
+		// HTTP methods used, not "we're deleting"; log a plainer label so it
+		// doesn't read as contradictory next to e.g. added:1, removed:0.
+		const strategyLabel = strategy === 'put' ? 'full replace' : 'add/remove';
+		logger.info(`Updating IP list ${listName} via ${strategyLabel}...`, {
 			list: listName,
 			added: toAdd.length,
 			removed: toDelete.length,
@@ -1978,7 +2051,7 @@ async function syncToIpListsInner(env, decisions) {
 			// stay applied; this list's pending work stays queued for next
 			// tick, and the loop stops here rather than risk cascading
 			// failures against a Cloudflare API that's already erroring.
-			return handleIpListError(env, e, `updating IP list ${listName} (${strategy})`);
+			return handleIpListError(env, e, `updating IP list ${listName} (${strategyLabel})`);
 		}
 
 		// D1 bookkeeping for what Cloudflare just confirmed. A failure here
@@ -2004,7 +2077,7 @@ async function syncToIpListsInner(env, decisions) {
 		} catch (e) {
 			logger.error('D1 write failed after Cloudflare confirmed an IP list update; D1 and the IP lists are now out of sync for this list until the next startup/reset pull', {
 				list: listName,
-				strategy,
+				strategy: strategyLabel,
 				error: e.message,
 			});
 			if (isD1DailyWriteLimitError(e)) {
@@ -2063,9 +2136,14 @@ async function handleIpListError(env, e, what) {
 }
 
 /**
- * Empty every managed IP list and the D1 table entirely. Used when LAPI
- * reports no decisions at all (HTTP 204), mirroring the KV path's
- * resetAllDecisions.
+ * Empty every managed IP list and the D1 table entirely. Used on an explicit
+ * RESET (see scheduled()), mirroring the KV path's resetAllDecisionsInKV.
+ *
+ * Emptying a list this way never needs per-row data (no ips, no itemIds) —
+ * a full replace with an empty body clears it regardless of how many items
+ * it held, so the D1 read only needs to know which lists aren't already
+ * empty, not every member's id. That avoids paging potentially hundreds of
+ * thousands of listed rows into Worker memory just to throw them away.
  * @param {import('./types.js').CrowdSecEnv} env
  */
 async function clearAllIpLists(env) {
@@ -2076,23 +2154,19 @@ async function clearAllIpLists(env) {
 	const db = env.LIST_STATE_DB;
 	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
 	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
-	const listedByList = await readAllListed(db);
+	const nonEmptyListIds = await readListedListIds(db);
 
 	const clearedLists = [];
-	for (const [listId, members] of listedByList) {
-		if (members.length === 0) continue;
+	for (const listId of nonEmptyListIds) {
 		const listName = listNameById.get(listId) ?? listId;
 
-		logger.info(`Emptying IP list ${listName}...`, { list: listName, removed: members.length });
-		await removeListItems(
-			env.CF_ACCOUNT_ID,
-			env.CF_API_TOKEN,
-			listId,
-			members.map((m) => m.itemId)
-		);
-		clearedLists.push({ list: listName, removed: members.length });
+		logger.info(`Emptying IP list ${listName}...`, { list: listName });
+		await replaceListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, []);
+		clearedLists.push({ list: listName });
 	}
 
+	// Reset, not a normal tick: every row (pending adds/deletes included, not
+	// just the 'listed' ones just cleared above) is dropped in one shot.
 	await clearQueue(db);
 
 	logger.info('All managed IP lists cleared successfully', {

@@ -32,6 +32,7 @@ import {
 	readPendingDeletes,
 	readPendingAdds,
 	readAllListed,
+	readListedListIds,
 	markListed,
 	deleteQueueRows,
 	clearQueue,
@@ -134,7 +135,7 @@ async function scheduled(event, env, _ctx) {
 
 			// Determine if this is the first fetch
 			const needStartUpFetch = await needWarmUp(env.CROWDSECCFBOUNCERNS);
-			logger.info('Pull All decisions ?', { startup: needStartUpFetch });
+			logger.info('Determined fetch mode', { startup: needStartUpFetch });
 
 			// Check if reset is requested
 			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
@@ -179,6 +180,13 @@ async function scheduled(event, env, _ctx) {
 				deletedDecisions: decisions.deleted.length,
 			});
 
+			// Mark warmed as soon as the LAPI pull itself succeeded to avoid pulling the full list every-time
+			// If there is an issue we'll have to check manually and reset
+			if (needStartUpFetch) {
+				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+				logger.info('LAPI startup pull complete');
+			}
+
 			let syncSucceeded;
 			if (syncToKvEnabled) {
 				await syncToKv(env, decisions, needStartUpFetch);
@@ -189,17 +197,15 @@ async function scheduled(event, env, _ctx) {
 				syncSucceeded = await syncToIpLists(env, decisions);
 			}
 
-			// Mark cache as warmed ONLY after the sync target has captured this run's decisions. 
-			if (needStartUpFetch && syncSucceeded) {
-				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-				logger.info('Cache marked as warmed (first sync complete)');
-			} else if (needStartUpFetch) {
-				logger.warn('First sync incomplete (IP list sync failed); cache not marked as warmed yet');
-			}
-
-			// Final summary
 			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-			logger.info('Decision sync completed successfully', { totalDuration: `${finalDuration}s` });
+			if (syncSucceeded) {
+				logger.info('Decision sync tick finished', { totalDuration: `${finalDuration}s`, syncSucceeded });
+			} else {
+				logger.warn('Decision sync tick finished without syncing (see warnings above for why)', {
+					totalDuration: `${finalDuration}s`,
+					syncSucceeded,
+				});
+			}
 		} finally {
 			await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
 		}
@@ -371,23 +377,16 @@ async function syncToIpListsInner(env, decisions) {
 	const listIds = lists.map((l) => l.id); // already name-sorted by listManagedIpLists
 	const numItemsById = new Map(lists.map((l) => [l.id, l.numItems]));
 
-	// listedByList gives both the current members (needed to build a PUT
-	// body) and the current size (needed to plan adds) in one D1 read, so
-	// it replaces the old separate readListSizes call. D1 stays the source
-	// of truth for planning (packing decisions below), since it's what lets
-	// warmup/pacing stay resumable without a live Cloudflare read every
-	// tick — but Cloudflare's own num_items (from the listManagedIpLists
-	// call above, no extra request) is what actually reflects the list, so
-	// that's what gets logged, with a warning if the two disagree.
 	const listedByList = await readAllListed(db);
 	const currentSize = (listId) => listedByList.get(listId)?.length ?? 0;
 
-	logger.info(
-		'IP list capacity before sync',
-		Object.fromEntries(
-			listIds.map((id) => [listNameById.get(id) ?? id, `${numItemsById.get(id) ?? 0}/${maxItemsPerList}`])
-		)
-	);
+	logger.info('IP list capacity before sync', {
+		lists: listIds.map((id) => ({
+			list: listNameById.get(id) ?? id,
+			size: numItemsById.get(id) ?? 0,
+			max: maxItemsPerList,
+		})),
+	});
 	for (const id of listIds) {
 		const listName = listNameById.get(id) ?? id;
 		const cloudflareCount = numItemsById.get(id) ?? 0;
@@ -401,22 +400,13 @@ async function syncToIpListsInner(env, decisions) {
 		}
 	}
 
-	// Plan adds against (current size - this list's pending deletes), i.e.
-	// the room that will actually be available once this tick's deletes are
-	// applied — computed up front so deletes and adds for the same list can
-	// be merged into a single Cloudflare request below, instead of applying
-	// all deletes first and only then seeing how much room adds have left.
+	// Plan adds and deletes
 	const pendingAdds = await readPendingAdds(db, batchSize);
 	const availableSize = new Map(listIds.map((id) => [id, currentSize(id) - (deletesByList.get(id)?.length ?? 0)]));
 	const { addsByList, unplaced } = pendingAdds.length > 0
 		? planAdds(pendingAdds, listIds, availableSize, maxItemsPerList)
 		: { addsByList: new Map(), unplaced: [] };
 	if (unplaced.length > 0) {
-		// Every managed list is full and these IPs are going unprotected
-		// until room frees up. That's expected if the account's plan caps
-		// how many IP Lists it can have (the single-list case below) — but
-		// it can also mean an extra crowdsec_-prefixed list was never
-		// created, so say both rather than just logging a bare count.
 		logger.warn(
 			`${unplaced.length} pending IP(s) have no room in any managed list; left pending and NOT yet protected`,
 			{
@@ -447,7 +437,9 @@ async function syncToIpListsInner(env, decisions) {
 		const deleteIps = new Set(toDelete.map((d) => d.ip));
 
 		const strategy = chooseListUpdateStrategy(currentSize(listId), toAdd.length, toDelete.length);
-		logger.info(`Updating IP list ${listName} via ${strategy}...`, {
+		
+		const strategyLabel = strategy === 'put' ? 'full replace' : 'add/remove';
+		logger.info(`Updating IP list ${listName} via ${strategyLabel}...`, {
 			list: listName,
 			added: toAdd.length,
 			removed: toDelete.length,
@@ -457,14 +449,12 @@ async function syncToIpListsInner(env, decisions) {
 		let itemIdByIp;
 		try {
 			if (strategy === 'put') {
-				// Full replace: body is everything currently listed, minus
-				// this tick's deletes, plus this tick's adds. Every id in the
-				// response is re-resolved below — PUT can reassign ids even
-				// for IPs that were already there.
+				// Full replace
 				const keptIps = (listedByList.get(listId) ?? []).map((m) => m.ip).filter((ip) => !deleteIps.has(ip));
 				const finalIps = [...keptIps, ...toAdd.map((a) => a.ip)];
 				itemIdByIp = await replaceListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, finalIps);
 			} else {
+				// Delete then Add
 				itemIdByIp = new Map();
 				if (toDelete.length > 0) {
 					await removeListItems(
@@ -489,7 +479,7 @@ async function syncToIpListsInner(env, decisions) {
 			// stay applied; this list's pending work stays queued for next
 			// tick, and the loop stops here rather than risk cascading
 			// failures against a Cloudflare API that's already erroring.
-			return handleIpListError(env, e, `updating IP list ${listName} (${strategy})`);
+			return handleIpListError(env, e, `updating IP list ${listName} (${strategyLabel})`);
 		}
 
 		// D1 bookkeeping for what Cloudflare just confirmed. A failure here
@@ -515,7 +505,7 @@ async function syncToIpListsInner(env, decisions) {
 		} catch (e) {
 			logger.error('D1 write failed after Cloudflare confirmed an IP list update; D1 and the IP lists are now out of sync for this list until the next startup/reset pull', {
 				list: listName,
-				strategy,
+				strategy: strategyLabel,
 				error: e.message,
 			});
 			if (isD1DailyWriteLimitError(e)) {
@@ -573,10 +563,7 @@ async function handleIpListError(env, e, what) {
 	return false;
 }
 
-/**
- * Empty every managed IP list and the D1 table entirely. Used when LAPI
- * reports no decisions at all (HTTP 204), mirroring the KV path's
- * resetAllDecisions.
+/** Empty all lists mapped in D1 and then full D1
  * @param {import('./types.js').CrowdSecEnv} env
  */
 async function clearAllIpLists(env) {
@@ -587,23 +574,19 @@ async function clearAllIpLists(env) {
 	const db = env.LIST_STATE_DB;
 	const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
 	const listNameById = new Map(lists.map((l) => [l.id, l.name]));
-	const listedByList = await readAllListed(db);
+	const nonEmptyListIds = await readListedListIds(db);
 
 	const clearedLists = [];
-	for (const [listId, members] of listedByList) {
-		if (members.length === 0) continue;
+	for (const listId of nonEmptyListIds) {
 		const listName = listNameById.get(listId) ?? listId;
 
-		logger.info(`Emptying IP list ${listName}...`, { list: listName, removed: members.length });
-		await removeListItems(
-			env.CF_ACCOUNT_ID,
-			env.CF_API_TOKEN,
-			listId,
-			members.map((m) => m.itemId)
-		);
-		clearedLists.push({ list: listName, removed: members.length });
+		logger.info(`Emptying IP list ${listName}...`, { list: listName });
+		await replaceListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, []);
+		clearedLists.push({ list: listName });
 	}
 
+	// Reset, not a normal tick: every row (pending adds/deletes included, not
+	// just the 'listed' ones just cleared above) is dropped in one shot.
 	await clearQueue(db);
 
 	logger.info('All managed IP lists cleared successfully', {
