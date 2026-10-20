@@ -64,6 +64,11 @@ const handleTurnstilePost = async (
   }
 
   if (!outcome.success) {
+    // The secret was rotated since TURNSTILE_CONFIG was cached: refetch it on
+    // the next request instead of failing every captcha until the TTL expires.
+    if (outcome["error-codes"]?.includes("invalid-input-secret")) {
+      invalidateKVCache(TURNSTILE_CONFIG_KEY);
+    }
     console.log("Invalid captcha solution");
     return new Response("Invalid captcha solution", {
       status: 401,
@@ -99,12 +104,104 @@ const getFromKV = async (kv, key) => {
   }
 };
 
-const writeToKV = async (kv, key, value) => {
-  try {
-    await kv.put(key, value);
-  } catch (e) {
-    console.log(e);
+// Every KV get() is billed, including edge-cache hits and lookups of missing
+// keys, so a clean request used to cost up to 4 reads. KV results (null
+// included) are memoized in isolate memory, which outlives a single request
+// but may be evicted at any time: a miss simply falls back to KV.
+// The trade-off is that a decision change can take up to the TTL to be
+// enforced on a warm isolate, on top of KV's own propagation delay.
+const DEFAULT_CACHE_TTL_MS = 60000;
+// Bounds memory use (128 MB per isolate) when many distinct IPs are seen.
+const MAX_CACHED_KEYS = 50000;
+const kvCache = new Map(); // key -> { promise, expiresAt }, in LRU order
+
+const getCacheTTLMs = (env) => {
+  if (env.CACHE_TTL_MS === undefined || env.CACHE_TTL_MS === "") {
+    return DEFAULT_CACHE_TTL_MS;
   }
+  const ttl = Number(env.CACHE_TTL_MS);
+  return Number.isFinite(ttl) && ttl >= 0 ? ttl : DEFAULT_CACHE_TTL_MS;
+};
+
+// Returns transform(value of key), memoized for the TTL. The promise is cached
+// rather than the value so that concurrent requests on a cold isolate share a
+// single KV read. KV errors are not cached, to avoid failing open for a full
+// TTL on a transient error.
+const getFromKVCached = (env, key, transform = (v) => v) => {
+  const ttlMs = getCacheTTLMs(env);
+  if (ttlMs === 0) {
+    return getFromKV(env.CROWDSECCFBOUNCERNS, key).then(transform);
+  }
+
+  const now = Date.now();
+  const entry = kvCache.get(key);
+  if (entry !== undefined) {
+    kvCache.delete(key);
+    if (entry.expiresAt > now) {
+      kvCache.set(key, entry);
+      return entry.promise;
+    }
+  }
+
+  const promise = Promise.resolve()
+    .then(() => env.CROWDSECCFBOUNCERNS.get(key))
+    .then(transform)
+    .catch((e) => {
+      console.log(e);
+      if (kvCache.get(key)?.promise === promise) {
+        kvCache.delete(key);
+      }
+      return null;
+    });
+  kvCache.set(key, { promise, expiresAt: now + ttlMs });
+  while (kvCache.size > MAX_CACHED_KEYS) {
+    kvCache.delete(kvCache.keys().next().value);
+  }
+  return promise;
+};
+
+const invalidateKVCache = (key) => {
+  kvCache.delete(key);
+};
+
+const TURNSTILE_CONFIG_KEY = "TURNSTILE_CONFIG";
+
+const parseTurnstileConfig = (value) => {
+  if (value === null) {
+    return null;
+  }
+  try {
+    return JSON.parse(value);
+  } catch (e) {
+    console.error("Failed to parse turnstile config:", e);
+    return null;
+  }
+};
+
+// Parse IP_RANGES once per cache refresh instead of on every request.
+const parseIPRanges = (value) => {
+  if (value === null) {
+    return null;
+  }
+  let actionByIPRange;
+  try {
+    actionByIPRange = JSON.parse(value);
+  } catch (e) {
+    console.error("Failed to parse IP_RANGES:", e);
+    return null;
+  }
+  if (actionByIPRange === null || typeof actionByIPRange !== "object") {
+    return null;
+  }
+  const ranges = [];
+  for (const [range, action] of Object.entries(actionByIPRange)) {
+    try {
+      ranges.push({ range, action, cidr: ipaddr.parseCIDR(range) });
+    } catch (e) {
+      console.error("Ignoring invalid range in IP_RANGES:", range, e);
+    }
+  }
+  return ranges;
 };
 
 // request ->
@@ -141,7 +238,7 @@ export default {
   async _handleFetch(request, env, ctx) {
     const doBan = async () => {
       return new Response(
-        await getFromKV(env.CROWDSECCFBOUNCERNS, "BAN_TEMPLATE"),
+        await getFromKVCached(env, "BAN_TEMPLATE"),
         {
           status: 403,
           headers: { "Content-Type": "text/html" },
@@ -156,32 +253,14 @@ export default {
       // If it's captcha submission, do the validation  and issue a JWT token as a cookie.
       // Else return the captcha HTML
       const ip = request.headers.get("CF-Connecting-IP");
-      let turnstileCfg = await getFromKV(
-        env.CROWDSECCFBOUNCERNS,
-        "TURNSTILE_CONFIG",
+      let turnstileCfg = await getFromKVCached(
+        env,
+        TURNSTILE_CONFIG_KEY,
+        parseTurnstileConfig,
       );
       if (turnstileCfg == null) {
         console.log("No turnstile config found for zone");
         return fetch(request);
-      }
-      if (typeof turnstileCfg === "string") {
-        console.log("Converting turnstile config to JSON");
-        try {
-          turnstileCfg = JSON.parse(turnstileCfg);
-        } catch (e) {
-          console.error("Failed to parse turnstile config:", e);
-          return fetch(request);
-        }
-        // ctx.waitUntil keeps the KV put alive after we return the response;
-        // otherwise the Workers runtime cancels the unawaited Promise and the
-        // normalised TURNSTILE_CONFIG never lands.
-        ctx.waitUntil(
-          writeToKV(
-            env.CROWDSECCFBOUNCERNS,
-            "TURNSTILE_CONFIG",
-            JSON.stringify(turnstileCfg),
-          ),
-        );
       }
 
       if (!turnstileCfg[zoneForThisRequest]) {
@@ -297,7 +376,7 @@ export default {
       const sourceIP = request.headers.get("CF-Connecting-IP");
 
       console.log("Checking for decision against the IP");
-      const actionForIP = await getFromKV(env.CROWDSECCFBOUNCERNS, sourceIP);
+      const actionForIP = await getFromKVCached(env, sourceIP);
       if (actionForIP !== null) {
         return {
           sourceIP,
@@ -308,19 +387,8 @@ export default {
       }
 
       console.log("Checking for decision against the IP ranges");
-      let actionByIPRange = await getFromKV(
-        env.CROWDSECCFBOUNCERNS,
-        "IP_RANGES",
-      );
-      if (typeof actionByIPRange === "string") {
-        try {
-          actionByIPRange = JSON.parse(actionByIPRange);
-        } catch (e) {
-          console.error("Failed to parse IP_RANGES:", e);
-          actionByIPRange = null;
-        }
-      }
-      if (actionByIPRange !== null) {
+      const ipRanges = await getFromKVCached(env, "IP_RANGES", parseIPRanges);
+      if (ipRanges !== null && ipRanges.length > 0) {
         let sourceIPAddr;
         try {
           sourceIPAddr = ipaddr.parse(sourceIP);
@@ -328,9 +396,9 @@ export default {
           console.error("Failed to parse client IP for range matching:", e);
           return null;
         }
-        for (const [range, action] of Object.entries(actionByIPRange)) {
+        for (const { range, action, cidr } of ipRanges) {
           try {
-            if (sourceIPAddr.match(ipaddr.parseCIDR(range))) {
+            if (sourceIPAddr.match(cidr)) {
               return {
                 sourceIP,
                 remediationAction: action,
@@ -347,7 +415,7 @@ export default {
       // Check for decision against the AS
       if (request.cf && request.cf.asn) {
         const sourceASN = request.cf.asn.toString();
-        const actionForASN = await getFromKV(env.CROWDSECCFBOUNCERNS, sourceASN);
+        const actionForASN = await getFromKVCached(env, sourceASN);
         if (actionForASN !== null) {
           return {
             sourceIP,
@@ -361,10 +429,7 @@ export default {
       // Check for decision against the country of the request
       if (request.cf && request.cf.country) {
         const sourceCountry = request.cf.country.toLowerCase();
-        const actionForCountry = await getFromKV(
-          env.CROWDSECCFBOUNCERNS,
-          sourceCountry,
-        );
+        const actionForCountry = await getFromKVCached(env, sourceCountry);
         if (actionForCountry !== null) {
           return {
             sourceIP,
