@@ -36,6 +36,35 @@ const (
 	VarNameForBanTemplate = "BAN_TEMPLATE"
 	IpRangeKeyName        = "IP_RANGES"
 
+	// IPListQueueDBBindingName is the worker env binding name for the D1
+	// database backing the IP list sync queue. Hardcoded in the compiled
+	// worker JS; must not change without also updating the worker source.
+	IPListQueueDBBindingName = "LIST_STATE_DB"
+
+	// ipListStateTableMigration creates the single table that is the source
+	// of truth for both pending work and current IP List membership, if it
+	// doesn't already exist. `ip` is the primary key so a repeated decision
+	// for the same IP (e.g. re-seen across LAPI stream polls, or a ban that
+	// expires and is re-issued before it's processed) upserts in place
+	// rather than creating a duplicate row.
+	//
+	// list_action is one of:
+	//   'new'    - pending add, not yet pushed to any Cloudflare list
+	//   'delete' - pending removal from list_id/item_id
+	//   'listed' - currently a member of list_id (item_id is Cloudflare's id
+	//              for it there); nothing pending
+	// list_id/item_id are only populated once list_action = 'listed'.
+	ipListStateTableMigration = `CREATE TABLE IF NOT EXISTS ip_list_state (
+		ip TEXT PRIMARY KEY,
+		action TEXT NOT NULL,
+		until TEXT,
+		list_action TEXT NOT NULL,
+		list_id TEXT,
+		item_id TEXT
+	);
+	CREATE INDEX IF NOT EXISTS idx_ip_list_state_list_action ON ip_list_state(list_action);
+	CREATE INDEX IF NOT EXISTS idx_ip_list_state_list_id ON ip_list_state(list_id);`
+
 	// metricsPollLookback is how far back the AE metrics cursor reaches when
 	// the manager is freshly constructed, so the first poll covers any AE
 	// data points written between bouncer start and the first push cycle.
@@ -50,9 +79,12 @@ const (
 
 type cloudflareAPI interface {
 	Account(ctx context.Context, accountID string) (cf.Account, cf.ResultInfo, error)
+	CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error)
 	CreateTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateTurnstileWidgetParams) (cf.TurnstileWidget, error)
 	CreateWorkerRoute(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerRouteParams) (cf.WorkerRouteResponse, error)
 	CreateWorkersKVNamespace(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkersKVNamespaceParams) (cf.WorkersKVNamespaceResponse, error)
+	ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
+	QueryD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error)
 	DeleteTurnstileWidget(ctx context.Context, rc *cf.ResourceContainer, siteKey string) error
 	DeleteWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.DeleteWorkerParams) error
 	DeleteWorkerRoute(ctx context.Context, rc *cf.ResourceContainer, routeID string) (cf.WorkerRouteResponse, error)
@@ -78,6 +110,7 @@ type CloudflareAccountManager struct {
 	logger                *log.Entry
 	hasIPRangeKV          bool
 	NamespaceID           string
+	D1DatabaseID          string
 	KVPairByDecisionValue map[string]cf.WorkersKVPair
 	ipRangeKVPair         cf.WorkersKVPair
 	ActionByIPRange       map[string]string
@@ -329,10 +362,54 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 	return zg.Wait()
 }
 
+// ensureIPListStateDatabase finds the D1 database backing the IP list sync
+// queue by name, creating it if it doesn't exist yet, then runs the schema
+// migration (idempotent: CREATE TABLE IF NOT EXISTS). Sets m.D1DatabaseID.
+func (m *CloudflareAccountManager) ensureIPListStateDatabase(name string) error {
+	databases, _, err := m.api.ListD1Databases(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListD1DatabasesParams{Name: name})
+	if err != nil {
+		return fmt.Errorf("failed to list D1 databases: %w", err)
+	}
+
+	var db cf.D1Database
+	for _, candidate := range databases {
+		if candidate.Name == name {
+			db = candidate
+			break
+		}
+	}
+
+	if db.UUID == "" {
+		m.logger.Infof("Creating D1 database %s for IP list state", name)
+		db, err = m.api.CreateD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateD1DatabaseParams{Name: name})
+		if err != nil {
+			return fmt.Errorf("failed to create D1 database %s: %w", name, err)
+		}
+	}
+	m.D1DatabaseID = db.UUID
+
+	if _, err := m.api.QueryD1Database(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.QueryD1DatabaseParams{
+		DatabaseID: m.D1DatabaseID,
+		SQL:        ipListStateTableMigration,
+	}); err != nil {
+		return fmt.Errorf("failed to migrate D1 database %s: %w", name, err)
+	}
+
+	return nil
+}
+
 // DeployDecisionsSyncWorker deploys the autonomous decisions sync worker.
-// This worker runs on a cron schedule and syncs decisions from CrowdSec LAPI to Cloudflare KV.
-func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.CrowdSecConfig, cronSchedule string) error {
-	m.logger.Infof("Deploying decisions sync worker %s with cron schedule: %s", m.Worker.DecisionsSyncScriptName, cronSchedule)
+// This worker runs on a cron schedule and syncs decisions from CrowdSec LAPI
+// to exactly one target — Cloudflare KV or Cloudflare IP Lists — per
+// syncCfg.SyncToListNotKV.
+func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.CrowdSecConfig, syncCfg cfg.DecisionsSyncWorkerConfig) error {
+	m.logger.Infof("Deploying decisions sync worker %s with cron schedule: %s", m.Worker.DecisionsSyncScriptName, syncCfg.Cron)
+
+	if syncCfg.SyncToListNotKV {
+		if err := m.ensureIPListStateDatabase(syncCfg.D1DatabaseName); err != nil {
+			return fmt.Errorf("failed to set up IP list queue database: %w", err)
+		}
+	}
 
 	// Build scenario filters
 	includeScenarios := strings.Join(crowdSecConfig.IncludeScenariosContaining, ",")
@@ -348,7 +425,7 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 		"LAPI_KEY": cf.WorkerSecretTextBinding{
 			Text: crowdSecConfig.CrowdSecLAPIKey,
 		},
-		// Cloudflare API credentials for bulk KV operations
+		// Cloudflare API credentials for bulk KV/IP list operations
 		"CF_ACCOUNT_ID": cf.WorkerPlainTextBinding{
 			Text: m.AccountCfg.ID,
 		},
@@ -357,6 +434,9 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 		},
 		"CF_API_TOKEN": cf.WorkerSecretTextBinding{
 			Text: m.AccountCfg.Token,
+		},
+		"SYNC_TO_LIST_NOT_KV": cf.WorkerPlainTextBinding{
+			Text: fmt.Sprintf("%t", syncCfg.SyncToListNotKV),
 		},
 	}
 
@@ -374,6 +454,17 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 	if origins != "" {
 		bindings["ONLY_INCLUDE_ORIGINS"] = cf.WorkerPlainTextBinding{
 			Text: origins,
+		}
+	}
+	if syncCfg.SyncToListNotKV {
+		bindings["IP_LIST_PREFIX"] = cf.WorkerPlainTextBinding{
+			Text: syncCfg.IPListPrefix,
+		}
+		bindings["IP_LIST_BATCH_SIZE"] = cf.WorkerPlainTextBinding{
+			Text: fmt.Sprintf("%d", syncCfg.IPListBatchSize),
+		}
+		bindings[IPListQueueDBBindingName] = cf.WorkerD1DatabaseBinding{
+			DatabaseID: m.D1DatabaseID,
 		}
 	}
 
@@ -402,16 +493,16 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 	}
 
 	// Deploy cron trigger for the decisions sync worker
-	m.logger.Infof("Deploying cron trigger for decisions sync worker: %s", cronSchedule)
+	m.logger.Infof("Deploying cron trigger for decisions sync worker: %s", syncCfg.Cron)
 	cronTriggers, err := m.api.UpdateWorkerCronTriggers(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.UpdateWorkerCronTriggersParams{
 		ScriptName: m.Worker.DecisionsSyncScriptName,
-		Crons:      []cf.WorkerCronTrigger{{Cron: cronSchedule}},
+		Crons:      []cf.WorkerCronTrigger{{Cron: syncCfg.Cron}},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to deploy cron trigger for decisions sync worker: %w", err)
 	}
 	m.logger.Tracef("Cron triggers: %+v", cronTriggers)
-	m.logger.Infof("Successfully deployed decisions sync worker %s with cron: %s", m.Worker.DecisionsSyncScriptName, cronSchedule)
+	m.logger.Infof("Successfully deployed decisions sync worker %s with cron: %s", m.Worker.DecisionsSyncScriptName, syncCfg.Cron)
 
 	return nil
 }
