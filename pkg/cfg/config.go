@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,10 @@ var (
 const (
 	KVWorkerBindingName = "CROWDSECCFBOUNCERNS"
 	AEWorkerBindingName = "CROWDSECCFBOUNCER_AE"
+
+	// DefaultWorkerCacheTTL bounds how long a new decision can take to be
+	// enforced by a warm worker isolate, on top of KV propagation delay.
+	DefaultWorkerCacheTTL = time.Minute
 )
 
 type TurnstileConfig struct {
@@ -77,6 +82,7 @@ type CloudflareWorkerCreateParams struct {
 	AnalyticsDataset        string                     `yaml:"analytics_dataset,omitempty"`          // CF Analytics Engine dataset name for metrics
 	DecisionsSyncScriptName string                     `yaml:"decisions_sync_script_name,omitempty"` // CF worker script name; change when sharing a Cloudflare account with another bouncer instance
 	Observability           *WorkerObservabilityConfig `yaml:"observability,omitempty"`              // Workers Observability (logs + traces); nil = skip
+	CacheTTL                *time.Duration             `yaml:"cache_ttl,omitempty"`                  // How long the worker memoizes KV lookups in memory; 0 disables the cache
 }
 
 type WorkerObservabilityConfig struct {
@@ -103,6 +109,10 @@ func (w *CloudflareWorkerCreateParams) setDefaults() {
 	if w.DecisionsSyncScriptName == "" {
 		w.DecisionsSyncScriptName = "crowdsec-decisions-sync-worker"
 	}
+	if w.CacheTTL == nil {
+		ttl := DefaultWorkerCacheTTL
+		w.CacheTTL = &ttl
+	}
 }
 
 func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, id string, varActionsForZoneByDomain []byte, accountName string) cloudflare.CreateWorkerParams {
@@ -120,6 +130,11 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, i
 		"ACCOUNT_NAME": cloudflare.WorkerPlainTextBinding{
 			Text: accountName,
 		},
+	}
+	if w.CacheTTL != nil {
+		bindings["CACHE_TTL_MS"] = cloudflare.WorkerPlainTextBinding{
+			Text: strconv.FormatInt(w.CacheTTL.Milliseconds(), 10),
+		}
 	}
 	return cloudflare.CreateWorkerParams{
 		Script:             workerScript,
@@ -249,6 +264,10 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 		}
 	}
 	config.CloudflareConfig.Worker.setDefaults() // set defaults for worker
+
+	if ttl := config.CloudflareConfig.Worker.CacheTTL; *ttl < 0 {
+		return nil, fmt.Errorf("worker cache_ttl must not be negative, got %s", *ttl)
+	}
 
 	if !validAnalyticsDataset.MatchString(config.CloudflareConfig.Worker.AnalyticsDataset) {
 		return nil, fmt.Errorf("invalid analytics_dataset %q: must match %s", config.CloudflareConfig.Worker.AnalyticsDataset, validAnalyticsDataset.String())
