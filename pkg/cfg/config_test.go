@@ -305,3 +305,57 @@ func TestAnalyticsDataset_RejectsInvalidIdentifiers(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerCacheTTL(t *testing.T) {
+	tests := []struct {
+		name      string
+		workerCfg string
+		wantMs    string
+		wantErr   string
+	}{
+		{name: "default", workerCfg: "", wantMs: "60000"},
+		{name: "explicit", workerCfg: "  worker:\n    cache_ttl: 2m30s\n", wantMs: "150000"},
+		{name: "disabled", workerCfg: "  worker:\n    cache_ttl: 0s\n", wantMs: "0"},
+		{name: "negative", workerCfg: "  worker:\n    cache_ttl: -1s\n", wantErr: "cache_ttl must not be negative"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			yamlCfg := []byte(`
+crowdsec_config:
+  lapi_url: http://localhost:8080/
+  lapi_key: test-key
+  update_frequency: 10s
+cloudflare_config:
+` + tt.workerCfg + `  accounts:
+    - id: acc1
+      token: tok1
+      zones:
+        - zone_id: zone1
+          actions: ["ban"]
+          default_action: ban
+          routes_to_protect: ["*example.com/*"]
+`)
+
+			config, err := cfg.NewConfig(bytes.NewReader(yamlCfg))
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("NewConfig error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewConfig: %v", err)
+			}
+
+			params := config.CloudflareConfig.Worker.CreateWorkerParams("script", "kv-ns-id", []byte(`{}`), "acc")
+			binding, ok := params.Bindings["CACHE_TTL_MS"].(cloudflare.WorkerPlainTextBinding)
+			if !ok {
+				t.Fatalf("CACHE_TTL_MS binding is %T, want WorkerPlainTextBinding", params.Bindings["CACHE_TTL_MS"])
+			}
+			if binding.Text != tt.wantMs {
+				t.Fatalf("CACHE_TTL_MS = %q, want %q", binding.Text, tt.wantMs)
+			}
+		})
+	}
+}
