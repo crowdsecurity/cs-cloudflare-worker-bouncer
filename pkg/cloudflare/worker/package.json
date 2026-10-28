@@ -15,7 +15,7 @@
   "license": "ISC",
   "dependencies": {
     "@tsndr/cloudflare-worker-jwt": "3.2.1",
-    "cookie": "^1.0.2",
+    "cookie": "^2.0.0",
     "ipaddr.js": "2.4.0",
     "jsonwebtoken": "9.0.3",
     "node-polyfill-webpack-plugin": "4.1.0"
