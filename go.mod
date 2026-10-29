@@ -9,7 +9,7 @@ require (
 	github.com/prometheus/client_model v0.6.3
 	github.com/sirupsen/logrus v1.10.2
 	github.com/whuang8/redactrus v1.0.2
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
