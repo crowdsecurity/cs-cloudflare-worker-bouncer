@@ -301,6 +301,10 @@ func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[
 	if strings.Contains(l, "decisions_sync_script_name:") {
 		return `Decisions sync worker script name; change when running multiple bouncers on the same Cloudflare account`
 	}
+	// Exact key match: a substring check would also hit decisions_sync_script_name.
+	if strings.HasPrefix(strings.TrimSpace(l), "script_name:") {
+		return `Worker script name, also used to name the Turnstile widget; change when running multiple bouncers on the same Cloudflare account`
+	}
 	if strings.Contains(l, "decisions_sync_worker:") {
 		return `Configuration for autonomous decisions sync worker`
 	}

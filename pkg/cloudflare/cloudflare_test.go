@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -121,12 +122,18 @@ type mockCFAPI struct {
 	listWorkersKVNamespacesFn  func(context.Context, *cf.ResourceContainer, cf.ListWorkersKVNamespacesParams) ([]cf.WorkersKVNamespace, *cf.ResultInfo, error)
 	deleteWorkersKVNamespaceFn func(context.Context, *cf.ResourceContainer, string) (cf.Response, error)
 	deleteKVCalls              []string
+
+	// Turnstile widget hooks (multi-instance widget safety)
+	turnstileWidgets     []cf.TurnstileWidget
+	createdWidgetNames   []string
+	deleteWidgetSiteKeys []string
 }
 
 func (*mockCFAPI) Account(_ context.Context, _ string) (cf.Account, cf.ResultInfo, error) {
 	return cf.Account{}, cf.ResultInfo{}, nil
 }
-func (*mockCFAPI) CreateTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateTurnstileWidgetParams) (cf.TurnstileWidget, error) {
+func (m *mockCFAPI) CreateTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, params cf.CreateTurnstileWidgetParams) (cf.TurnstileWidget, error) {
+	m.createdWidgetNames = append(m.createdWidgetNames, params.Name)
 	return cf.TurnstileWidget{}, nil
 }
 func (*mockCFAPI) CreateWorkerRoute(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkerRouteParams) (cf.WorkerRouteResponse, error) {
@@ -135,7 +142,8 @@ func (*mockCFAPI) CreateWorkerRoute(_ context.Context, _ *cf.ResourceContainer, 
 func (*mockCFAPI) CreateWorkersKVNamespace(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkersKVNamespaceParams) (cf.WorkersKVNamespaceResponse, error) {
 	return cf.WorkersKVNamespaceResponse{}, nil
 }
-func (*mockCFAPI) DeleteTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, _ string) error {
+func (m *mockCFAPI) DeleteTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, siteKey string) error {
+	m.deleteWidgetSiteKeys = append(m.deleteWidgetSiteKeys, siteKey)
 	return nil
 }
 func (*mockCFAPI) DeleteWorker(_ context.Context, _ *cf.ResourceContainer, _ cf.DeleteWorkerParams) error {
@@ -154,8 +162,8 @@ func (m *mockCFAPI) DeleteWorkersKVNamespace(ctx context.Context, rc *cf.Resourc
 	}
 	return cf.Response{}, nil
 }
-func (*mockCFAPI) ListTurnstileWidgets(_ context.Context, _ *cf.ResourceContainer, _ cf.ListTurnstileWidgetParams) ([]cf.TurnstileWidget, *cf.ResultInfo, error) {
-	return nil, nil, nil
+func (m *mockCFAPI) ListTurnstileWidgets(_ context.Context, _ *cf.ResourceContainer, _ cf.ListTurnstileWidgetParams) ([]cf.TurnstileWidget, *cf.ResultInfo, error) {
+	return m.turnstileWidgets, nil, nil
 }
 func (*mockCFAPI) ListWorkerRoutes(_ context.Context, _ *cf.ResourceContainer, _ cf.ListWorkerRoutesParams) (cf.WorkerRoutesResponse, error) {
 	return cf.WorkerRoutesResponse{}, nil
@@ -706,6 +714,58 @@ func TestFindBoundKVNamespaceIDs_HandlesNotFoundError(t *testing.T) {
 
 	if len(ids) != 0 {
 		t.Errorf("expected empty result on 404, got %v", ids)
+	}
+}
+
+func TestCreateTurnstileWidgets_NameDerivedFromScriptName(t *testing.T) {
+	mock := &mockCFAPI{}
+	m := newTestManager()
+	m.api = mock
+	m.Worker.ScriptName = "bouncer-prd"
+	m.AccountCfg.ZoneConfigs = []*cfg.ZoneConfig{{Domain: "example.com", Turnstile: cfg.TurnstileConfig{Enabled: true}}}
+
+	if _, err := m.CreateTurnstileWidgets(); err != nil {
+		t.Fatalf("CreateTurnstileWidgets returned error: %v", err)
+	}
+	if !slices.Equal(mock.createdWidgetNames, []string{"bouncer-prd-widget"}) {
+		t.Errorf("created widgets %v, want [bouncer-prd-widget]", mock.createdWidgetNames)
+	}
+}
+
+func TestCleanupTurnstileWidgets_OnlyDeletesOwnWidgets(t *testing.T) {
+	widgets := []cf.TurnstileWidget{
+		{SiteKey: "default", Name: WidgetName, Domains: []string{"example.com"}},
+		{SiteKey: "prd", Name: "bouncer-prd-widget", Domains: []string{"example.com"}},
+		{SiteKey: "stg", Name: "bouncer-stg-widget", Domains: []string{"example.dev"}},
+		{SiteKey: "legacy-other-zone", Name: WidgetName, Domains: []string{"example.dev"}},
+		{SiteKey: "legacy-mixed-zones", Name: WidgetName, Domains: []string{"example.com", "example.dev"}},
+		{SiteKey: "unrelated", Name: "someone-else", Domains: []string{"example.com"}},
+	}
+	tests := []struct {
+		name       string
+		scriptName string
+		want       []string
+	}{
+		// Default script name: unchanged behaviour, every legacy-named widget goes.
+		{"default script name", "crowdsec-cloudflare-worker-bouncer", []string{"default", "legacy-other-zone", "legacy-mixed-zones"}},
+		// Custom script name: own widgets, plus legacy widgets that only cover our zones.
+		{"custom script name", "bouncer-prd", []string{"default", "prd"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockCFAPI{turnstileWidgets: widgets}
+			m := newTestManager()
+			m.api = mock
+			m.Worker.ScriptName = tt.scriptName
+			m.AccountCfg.ZoneConfigs = []*cfg.ZoneConfig{{Domain: "example.com"}}
+
+			if err := m.cleanupTurnstileWidgets(); err != nil {
+				t.Fatalf("cleanupTurnstileWidgets returned error: %v", err)
+			}
+			if !slices.Equal(mock.deleteWidgetSiteKeys, tt.want) {
+				t.Errorf("deleted %v, want %v", mock.deleteWidgetSiteKeys, tt.want)
+			}
+		})
 	}
 }
 

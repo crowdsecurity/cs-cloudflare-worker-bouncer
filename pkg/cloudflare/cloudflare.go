@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,9 @@ var workerScript string
 var decisionsSyncWorkerScript string
 
 const (
+	// WidgetName is the fixed Turnstile widget name used before widget names
+	// were derived from the worker script name. It is still what the default
+	// script name produces, see widgetName.
 	WidgetName            = "crowdsec-cloudflare-worker-bouncer-widget"
 	TurnstileConfigKey    = "TURNSTILE_CONFIG"
 	VarNameForBanTemplate = "BAN_TEMPLATE"
@@ -434,6 +438,27 @@ func (m *CloudflareAccountManager) updateMetrics() {
 	metrics.TotalKeysByAccount.WithLabelValues(m.AccountCfg.Name).Set(float64(totalKVPairs))
 }
 
+// widgetName is the Turnstile widget name of this instance. Deriving it from the
+// worker script name lets several bouncers share one Cloudflare account; the
+// default script name yields the legacy WidgetName.
+func (m *CloudflareAccountManager) widgetName() string {
+	return m.Worker.ScriptName + "-widget"
+}
+
+// ownsWidget reports whether a widget belongs to this instance: it carries this
+// instance's widget name, or the legacy WidgetName (created by an older version
+// with a custom script name) on a zone this instance manages. The bouncer only
+// creates single-domain widgets, so a legacy widget it made has one domain.
+func (m *CloudflareAccountManager) ownsWidget(widget cf.TurnstileWidget) bool {
+	if widget.Name == m.widgetName() {
+		return true
+	}
+	if widget.Name != WidgetName || len(widget.Domains) != 1 {
+		return false
+	}
+	return slices.ContainsFunc(m.AccountCfg.ZoneConfigs, func(z *cfg.ZoneConfig) bool { return z.Domain == widget.Domains[0] })
+}
+
 func (m *CloudflareAccountManager) cleanupTurnstileWidgets() error {
 	m.logger.Debug("Listing existing turnstile widgets")
 	widgets, _, err := m.api.ListTurnstileWidgets(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.ListTurnstileWidgetParams{})
@@ -444,7 +469,7 @@ func (m *CloudflareAccountManager) cleanupTurnstileWidgets() error {
 	m.logger.Debug("Done listing existing turnstile widgets")
 
 	for _, widget := range widgets {
-		if widget.Name == WidgetName {
+		if m.ownsWidget(widget) {
 			m.logger.Debugf("Deleting turnstile widget with site key %s", widget.SiteKey)
 			if err := m.api.DeleteTurnstileWidget(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), widget.SiteKey); err != nil {
 				return err
@@ -871,7 +896,7 @@ func (m *CloudflareAccountManager) CreateTurnstileWidgets() (map[string]WidgetTo
 		zoneLogger.Info(("Creating turnstile widget"))
 		widgetCreatorGrp.Go(func() error {
 			resp, err := m.api.CreateTurnstileWidget(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.CreateTurnstileWidgetParams{
-				Name:    WidgetName,
+				Name:    m.widgetName(),
 				Domains: []string{zone.Domain},
 				Mode:    zone.Turnstile.Mode,
 			})
