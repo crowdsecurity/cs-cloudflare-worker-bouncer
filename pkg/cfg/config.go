@@ -67,7 +67,7 @@ type AccountConfig struct {
 // YAML struct derived from cloudflare.CreateWorkerParams
 // https://github.com/cloudflare/cloudflare-go/blob/056b65c6e956a7119d0d89b27a659ea63b1c0506/workers.go#L24
 type CloudflareWorkerCreateParams struct {
-	ScriptName              string                     `yaml:"script_name"` // CF worker script name, also the Turnstile widget name prefix; change when sharing a Cloudflare account with another bouncer instance
+	ScriptName              string                     `yaml:"script_name"`
 	Logpush                 *bool                      `yaml:"logpush"`
 	Tags                    []string                   `yaml:"tags"`
 	CompatibilityDate       string                     `yaml:"compatibility_date"`
@@ -301,7 +301,8 @@ func lineComment(l string, zoneByID map[string]cloudflare.Zone, accountByID map[
 	if strings.Contains(l, "decisions_sync_script_name:") {
 		return `Decisions sync worker script name; change when running multiple bouncers on the same Cloudflare account`
 	}
-	if strings.Contains(l, "script_name:") {
+	// Exact key match: a substring check would also hit decisions_sync_script_name.
+	if strings.HasPrefix(strings.TrimSpace(l), "script_name:") {
 		return `Worker script name, also used to name the Turnstile widget; change when running multiple bouncers on the same Cloudflare account`
 	}
 	if strings.Contains(l, "decisions_sync_worker:") {

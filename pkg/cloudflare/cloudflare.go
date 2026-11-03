@@ -447,20 +447,16 @@ func (m *CloudflareAccountManager) widgetName() string {
 
 // ownsWidget reports whether a widget belongs to this instance: it carries this
 // instance's widget name, or the legacy WidgetName (created by an older version
-// with a custom script name) and covers only zones this instance manages.
+// with a custom script name) on a zone this instance manages. The bouncer only
+// creates single-domain widgets, so a legacy widget it made has one domain.
 func (m *CloudflareAccountManager) ownsWidget(widget cf.TurnstileWidget) bool {
 	if widget.Name == m.widgetName() {
 		return true
 	}
-	if widget.Name != WidgetName || len(widget.Domains) == 0 {
+	if widget.Name != WidgetName || len(widget.Domains) != 1 {
 		return false
 	}
-	for _, domain := range widget.Domains {
-		if !slices.ContainsFunc(m.AccountCfg.ZoneConfigs, func(z *cfg.ZoneConfig) bool { return z.Domain == domain }) {
-			return false
-		}
-	}
-	return true
+	return slices.ContainsFunc(m.AccountCfg.ZoneConfigs, func(z *cfg.ZoneConfig) bool { return z.Domain == widget.Domains[0] })
 }
 
 func (m *CloudflareAccountManager) cleanupTurnstileWidgets() error {

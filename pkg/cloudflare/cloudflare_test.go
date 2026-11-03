@@ -201,7 +201,6 @@ func (*mockCFAPI) UpdateWorkerCronTriggers(_ context.Context, _ *cf.ResourceCont
 func (*mockCFAPI) WriteWorkersKVEntries(_ context.Context, _ *cf.ResourceContainer, _ cf.WriteWorkersKVEntriesParams) (cf.Response, error) {
 	return cf.Response{}, nil
 }
-
 // ============================================================
 // Group 1: queryAnalyticsEngine
 // ============================================================
