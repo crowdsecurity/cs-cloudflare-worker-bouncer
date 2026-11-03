@@ -15,13 +15,13 @@ const SYNC_LOCK_TTL_SECONDS = 300;
 const SUPPORTED_SCOPES = ['ip', 'range', 'as', 'country'];
 
 /**
- * Check if this is the first fetch by looking for the WARMED_UP flag in KV
+ * Check if the cache needs to be warmed up by looking for the WARMED_UP flag in KV
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- * @returns {Promise<boolean>} True if this is the first fetch
+ * @returns {Promise<boolean>} True if the cache needs to be warmed up (WARMED_UP is not exactly 'true')
  */
-export async function isFirstFetch(kvNamespace) {
+export async function needWarmUp(kvNamespace) {
 	const warmedUpFlag = await kvNamespace.get(WARMED_UP_KEY);
-	return !warmedUpFlag;
+	return warmedUpFlag !== 'true';
 }
 
 /**
@@ -189,13 +189,13 @@ export async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 		throw new Error(`LAPI request failed with status ${response.status}: ${errorText}`);
 	}
 
-	// Handle HTTP 204 No Content (LAPI has no decisions - need to delete all from KV)
+	// Handle eventual HTTP 204 No Content 
+	// it used to delete all, but we don't want that anymore
 	if (response.status === 204) {
-		logger.info('LAPI returned 204 No Content: LAPI has no decisions, will clear KV');
+		logger.warn('LAPI returned 204 No Content: not doing anything');
 		return {
 			new: [],
 			deleted: [],
-			deleteAll: true, // Signal to main sync logic to reset KV and exit
 		};
 	}
 
