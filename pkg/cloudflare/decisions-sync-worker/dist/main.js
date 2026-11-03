@@ -1943,12 +1943,17 @@ async function syncToIpListsInner(env, decisions) {
 		const deleteIps = new Set(toDelete.map((d) => d.ip));
 
 		const strategy = chooseListUpdateStrategy(currentSize(listId), toAdd.length, toDelete.length);
-		
+		// tweak to try to dodge some annoying CloudFlare rate limiting opacity
+		const performAddToListFirst = new Date().getUTCDate() % 2 === 0;
+
 		const strategyLabel = strategy === 'put' ? 'full replace' : 'add/remove';
 		logger.info(`Updating IP list ${listName} via ${strategyLabel}...`, {
 			list: listName,
 			added: toAdd.length,
 			removed: toDelete.length,
+			// Diagnostic only (see post-delete branch below): which op ran
+			// first this tick, to check for correlation with starved adds.
+			order: strategy === 'put' ? 'n/a' : performAddToListFirst ? 'add-then-delete' : 'delete-then-add',
 		});
 
 		/** @type {Map<string, string>} ip -> item id, for every row this tick confirms as listed */
@@ -1960,24 +1965,39 @@ async function syncToIpListsInner(env, decisions) {
 				const finalIps = [...keptIps, ...toAdd.map((a) => a.ip)];
 				itemIdByIp = await replaceListItems(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, listId, finalIps);
 			} else {
-				// Delete then Add
+				// Delete and add, order alternated by day parity — a diagnostic
+				// for suspected Cloudflare rate-limit starvation: if a delete
+				// eats the tick's rate-limit budget (or the account's single
+				// pending-bulk-operation slot) before the add runs, adds never
+				// happen on a day where deletes always go first. Alternating
+				// lets us see whether the order correlates with that pattern.
 				itemIdByIp = new Map();
-				if (toDelete.length > 0) {
-					await removeListItems(
-						env.CF_ACCOUNT_ID,
-						env.CF_API_TOKEN,
-						listId,
-						toDelete.map((t) => t.itemId)
-					);
-				}
-				if (toAdd.length > 0) {
-					const added = await addListItems(
-						env.CF_ACCOUNT_ID,
-						env.CF_API_TOKEN,
-						listId,
-						toAdd.map((a) => a.ip)
-					);
-					itemIdByIp = added;
+				const doDelete = async () => {
+					if (toDelete.length > 0) {
+						await removeListItems(
+							env.CF_ACCOUNT_ID,
+							env.CF_API_TOKEN,
+							listId,
+							toDelete.map((t) => t.itemId)
+						);
+					}
+				};
+				const doAdd = async () => {
+					if (toAdd.length > 0) {
+						itemIdByIp = await addListItems(
+							env.CF_ACCOUNT_ID,
+							env.CF_API_TOKEN,
+							listId,
+							toAdd.map((a) => a.ip)
+						);
+					}
+				};
+				if (performAddToListFirst) {
+					await doAdd();
+					await doDelete();
+				} else {
+					await doDelete();
+					await doAdd();
 				}
 			}
 		} catch (e) {
