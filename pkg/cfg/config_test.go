@@ -91,6 +91,87 @@ func TestCreateWorkerParams_AccountNameBinding(t *testing.T) {
 	}
 }
 
+func TestSetDefaults_DecisionsSyncWorker(t *testing.T) {
+	yamlCfg := []byte(`
+crowdsec_config:
+  lapi_url: http://localhost:8080/
+  lapi_key: test-key
+  update_frequency: 10s
+cloudflare_config:
+  accounts:
+    - id: acc1
+      token: tok1
+      zones:
+        - zone_id: zone1
+          actions: ["ban"]
+          default_action: ban
+          routes_to_protect: ["*example.com/*"]
+`)
+
+	config, err := cfg.NewConfig(bytes.NewReader(yamlCfg))
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+
+	syncCfg := config.CloudflareConfig.DecisionsSyncWorker
+
+	if syncCfg.SyncToListNotKV {
+		t.Fatalf("SyncToListNotKV = %v, want false", syncCfg.SyncToListNotKV)
+	}
+	if syncCfg.IPListPrefix != "crowdsec_" {
+		t.Fatalf("IPListPrefix = %q, want %q", syncCfg.IPListPrefix, "crowdsec_")
+	}
+	if syncCfg.D1DatabaseName != "crowdsec_ip_list_state" {
+		t.Fatalf("D1DatabaseName = %q, want %q", syncCfg.D1DatabaseName, "crowdsec_ip_list_state")
+	}
+	if syncCfg.IPListBatchSize != 1000 {
+		t.Fatalf("IPListBatchSize = %d, want %d", syncCfg.IPListBatchSize, 1000)
+	}
+}
+
+func TestSetDefaults_DecisionsSyncWorker_ExplicitValuesPreserved(t *testing.T) {
+	yamlCfg := []byte(`
+crowdsec_config:
+  lapi_url: http://localhost:8080/
+  lapi_key: test-key
+  update_frequency: 10s
+cloudflare_config:
+  decisions_sync_worker:
+    sync_to_list_not_kv: true
+    ip_list_prefix: myprefix_
+    d1_database_name: my_list_state_db
+    ip_list_batch_size: 2000
+  accounts:
+    - id: acc1
+      token: tok1
+      zones:
+        - zone_id: zone1
+          actions: ["ban"]
+          default_action: ban
+          routes_to_protect: ["*example.com/*"]
+`)
+
+	config, err := cfg.NewConfig(bytes.NewReader(yamlCfg))
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+
+	syncCfg := config.CloudflareConfig.DecisionsSyncWorker
+
+	if !syncCfg.SyncToListNotKV {
+		t.Fatalf("SyncToListNotKV = %v, want true", syncCfg.SyncToListNotKV)
+	}
+	if syncCfg.IPListPrefix != "myprefix_" {
+		t.Fatalf("IPListPrefix = %q, want %q", syncCfg.IPListPrefix, "myprefix_")
+	}
+	if syncCfg.D1DatabaseName != "my_list_state_db" {
+		t.Fatalf("D1DatabaseName = %q, want %q", syncCfg.D1DatabaseName, "my_list_state_db")
+	}
+	if syncCfg.IPListBatchSize != 2000 {
+		t.Fatalf("IPListBatchSize = %d, want %d", syncCfg.IPListBatchSize, 2000)
+	}
+}
+
 func TestSetDefaults_AnalyticsDataset(t *testing.T) {
 	yamlCfg := []byte(`
 crowdsec_config:

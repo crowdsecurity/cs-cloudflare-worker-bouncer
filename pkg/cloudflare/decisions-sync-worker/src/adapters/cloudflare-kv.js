@@ -239,6 +239,14 @@ export async function shouldReset(kvNamespace) {
 }
 
 /**
+ * Clear the RESET state in KV
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ */
+export async function clearResetFlag(kvNamespace) {
+	await kvNamespace.put(RESET_KEY, 'false');
+}
+
+/**
  * List all keys in KV namespace using Cloudflare API
  * @param {string} accountId - Cloudflare account ID
  * @param {string} namespaceId - KV namespace ID
@@ -289,7 +297,7 @@ export async function listAllKeys(accountId, namespaceId, apiToken) {
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace (for direct operations)
  * @returns {Promise<void>}
  */
-export async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) {
+export async function resetAllDecisionsInKV(accountId, namespaceId, apiToken, kvNamespace) {
 	logger.info('Starting KV reset: deleting all decision keys...');
 
 	// Step 1: List all keys in KV
@@ -306,10 +314,6 @@ export async function resetAllDecisions(accountId, namespaceId, apiToken, kvName
 	if (keysToDelete.length > 0) {
 		await batchDeleteStringBasedDecisions(accountId, namespaceId, apiToken, keysToDelete);
 	}
-
-	// Step 4: Set RESET to false
-	await kvNamespace.put(RESET_KEY, 'false');
-	logger.info('RESET key set to false');
 
 	logger.info('KV reset completed successfully');
 }
