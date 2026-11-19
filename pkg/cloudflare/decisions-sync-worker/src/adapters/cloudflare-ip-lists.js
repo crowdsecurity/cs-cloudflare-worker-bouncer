@@ -441,20 +441,15 @@ export async function removeListItems(accountId, apiToken, listId, itemIds) {
 }
 
 /**
- * Replace a list's entire membership in one request (removes everything not
- * in `ips`, adds everything in `ips` that isn't already there), and poll the
- * resulting bulk operation until it completes. One request either way, but
- * every item in `ips` counts against Cloudflare's item-modifications quota —
- * unlike addListItems/removeListItems, which only count the actual delta —
- * so callers should only reach for this when the full list is cheaper than
- * the delta (see chooseListUpdateStrategy).
+ * PUT a list's full desired membership and wait for the resulting bulk
+ * operation to complete. Shared by replaceListItems (D1 mode, needs the
+ * itemIds back) and replaceListItemsNoResolve (D1-bypass mode, doesn't).
  * @param {string} accountId
  * @param {string} apiToken
  * @param {string} listId
- * @param {string[]} ips - the list's full desired membership after this call
- * @returns {Promise<Map<string, string>>} ip -> Cloudflare item id, for every item in `ips`
+ * @param {string[]} ips
  */
-export async function replaceListItems(accountId, apiToken, listId, ips) {
+async function putListItems(accountId, apiToken, listId, ips) {
 	const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists/${listId}/items`;
 
 	const response = await trackedFetch('replaceListItems', url, {
@@ -472,8 +467,40 @@ export async function replaceListItems(accountId, apiToken, listId, ips) {
 	if (operationId) {
 		await pollBulkOperation(accountId, apiToken, operationId);
 	}
+}
 
+/**
+ * Replace a list's entire membership in one request (removes everything not
+ * in `ips`, adds everything in `ips` that isn't already there), and poll the
+ * resulting bulk operation until it completes. One request either way, but
+ * every item in `ips` counts against Cloudflare's item-modifications quota —
+ * unlike addListItems/removeListItems, which only count the actual delta —
+ * so callers should only reach for this when the full list is cheaper than
+ * the delta (see chooseListUpdateStrategy).
+ * @param {string} accountId
+ * @param {string} apiToken
+ * @param {string} listId
+ * @param {string[]} ips - the list's full desired membership after this call
+ * @returns {Promise<Map<string, string>>} ip -> Cloudflare item id, for every item in `ips`
+ */
+export async function replaceListItems(accountId, apiToken, listId, ips) {
+	await putListItems(accountId, apiToken, listId, ips);
 	return resolveItemIds(accountId, apiToken, listId, ips);
+}
+
+/**
+ * Same PUT (full replace) as replaceListItems, but skips resolving itemIds
+ * for the result — for the D1-bypass sync mode, which never needs them (it
+ * never deletes by id; every tick just PUTs the full desired set again). On
+ * a large list, resolveItemIds would otherwise page through the entire list
+ * via GET just to build a map nothing uses — pure waste at that point.
+ * @param {string} accountId
+ * @param {string} apiToken
+ * @param {string} listId
+ * @param {string[]} ips - the list's full desired membership after this call
+ */
+export async function replaceListItemsNoResolve(accountId, apiToken, listId, ips) {
+	await putListItems(accountId, apiToken, listId, ips);
 }
 
 /**

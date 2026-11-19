@@ -72,9 +72,29 @@ export interface CrowdSecEnv {
 	IP_LIST_PREFIX?: string;
 
 	/**
+	 * Selects how SYNC_TO_LIST_NOT_KV mode tracks list membership:
+	 * unset/any value other than "true" (the default) bypasses D1 entirely —
+	 * every tick pulls the full decision set from LAPI (startup=true,
+	 * always) and PUTs it wholesale into the single `{IP_LIST_PREFIX}00`
+	 * list, replacing its contents outright. Simpler and self-healing (every
+	 * tick is authoritative, nothing to desync), but each tick's Cloudflare
+	 * request body scales with the total number of active decisions, not
+	 * just what changed, and there is no pacing/sharding — set IP_LIST_PREFIX
+	 * such that this resolves to one list only, and decisions beyond
+	 * IP_LIST_MAX_ITEMS_PER_LIST are truncated (logged, not paced in over
+	 * later ticks). "true" uses the original D1-backed incremental mode:
+	 * pending adds/deletes tracked in `ip_list_state`, paced via
+	 * IP_LIST_BATCH_SIZE, packed across as many lists as needed.
+	 * @optional
+	 * @default "false"
+	 */
+	USE_D1_FOR_L3_MAPPING?: string;
+
+	/**
 	 * D1 database holding IP list state (a single `ip_list_state` table:
 	 * pending work and current Cloudflare IP List membership, keyed by ip).
-	 * Required when SYNC_TO_LIST_NOT_KV is "true".
+	 * Required when SYNC_TO_LIST_NOT_KV is "true" AND USE_D1_FOR_L3_MAPPING
+	 * is "true". Not used in the default D1-bypass mode.
 	 */
 	LIST_STATE_DB?: D1Database;
 

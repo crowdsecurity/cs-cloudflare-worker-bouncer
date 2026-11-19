@@ -24,7 +24,7 @@ import {
 	resetAllDecisionsInKV,
 	clearResetFlag,
 } from './adapters/cloudflare-kv.js';
-import { planUpserts, planAdds } from './core/ip-list-processor.js';
+import { planUpserts, planAdds, filterIpListScopes } from './core/ip-list-processor.js';
 import {
 	listManagedIpLists,
 	upsertDeletes,
@@ -39,6 +39,7 @@ import {
 	addListItems,
 	removeListItems,
 	replaceListItems,
+	replaceListItemsNoResolve,
 	chooseListUpdateStrategy,
 	getIpListBackoffUntil,
 	setIpListBackoff,
@@ -73,6 +74,11 @@ async function scheduled(event, env, _ctx) {
 		// Logic variables to make code more readable along the way
 		const syncToKvEnabled = !syncToListsMode;
 		const syncToIpListsEnabled = syncToListsMode;
+		// Within IP-list mode, USE_D1_FOR_L3_MAPPING picks between the D1-backed
+		// incremental/paced sync (true) and the default D1-bypass mode: always
+		// a full LAPI startup pull, PUT wholesale into one list, no D1 at all.
+		const useD1ForL3Mapping = syncToIpListsEnabled && env.USE_D1_FOR_L3_MAPPING === 'true';
+		const syncToIpListsDirectEnabled = syncToIpListsEnabled && !useD1ForL3Mapping;
 
 		// Validate required environment variables
 		if (!env.LAPI_URL) {
@@ -102,8 +108,8 @@ async function scheduled(event, env, _ctx) {
 			return;
 		}
 
-		if (syncToIpListsEnabled && !env.LIST_STATE_DB) {
-			logger.error('LIST_STATE_DB D1 database is not bound (required when syncing to IP Lists)');
+		if (useD1ForL3Mapping && !env.LIST_STATE_DB) {
+			logger.error('LIST_STATE_DB D1 database is not bound (required when USE_D1_FOR_L3_MAPPING is "true")');
 			return;
 		}
 
@@ -122,8 +128,10 @@ async function scheduled(event, env, _ctx) {
 		}
 
 		try {
-			// If D1 is out of its daily write-row quota, nothing in IP-list mode can proceed 
-			if (syncToIpListsEnabled) {
+			// If D1 is out of its daily write-row quota, nothing in D1-backed
+			// IP-list mode can proceed. Irrelevant in the default D1-bypass
+			// mode, which never touches D1.
+			if (useD1ForL3Mapping) {
 				const d1BackoffUntil = await getD1BackoffUntil(env.CROWDSECCFBOUNCERNS);
 				if (d1BackoffUntil && d1BackoffUntil > new Date()) {
 					logger.warn('Skipping sync entirely: D1 daily write-row quota exceeded, waiting for reset', {
@@ -133,8 +141,12 @@ async function scheduled(event, env, _ctx) {
 				}
 			}
 
-			// Determine if this is the first fetch
-			const needStartUpFetch = await needWarmUp(env.CROWDSECCFBOUNCERNS);
+			// Determine if this is the first fetch. The D1-bypass IP-list mode
+			// has no warmed/incremental concept at all — every tick is already
+			// a full, authoritative pull, so it always forces startup=true
+			// without touching the WARMED_UP flag (needWarmUp/markAsWarmed),
+			// which stays meaningful only for KV mode and the D1-backed mode.
+			const needStartUpFetch = syncToIpListsDirectEnabled ? true : await needWarmUp(env.CROWDSECCFBOUNCERNS);
 			logger.info('Determined fetch mode', { startup: needStartUpFetch });
 
 			// Check if reset is requested
@@ -150,7 +162,11 @@ async function scheduled(event, env, _ctx) {
 					env.CROWDSECCFBOUNCERNS
 				);
 			}
-			if ((resetRequested) && syncToIpListsEnabled) {
+			// D1-backed mode only: the D1-bypass mode has nothing to clear —
+			// every tick already PUTs this tick's full LAPI pull as the list's
+			// entire contents, which already supersedes whatever RESET would
+			// have cleared.
+			if ((resetRequested) && useD1ForL3Mapping) {
 				logger.info('Clearing all managed IP lists and the sync queue before fresh sync...');
 				await clearAllIpLists(env);
 			}
@@ -180,9 +196,9 @@ async function scheduled(event, env, _ctx) {
 				deletedDecisions: decisions.deleted.length,
 			});
 
-			// Mark warmed as soon as the LAPI pull itself succeeded to avoid pulling the full list every-time
-			// If there is an issue we'll have to check manually and reset
-			if (needStartUpFetch) {
+			// Mark warmed as soon as the LAPI pull itself succeeded to avoid pulling the full list every-time.
+			// Skipped in the D1-bypass IP-list mode: WARMED_UP has no meaning there (see above).
+			if (needStartUpFetch && !syncToIpListsDirectEnabled) {
 				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
 				logger.info('LAPI startup pull complete');
 			}
@@ -192,9 +208,12 @@ async function scheduled(event, env, _ctx) {
 				await syncToKv(env, decisions, needStartUpFetch);
 				// syncToKv throws on failure, so reaching this point means it succeeded
 				syncSucceeded = true;
-			} else {
+			} else if (useD1ForL3Mapping) {
 				// Partial sync possible: in D1 but not in lists yet
 				syncSucceeded = await syncToIpLists(env, decisions);
+			} else {
+				// D1-bypass mode: one PUT, all-or-nothing this tick.
+				syncSucceeded = await syncToIpListsDirect(env, decisions);
 			}
 
 			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -298,7 +317,91 @@ async function syncToKv(env, decisions, needStartUpFetch) {
 }
 
 /**
- * Sync decisions to Cloudflare IP Lists (used for L3/4 bouncing). 
+ * Sync decisions to a single Cloudflare IP List by brute force: every tick is
+ * already a full LAPI startup pull (see scheduled()), so this just PUTs that
+ * whole set as the list's entire contents — no D1, no diffing, no per-list
+ * packing. Self-healing (every tick is authoritative on its own) but the
+ * request body scales with the total active decision count every tick, not
+ * with what changed, and anything beyond maxItemsPerList is truncated rather
+ * than spread across more lists or paced in over later ticks.
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @param {import('./types.js').DecisionStreamResponse} decisions
+ * @returns {Promise<boolean>} true unless this tick failed outright (rate
+ *   limit or error) — see handleIpListError.
+ */
+async function syncToIpListsDirect(env, decisions) {
+	logger.info('Starting direct (D1-bypass) IP list sync...');
+	resetRequestCounts();
+
+	const prefix = env.IP_LIST_PREFIX || DEFAULT_IP_LIST_PREFIX;
+	const maxItemsPerList = env.IP_LIST_MAX_ITEMS_PER_LIST ? parseInt(env.IP_LIST_MAX_ITEMS_PER_LIST, 10) : MAX_ITEMS_PER_LIST;
+
+	try {
+		// Check if we're currently backing off due to a previous rate limit.
+		const backoffUntil = await getIpListBackoffUntil(env.CROWDSECCFBOUNCERNS);
+		if (backoffUntil && backoffUntil > new Date()) {
+			logger.warn('Skipping direct IP list update: backing off after a previous rate limit', {
+				backoffUntil: backoffUntil.toISOString(),
+			});
+			return false;
+		}
+
+		// decisions.deleted is irrelevant here: a startup pull's decisions.new
+		// already IS the full desired set, so there's nothing to subtract.
+		// Dedupe: LAPI can emit multiple decisions for the same IP (different
+		// scenarios/origins), which would otherwise inflate the list and the
+		// truncation count for no reason.
+		const allIps = [...new Set(filterIpListScopes(decisions.new).map((d) => d.value))];
+
+		const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, prefix);
+		if (lists.length === 0) {
+			logger.warn(`No IP List found with prefix "${prefix}"; skipping direct IP list sync`);
+			return true;
+		}
+		if (lists.length > 1) {
+			logger.warn(
+				`Direct (D1-bypass) mode manages exactly one list but found ${lists.length} matching prefix "${prefix}"; using the first (name-sorted) and leaving the rest untouched`,
+				{ lists: lists.map((l) => l.name) }
+			);
+		}
+		const list = lists[0];
+
+		let ipsToPush = allIps;
+		if (allIps.length > maxItemsPerList) {
+			const truncatedCount = allIps.length - maxItemsPerList;
+			logger.error(
+				`Active decisions (${allIps.length}) exceed IP_LIST_MAX_ITEMS_PER_LIST (${maxItemsPerList}); truncating — ${truncatedCount} IP(s) will NOT be in list ${list.name} this tick`,
+				{ list: list.name, totalDecisions: allIps.length, maxItemsPerList, truncatedCount }
+			);
+			ipsToPush = allIps.slice(0, maxItemsPerList);
+		}
+
+		logger.info(`Replacing IP list ${list.name} entirely...`, {
+			list: list.name,
+			size: ipsToPush.length,
+			max: maxItemsPerList,
+		});
+		await replaceListItemsNoResolve(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, list.id, ipsToPush);
+
+		// Made it through without hitting a rate limit; clear any stale
+		// backoff from a previous run so the next tick isn't held back
+		// unnecessarily.
+		await clearIpListBackoff(env.CROWDSECCFBOUNCERNS);
+
+		logger.info('Direct IP list sync completed successfully', { list: list.name, size: ipsToPush.length });
+		return true;
+	} catch (e) {
+		return handleIpListError(env, e, 'replacing the IP list directly (D1-bypass mode)');
+	} finally {
+		logger.info('Direct IP list sync request tally', {
+			cloudflareApiRequests: requestCounts.cloudflareApi,
+			cloudflareApiByEndpoint: { ...requestCounts.cloudflareApiByEndpoint },
+		});
+	}
+}
+
+/**
+ * Sync decisions to Cloudflare IP Lists (used for L3/4 bouncing).
  *
  * The D1 table is the source of truth for pending work and current list content index
  *
