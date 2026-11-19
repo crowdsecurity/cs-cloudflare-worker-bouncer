@@ -49,6 +49,19 @@ export interface CrowdSecEnv {
 	CROWDSECCFBOUNCERNS: KVNamespace;
 
 	/**
+	 * When "true", bypasses every other sync mode entirely: each tick does a
+	 * full LAPI startup pull and PUTs only the first 10 ip/range-scoped IPs
+	 * into a fixed list named "crowdsec_test" (must already exist — this mode
+	 * never creates it), logging how many were put successfully. For
+	 * sanity-checking CF_ACCOUNT_ID/CF_API_TOKEN access against a small,
+	 * non-traffic-facing list without risking real lists. Takes priority over
+	 * SYNC_TO_LIST_NOT_KV and USE_D1_FOR_L3_MAPPING.
+	 * @optional
+	 * @default "false"
+	 */
+	TEST_MODE?: string;
+
+	/**
 	 * Selects which single sync target the worker uses: unset/any value other
 	 * than the literal string "true" means KV mode (decisions are synced to
 	 * the Worker's KV store, the L7 bouncer worker's data source); "true"

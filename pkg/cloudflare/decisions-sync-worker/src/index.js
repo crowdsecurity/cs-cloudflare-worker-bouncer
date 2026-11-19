@@ -56,6 +56,8 @@ import {
 
 const DEFAULT_IP_LIST_PREFIX = 'crowdsec_';
 const DEFAULT_IP_LIST_BATCH_SIZE = 1000;
+const TEST_MODE_LIST_NAME = 'crowdsec_test';
+const TEST_MODE_IP_COUNT = 10;
 
 /**
  * Scheduled handler
@@ -69,11 +71,18 @@ async function scheduled(event, env, _ctx) {
 	logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
 
 	try {
+		// TEST_MODE is independent of and takes priority over every other sync
+		// mode: it always does a full startup pull and PUTs only the first
+		// TEST_MODE_IP_COUNT ip/range IPs into the fixed TEST_MODE_LIST_NAME
+		// list, for sanity-checking credentials/API access against a small,
+		// non-traffic-facing list.
+		const testModeEnabled = env.TEST_MODE === 'true';
+
 		// By Default, the worker syncs to KV unless explicitly configured to sync to IP Lists (SYNC_TO_LIST_NOT_KV=true).
 		const syncToListsMode = env.SYNC_TO_LIST_NOT_KV === 'true';
 		// Logic variables to make code more readable along the way
-		const syncToKvEnabled = !syncToListsMode;
-		const syncToIpListsEnabled = syncToListsMode;
+		const syncToKvEnabled = !testModeEnabled && !syncToListsMode;
+		const syncToIpListsEnabled = !testModeEnabled && syncToListsMode;
 		// Within IP-list mode, USE_D1_FOR_L3_MAPPING picks between the D1-backed
 		// incremental/paced sync (true) and the default D1-bypass mode: always
 		// a full LAPI startup pull, PUT wholesale into one list, no D1 at all.
@@ -142,11 +151,13 @@ async function scheduled(event, env, _ctx) {
 			}
 
 			// Determine if this is the first fetch. The D1-bypass IP-list mode
-			// has no warmed/incremental concept at all — every tick is already
-			// a full, authoritative pull, so it always forces startup=true
-			// without touching the WARMED_UP flag (needWarmUp/markAsWarmed),
-			// which stays meaningful only for KV mode and the D1-backed mode.
-			const needStartUpFetch = syncToIpListsDirectEnabled ? true : await needWarmUp(env.CROWDSECCFBOUNCERNS);
+			// and TEST_MODE have no warmed/incremental concept at all — every
+			// tick is already a full, authoritative pull, so they always force
+			// startup=true without touching the WARMED_UP flag
+			// (needWarmUp/markAsWarmed), which stays meaningful only for KV
+			// mode and the D1-backed mode.
+			const needStartUpFetch =
+				testModeEnabled || syncToIpListsDirectEnabled ? true : await needWarmUp(env.CROWDSECCFBOUNCERNS);
 			logger.info('Determined fetch mode', { startup: needStartUpFetch });
 
 			// Check if reset is requested
@@ -197,14 +208,16 @@ async function scheduled(event, env, _ctx) {
 			});
 
 			// Mark warmed as soon as the LAPI pull itself succeeded to avoid pulling the full list every-time.
-			// Skipped in the D1-bypass IP-list mode: WARMED_UP has no meaning there (see above).
-			if (needStartUpFetch && !syncToIpListsDirectEnabled) {
+			// Skipped in TEST_MODE and the D1-bypass IP-list mode: WARMED_UP has no meaning there (see above).
+			if (needStartUpFetch && !testModeEnabled && !syncToIpListsDirectEnabled) {
 				await markAsWarmed(env.CROWDSECCFBOUNCERNS);
 				logger.info('LAPI startup pull complete');
 			}
 
 			let syncSucceeded;
-			if (syncToKvEnabled) {
+			if (testModeEnabled) {
+				syncSucceeded = await runTestModeSync(env, decisions);
+			} else if (syncToKvEnabled) {
 				await syncToKv(env, decisions, needStartUpFetch);
 				// syncToKv throws on failure, so reaching this point means it succeeded
 				syncSucceeded = true;
@@ -394,6 +407,47 @@ async function syncToIpListsDirect(env, decisions) {
 		return handleIpListError(env, e, 'replacing the IP list directly (D1-bypass mode)');
 	} finally {
 		logger.info('Direct IP list sync request tally', {
+			cloudflareApiRequests: requestCounts.cloudflareApi,
+			cloudflareApiByEndpoint: { ...requestCounts.cloudflareApiByEndpoint },
+		});
+	}
+}
+
+/**
+ * Test mode: pulls the full decision set (startup=true, done by the caller)
+ * and PUTs only the first TEST_MODE_IP_COUNT ip/range-scoped IPs into the
+ * fixed TEST_MODE_LIST_NAME list, bypassing D1 and every other sync mode.
+ * For poking a known-small, known list to sanity check credentials/API
+ * access without touching real traffic-facing lists.
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @param {import('./types.js').DecisionStreamResponse} decisions
+ * @returns {Promise<boolean>}
+ */
+async function runTestModeSync(env, decisions) {
+	logger.info(`Starting test mode sync: PUTting up to ${TEST_MODE_IP_COUNT} IP(s) into ${TEST_MODE_LIST_NAME}...`);
+	resetRequestCounts();
+
+	try {
+		const ips = [...new Set(filterIpListScopes(decisions.new).map((d) => d.value))].slice(0, TEST_MODE_IP_COUNT);
+
+		const lists = await listManagedIpLists(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, TEST_MODE_LIST_NAME);
+		const list = lists.find((l) => l.name === TEST_MODE_LIST_NAME);
+		if (!list) {
+			logger.error(`Test mode list "${TEST_MODE_LIST_NAME}" not found; create it manually first`);
+			return false;
+		}
+
+		await replaceListItemsNoResolve(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, list.id, ips);
+		logger.info(`Test mode: successfully put ${ips.length} IP(s) into ${TEST_MODE_LIST_NAME}`, {
+			list: TEST_MODE_LIST_NAME,
+			count: ips.length,
+			ips,
+		});
+		return true;
+	} catch (e) {
+		return handleIpListError(env, e, `test mode PUT into ${TEST_MODE_LIST_NAME}`);
+	} finally {
+		logger.info('Test mode sync request tally', {
 			cloudflareApiRequests: requestCounts.cloudflareApi,
 			cloudflareApiByEndpoint: { ...requestCounts.cloudflareApiByEndpoint },
 		});
