@@ -2068,8 +2068,30 @@ async function syncToIpListsInner(env, decisions) {
 	for (const listId of touchedListIds) {
 		const listName = listNameById.get(listId) ?? listId;
 		const toDelete = deletesByList.get(listId) ?? [];
-		const toAdd = addsByList.get(listId) ?? [];
 		const deleteIps = new Set(toDelete.map((d) => d.ip));
+
+		// planAdds sized this against the D1 snapshot of the list, which can
+		// undercount the real Cloudflare list (e.g. after a past D1 write
+		// failed following a confirmed Cloudflare add/replace — see the
+		// out-of-sync warnings above and below). Reclamp against Cloudflare's
+		// own live count so a stale/undercounting D1 can never push the real
+		// list over maxItemsPerList; any add that doesn't fit is deferred
+		// (left 'new' in the queue) rather than dropped.
+		let toAdd = addsByList.get(listId) ?? [];
+		const cloudflareSizeAfterDeletes = Math.max(0, (numItemsById.get(listId) ?? 0) - toDelete.length);
+		const cloudflareAvailable = Math.max(0, maxItemsPerList - cloudflareSizeAfterDeletes);
+		if (toAdd.length > cloudflareAvailable) {
+			logger.warn(
+				`List ${listName}'s D1 room estimate disagreed with Cloudflare's live count; clamping adds to avoid exceeding maxItemsPerList`,
+				{
+					list: listName,
+					planned: toAdd.length,
+					cloudflareAvailable,
+					deferred: toAdd.length - cloudflareAvailable,
+				}
+			);
+			toAdd = toAdd.slice(0, cloudflareAvailable);
+		}
 
 		const strategy = chooseListUpdateStrategy(currentSize(listId), toAdd.length, toDelete.length);
 		// tweak to try to dodge some annoying CloudFlare rate limiting opacity
