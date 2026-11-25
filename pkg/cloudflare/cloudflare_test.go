@@ -124,11 +124,6 @@ type mockCFAPI struct {
 
 	uploadWorkerFn   func(context.Context, *cf.ResourceContainer, cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
 	uploadWorkerCall *cf.CreateWorkerParams
-
-	listD1DatabasesFn  func(context.Context, *cf.ResourceContainer, cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error)
-	createD1DatabaseFn func(context.Context, *cf.ResourceContainer, cf.CreateD1DatabaseParams) (cf.D1Database, error)
-	queryD1DatabaseFn  func(context.Context, *cf.ResourceContainer, cf.QueryD1DatabaseParams) ([]cf.D1Result, error)
-	d1CallsMade        bool
 }
 
 func (*mockCFAPI) Account(_ context.Context, _ string) (cf.Account, cf.ResultInfo, error) {
@@ -136,27 +131,6 @@ func (*mockCFAPI) Account(_ context.Context, _ string) (cf.Account, cf.ResultInf
 }
 func (*mockCFAPI) CreateTurnstileWidget(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateTurnstileWidgetParams) (cf.TurnstileWidget, error) {
 	return cf.TurnstileWidget{}, nil
-}
-func (m *mockCFAPI) CreateD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateD1DatabaseParams) (cf.D1Database, error) {
-	m.d1CallsMade = true
-	if m.createD1DatabaseFn != nil {
-		return m.createD1DatabaseFn(ctx, rc, params)
-	}
-	return cf.D1Database{Name: params.Name, UUID: "test-d1-database-id"}, nil
-}
-func (m *mockCFAPI) ListD1Databases(ctx context.Context, rc *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
-	m.d1CallsMade = true
-	if m.listD1DatabasesFn != nil {
-		return m.listD1DatabasesFn(ctx, rc, params)
-	}
-	return nil, &cf.ResultInfo{}, nil
-}
-func (m *mockCFAPI) QueryD1Database(ctx context.Context, rc *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error) {
-	m.d1CallsMade = true
-	if m.queryD1DatabaseFn != nil {
-		return m.queryD1DatabaseFn(ctx, rc, params)
-	}
-	return nil, nil
 }
 func (*mockCFAPI) CreateWorkerRoute(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkerRouteParams) (cf.WorkerRouteResponse, error) {
 	return cf.WorkerRouteResponse{}, nil
@@ -1033,40 +1007,26 @@ func TestDeployDecisionsSyncWorker_DefaultsToKV(t *testing.T) {
 		t.Fatal("UploadWorker was not called")
 	}
 
-	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_LIST_NOT_KV"); got != "false" {
-		t.Errorf("SYNC_TO_LIST_NOT_KV = %q, want %q", got, "false")
-	}
 	if _, ok := mock.uploadWorkerCall.Bindings["IP_LIST_PREFIX"]; ok {
 		t.Error("IP_LIST_PREFIX binding should be absent when SyncToListNotKV is false")
 	}
-	if _, ok := mock.uploadWorkerCall.Bindings["IP_LIST_BATCH_SIZE"]; ok {
-		t.Error("IP_LIST_BATCH_SIZE binding should be absent when SyncToListNotKV is false")
+	if _, ok := mock.uploadWorkerCall.Bindings["CF_KV_NAMESPACE_ID"]; !ok {
+		t.Error("CF_KV_NAMESPACE_ID binding should be present when SyncToListNotKV is false")
 	}
-	if _, ok := mock.uploadWorkerCall.Bindings[IPListQueueDBBindingName]; ok {
-		t.Error("D1 queue database binding should be absent when SyncToListNotKV is false")
-	}
-	if mock.d1CallsMade {
-		t.Error("no D1 API calls should be made when SyncToListNotKV is false")
+	if mock.uploadWorkerCall.Script != kvSyncWorkerScript {
+		t.Error("expected the KV-target compiled worker script to be deployed")
 	}
 }
 
 func TestDeployDecisionsSyncWorker_IPListsEnabled(t *testing.T) {
 	m := newTestManager()
-	var migrationSQL []string
-	mock := &mockCFAPI{
-		queryD1DatabaseFn: func(_ context.Context, _ *cf.ResourceContainer, params cf.QueryD1DatabaseParams) ([]cf.D1Result, error) {
-			migrationSQL = append(migrationSQL, params.SQL)
-			return nil, nil
-		},
-	}
+	mock := &mockCFAPI{}
 	m.api = mock
 
 	syncCfg := cfg.DecisionsSyncWorkerConfig{
 		Cron:            "*/5 * * * *",
 		SyncToListNotKV: true,
 		IPListPrefix:    "crowdsec_",
-		D1DatabaseName:  "crowdsec_ip_list_state",
-		IPListBatchSize: 2000,
 	}
 
 	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
@@ -1077,71 +1037,13 @@ func TestDeployDecisionsSyncWorker_IPListsEnabled(t *testing.T) {
 		t.Fatal("UploadWorker was not called")
 	}
 
-	if got := plainTextBinding(t, mock.uploadWorkerCall, "SYNC_TO_LIST_NOT_KV"); got != "true" {
-		t.Errorf("SYNC_TO_LIST_NOT_KV = %q, want %q", got, "true")
-	}
 	if got := plainTextBinding(t, mock.uploadWorkerCall, "IP_LIST_PREFIX"); got != "crowdsec_" {
 		t.Errorf("IP_LIST_PREFIX = %q, want %q", got, "crowdsec_")
 	}
-	if got := plainTextBinding(t, mock.uploadWorkerCall, "IP_LIST_BATCH_SIZE"); got != "2000" {
-		t.Errorf("IP_LIST_BATCH_SIZE = %q, want %q", got, "2000")
+	if _, ok := mock.uploadWorkerCall.Bindings["CF_KV_NAMESPACE_ID"]; ok {
+		t.Error("CF_KV_NAMESPACE_ID binding should be absent when SyncToListNotKV is true")
 	}
-
-	d1Binding, ok := mock.uploadWorkerCall.Bindings[IPListQueueDBBindingName]
-	if !ok {
-		t.Fatal("D1 database binding missing from CreateWorkerParams")
-	}
-	d1, ok := d1Binding.(cf.WorkerD1DatabaseBinding)
-	if !ok {
-		t.Fatalf("D1 binding is %T, want WorkerD1DatabaseBinding", d1Binding)
-	}
-	if d1.DatabaseID != "test-d1-database-id" {
-		t.Errorf("D1 DatabaseID = %q, want %q", d1.DatabaseID, "test-d1-database-id")
-	}
-
-	if len(migrationSQL) != 1 {
-		t.Fatalf("expected exactly 1 migration query, got %d: %v", len(migrationSQL), migrationSQL)
-	}
-	if !strings.Contains(migrationSQL[0], "CREATE TABLE IF NOT EXISTS ip_list_state") {
-		t.Errorf("migration SQL = %q, want it to create ip_list_state", migrationSQL[0])
-	}
-	for _, col := range []string{"list_id", "item_id"} {
-		if !strings.Contains(migrationSQL[0], col) {
-			t.Errorf("migration SQL missing column %q", col)
-		}
-	}
-	for _, idx := range []string{"idx_ip_list_state_list_action", "idx_ip_list_state_list_id"} {
-		if !strings.Contains(migrationSQL[0], idx) {
-			t.Errorf("migration SQL missing index %q", idx)
-		}
-	}
-}
-
-func TestDeployDecisionsSyncWorker_IPListsEnabled_ReusesExistingD1Database(t *testing.T) {
-	m := newTestManager()
-	mock := &mockCFAPI{
-		listD1DatabasesFn: func(_ context.Context, _ *cf.ResourceContainer, params cf.ListD1DatabasesParams) ([]cf.D1Database, *cf.ResultInfo, error) {
-			return []cf.D1Database{{Name: params.Name, UUID: "existing-db-id"}}, &cf.ResultInfo{}, nil
-		},
-		createD1DatabaseFn: func(context.Context, *cf.ResourceContainer, cf.CreateD1DatabaseParams) (cf.D1Database, error) {
-			t.Fatal("CreateD1Database should not be called when a matching database already exists")
-			return cf.D1Database{}, nil
-		},
-	}
-	m.api = mock
-
-	syncCfg := cfg.DecisionsSyncWorkerConfig{
-		Cron:            "*/5 * * * *",
-		SyncToListNotKV: true,
-		D1DatabaseName:  "crowdsec_ip_list_state",
-	}
-
-	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	d1Binding := mock.uploadWorkerCall.Bindings[IPListQueueDBBindingName].(cf.WorkerD1DatabaseBinding)
-	if d1Binding.DatabaseID != "existing-db-id" {
-		t.Errorf("D1 DatabaseID = %q, want %q (should reuse existing database)", d1Binding.DatabaseID, "existing-db-id")
+	if mock.uploadWorkerCall.Script != ipListsSyncWorkerScript {
+		t.Error("expected the IP-lists-target compiled worker script to be deployed")
 	}
 }

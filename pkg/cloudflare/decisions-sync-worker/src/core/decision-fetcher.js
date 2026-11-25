@@ -8,6 +8,7 @@ import logger from '../utils/logger.js';
 
 const USER_AGENT = 'cloudflare-worker-bouncer/v1.0.0';
 const WARMED_UP_KEY = 'WARMED_UP';
+const RESET_KEY = 'RESET';
 const SYNC_LOCK_KEY = 'SYNC_IN_PROGRESS';
 // TTL backstop in case a sync crashes before releaseSyncLock runs; without
 // this, a stuck lock would block every subsequent cron run.
@@ -65,6 +66,29 @@ export async function tryAcquireSyncLock(kvNamespace) {
  */
 export async function releaseSyncLock(kvNamespace) {
 	await kvNamespace.delete(SYNC_LOCK_KEY);
+}
+
+/**
+ * Check if reset is requested
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * @returns {Promise<boolean>} True if RESET key exists and is set to 'true'
+ */
+export async function shouldReset(kvNamespace) {
+	try {
+		const resetValue = await kvNamespace.get(RESET_KEY);
+		return resetValue === 'true';
+	} catch (error) {
+		logger.error('Failed to check RESET key', { error: error.message });
+		return false;
+	}
+}
+
+/**
+ * Clear the RESET state in KV
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ */
+export async function clearResetFlag(kvNamespace) {
+	await kvNamespace.put(RESET_KEY, 'false');
 }
 
 /**

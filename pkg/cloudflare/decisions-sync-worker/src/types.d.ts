@@ -3,10 +3,12 @@
  */
 
 /**
- * CrowdSec environment bindings
- * Contains all configuration variables and Cloudflare resource bindings
+ * Environment bindings shared by both compiled decisions-sync workers
+ * (kv-sync-worker.js and ip-lists-sync-worker.js). Which one is deployed is
+ * chosen at deploy time — there is no runtime flag that switches a single
+ * worker between targets.
  */
-export interface CrowdSecEnv {
+export interface CrowdSecEnvCommon {
 	/**
 	 * CrowdSec LAPI base URL
 	 * @example "http://localhost:8080"
@@ -44,97 +46,97 @@ export interface CrowdSecEnv {
 	ONLY_INCLUDE_ORIGINS?: string;
 
 	/**
-	 * Cloudflare KV namespace for storing CrowdSec decisions
+	 * Cloudflare KV namespace used for the worker's own state: WARMED_UP, the
+	 * sync lock, RESET, and (IP-list worker only) the rate-limit/backoff
+	 * deadline. Required by both workers even though only the KV-target
+	 * worker stores decision data in it.
 	 */
 	CROWDSECCFBOUNCERNS: KVNamespace;
 
 	/**
-	 * When "true", bypasses every other sync mode entirely: each tick does a
-	 * full LAPI startup pull and PUTs only the first 10 ip/range-scoped IPs
-	 * into a fixed list named "crowdsec_test" (must already exist — this mode
-	 * never creates it), logging how many were put successfully. For
-	 * sanity-checking CF_ACCOUNT_ID/CF_API_TOKEN access against a small,
-	 * non-traffic-facing list without risking real lists. Takes priority over
-	 * SYNC_TO_LIST_NOT_KV and USE_D1_FOR_L3_MAPPING.
+	 * Cloudflare account ID, used for the Cloudflare REST API calls both
+	 * workers make (bulk KV endpoints, or IP Lists endpoints).
+	 */
+	CF_ACCOUNT_ID: string;
+
+	/**
+	 * Cloudflare API token, used for the Cloudflare REST API calls both
+	 * workers make (bulk KV endpoints, or IP Lists endpoints).
+	 */
+	CF_API_TOKEN: string;
+}
+
+/**
+ * Environment bindings for the KV-target worker (kv-sync-worker.js): syncs
+ * all decision scopes to the Worker's KV store, the L7 bouncer worker's data
+ * source.
+ */
+export interface CrowdSecEnvKv extends CrowdSecEnvCommon {
+	/**
+	 * KV namespace ID, used for the bulk KV REST API calls that write/delete
+	 * decision data.
+	 */
+	CF_KV_NAMESPACE_ID: string;
+}
+
+/**
+ * Environment bindings for the IP-Lists-target worker
+ * (ip-lists-sync-worker.js): syncs `ip`/`range` scoped decisions into a
+ * single Cloudflare IP List, used for L3/4 firewall-rule bouncing. The list
+ * itself and the firewall rule referencing it must be provisioned
+ * externally — this worker only manages list membership, stateless:
+ * Cloudflare's own list contents are the only source of truth, no D1 or
+ * other local index involved.
+ *
+ * On a startup pull (first run, or the tick right after a RESET or a failed
+ * previous startup), the full LAPI decision set is PUT wholesale into the
+ * list, replacing its entire contents, and the worker then waits 25h (win or
+ * lose) before any further IP-list action — a failed startup leaves
+ * WARMED_UP unset, so it simply retries as a startup once the wait clears.
+ * Once warmed, each tick instead applies just that tick's new/expired
+ * decisions via plain add (POST) and remove (DELETE) calls — item ids for
+ * removals are resolved by reading the list's current contents first.
+ * Decisions beyond IP_LIST_MAX_ITEMS_PER_LIST are dropped for that tick
+ * (logged) rather than queued — there is no local state to retry them from,
+ * so they're picked up again only by the next startup pull.
+ */
+export interface CrowdSecEnvIpLists extends CrowdSecEnvCommon {
+	/**
+	 * When "true", bypasses the normal startup/warmed sync entirely: each
+	 * tick does a full LAPI startup pull and PUTs only the first 10
+	 * ip/range-scoped IPs into a fixed list named "crowdsec_test" (must
+	 * already exist — this mode never creates it), logging how many were put
+	 * successfully. For sanity-checking CF_ACCOUNT_ID/CF_API_TOKEN access
+	 * against a small, non-traffic-facing list without risking real lists.
 	 * @optional
 	 * @default "false"
 	 */
 	TEST_MODE?: string;
 
 	/**
-	 * Selects which single sync target the worker uses: unset/any value other
-	 * than the literal string "true" means KV mode (decisions are synced to
-	 * the Worker's KV store, the L7 bouncer worker's data source); "true"
-	 * means IP Lists mode (`ip`/`range` scoped decisions are synced to
-	 * Cloudflare IP Lists, used for L3/4 firewall-rule bouncing). The two
-	 * modes are mutually exclusive — the worker always does exactly one,
-	 * never both. In IP Lists mode, the lists themselves and the firewall
-	 * rules referencing them must be provisioned externally — this worker
-	 * only manages list membership.
-	 * @optional
-	 * @default "false"
-	 */
-	SYNC_TO_LIST_NOT_KV?: string;
-
-	/**
-	 * Name prefix used to discover which Cloudflare IP Lists this worker is
-	 * allowed to manage. Only used when SYNC_TO_LIST_NOT_KV is "true".
+	 * Name prefix used to discover which Cloudflare IP List this worker is
+	 * allowed to manage.
 	 * @optional
 	 * @default "crowdsec_"
 	 */
 	IP_LIST_PREFIX?: string;
 
 	/**
-	 * Selects how SYNC_TO_LIST_NOT_KV mode tracks list membership:
-	 * unset/any value other than "true" (the default) bypasses D1 entirely —
-	 * every tick pulls the full decision set from LAPI (startup=true,
-	 * always) and PUTs it wholesale into the single `{IP_LIST_PREFIX}00`
-	 * list, replacing its contents outright. Simpler and self-healing (every
-	 * tick is authoritative, nothing to desync), but each tick's Cloudflare
-	 * request body scales with the total number of active decisions, not
-	 * just what changed, and there is no pacing/sharding — set IP_LIST_PREFIX
-	 * such that this resolves to one list only, and decisions beyond
-	 * IP_LIST_MAX_ITEMS_PER_LIST are truncated (logged, not paced in over
-	 * later ticks). "true" uses the original D1-backed incremental mode:
-	 * pending adds/deletes tracked in `ip_list_state`, paced via
-	 * IP_LIST_BATCH_SIZE, packed across as many lists as needed.
-	 * @optional
-	 * @default "false"
-	 */
-	USE_D1_FOR_L3_MAPPING?: string;
-
-	/**
-	 * D1 database holding IP list state (a single `ip_list_state` table:
-	 * pending work and current Cloudflare IP List membership, keyed by ip).
-	 * Required when SYNC_TO_LIST_NOT_KV is "true" AND USE_D1_FOR_L3_MAPPING
-	 * is "true". Not used in the default D1-bypass mode.
-	 */
-	LIST_STATE_DB?: D1Database;
-
-	/**
-	 * Maximum number of queued rows (a mix of pending adds and removals)
-	 * processed against Cloudflare IP Lists per sync tick. Bounding this
-	 * keeps each tick's Cloudflare API usage predictable regardless of how
-	 * large the backlog is — a large warmup (e.g. 100k+ IPs) drains over
-	 * many ticks rather than in one burst. Only used when SYNC_TO_LIST_NOT_KV
-	 * is "true".
-	 * @optional
-	 * @default "1000"
-	 */
-	IP_LIST_BATCH_SIZE?: string;
-
-	/**
-	 * Ceiling on how many IPs this worker will pack into a single managed
-	 * list before moving on to the next one (pack-to-full, in list-name
-	 * order). Cloudflare's large "IP Lists" have no fixed per-list item cap
-	 * of their own, so this is purely an operator choice — override it if
-	 * you want smaller/larger lists than the built-in default. Only used
-	 * when SYNC_TO_LIST_NOT_KV is "true".
+	 * Ceiling on how many IPs this worker will put into its managed list.
+	 * Cloudflare's large "IP Lists" have no fixed per-list item cap of their
+	 * own, so this is purely an operator choice — override it if you want a
+	 * smaller/larger limit than the built-in default.
 	 * @optional
 	 * @default "300000"
 	 */
 	IP_LIST_MAX_ITEMS_PER_LIST?: string;
 }
+
+/**
+ * Union of both workers' environments, for shared code (core/, utils/) that
+ * doesn't care which target it's running under.
+ */
+export type CrowdSecEnv = CrowdSecEnvKv | CrowdSecEnvIpLists;
 
 /**
  * Decision scope types supported by CrowdSec

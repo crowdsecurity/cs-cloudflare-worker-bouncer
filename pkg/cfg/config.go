@@ -148,33 +148,14 @@ type DecisionsSyncWorkerConfig struct {
 	SyncToListNotKV bool `yaml:"sync_to_list_not_kv,omitempty"`
 
 	// IPListPrefix is the name prefix used to discover which Cloudflare IP
-	// Lists this worker is allowed to manage. Only used when SyncToListNotKV
+	// List this worker is allowed to manage. Only used when SyncToListNotKV
 	// is true.
 	IPListPrefix string `yaml:"ip_list_prefix,omitempty"`
-
-	// D1DatabaseName is the name of the D1 database holding IP list state
-	// (pending work and current Cloudflare IP List membership). Created
-	// automatically on deploy if it doesn't already exist. Only used when
-	// SyncToListNotKV is true.
-	D1DatabaseName string `yaml:"d1_database_name,omitempty"`
-
-	// IPListBatchSize caps how many queued rows (new adds and expired
-	// removals combined) are processed against Cloudflare IP Lists per sync
-	// tick. Bounding this keeps each tick's Cloudflare API usage predictable
-	// regardless of backlog size — a large warmup drains over many ticks
-	// instead of in one burst. Only used when SyncToListNotKV is true.
-	IPListBatchSize int `yaml:"ip_list_batch_size,omitempty"`
 }
 
 func (d *DecisionsSyncWorkerConfig) setDefaults() {
 	if d.IPListPrefix == "" {
 		d.IPListPrefix = "crowdsec_"
-	}
-	if d.D1DatabaseName == "" {
-		d.D1DatabaseName = "crowdsec_ip_list_state"
-	}
-	if d.IPListBatchSize == 0 {
-		d.IPListBatchSize = 1000
 	}
 }
 

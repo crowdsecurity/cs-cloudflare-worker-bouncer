@@ -121,12 +121,6 @@ cloudflare_config:
 	if syncCfg.IPListPrefix != "crowdsec_" {
 		t.Fatalf("IPListPrefix = %q, want %q", syncCfg.IPListPrefix, "crowdsec_")
 	}
-	if syncCfg.D1DatabaseName != "crowdsec_ip_list_state" {
-		t.Fatalf("D1DatabaseName = %q, want %q", syncCfg.D1DatabaseName, "crowdsec_ip_list_state")
-	}
-	if syncCfg.IPListBatchSize != 1000 {
-		t.Fatalf("IPListBatchSize = %d, want %d", syncCfg.IPListBatchSize, 1000)
-	}
 }
 
 func TestSetDefaults_DecisionsSyncWorker_ExplicitValuesPreserved(t *testing.T) {
@@ -139,8 +133,6 @@ cloudflare_config:
   decisions_sync_worker:
     sync_to_list_not_kv: true
     ip_list_prefix: myprefix_
-    d1_database_name: my_list_state_db
-    ip_list_batch_size: 2000
   accounts:
     - id: acc1
       token: tok1
@@ -163,12 +155,6 @@ cloudflare_config:
 	}
 	if syncCfg.IPListPrefix != "myprefix_" {
 		t.Fatalf("IPListPrefix = %q, want %q", syncCfg.IPListPrefix, "myprefix_")
-	}
-	if syncCfg.D1DatabaseName != "my_list_state_db" {
-		t.Fatalf("D1DatabaseName = %q, want %q", syncCfg.D1DatabaseName, "my_list_state_db")
-	}
-	if syncCfg.IPListBatchSize != 2000 {
-		t.Fatalf("IPListBatchSize = %d, want %d", syncCfg.IPListBatchSize, 2000)
 	}
 }
 

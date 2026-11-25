@@ -9,7 +9,6 @@ import logger from '../utils/logger.js';
 const BATCH_SIZE = 10000; // Cloudflare KV limit for bulk write/delete operations
 const BATCH_SIZE_GET = 100; // Cloudflare KV limit for bulk get operations
 const IP_RANGES_KEY = 'IP_RANGES';
-const RESET_KEY = 'RESET';
 // Keys to preserve during reset
 const PRESERVED_KEYS = ['BAN_TEMPLATE', 'TURNSTILE_CONFIG'];
 
@@ -221,29 +220,6 @@ export async function batchGetStringBasedDecisions(accountId, namespaceId, apiTo
 	logger.debug(`Found ${existingMap.size} existing entries in KV out of ${keys.length} requested`);
 
 	return existingMap;
-}
-
-/**
- * Check if reset is requested
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- * @returns {Promise<boolean>} True if RESET key exists and is set to 'true'
- */
-export async function shouldReset(kvNamespace) {
-	try {
-		const resetValue = await kvNamespace.get(RESET_KEY);
-		return resetValue === 'true';
-	} catch (error) {
-		logger.error('Failed to check RESET key', { error: error.message });
-		return false;
-	}
-}
-
-/**
- * Clear the RESET state in KV
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- */
-export async function clearResetFlag(kvNamespace) {
-	await kvNamespace.put(RESET_KEY, 'false');
 }
 
 /**
