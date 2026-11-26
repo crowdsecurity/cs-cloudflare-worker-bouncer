@@ -121,6 +121,9 @@ type mockCFAPI struct {
 	listWorkersKVNamespacesFn  func(context.Context, *cf.ResourceContainer, cf.ListWorkersKVNamespacesParams) ([]cf.WorkersKVNamespace, *cf.ResultInfo, error)
 	deleteWorkersKVNamespaceFn func(context.Context, *cf.ResourceContainer, string) (cf.Response, error)
 	deleteKVCalls              []string
+
+	uploadWorkerFn   func(context.Context, *cf.ResourceContainer, cf.CreateWorkerParams) (cf.WorkerScriptResponse, error)
+	uploadWorkerCall *cf.CreateWorkerParams
 }
 
 func (*mockCFAPI) Account(_ context.Context, _ string) (cf.Account, cf.ResultInfo, error) {
@@ -184,7 +187,11 @@ func (*mockCFAPI) RotateTurnstileWidget(_ context.Context, _ *cf.ResourceContain
 func (*mockCFAPI) SetWorkersSecret(_ context.Context, _ *cf.ResourceContainer, _ cf.SetWorkersSecretParams) (cf.WorkersPutSecretResponse, error) {
 	return cf.WorkersPutSecretResponse{}, nil
 }
-func (*mockCFAPI) UploadWorker(_ context.Context, _ *cf.ResourceContainer, _ cf.CreateWorkerParams) (cf.WorkerScriptResponse, error) {
+func (m *mockCFAPI) UploadWorker(ctx context.Context, rc *cf.ResourceContainer, params cf.CreateWorkerParams) (cf.WorkerScriptResponse, error) {
+	m.uploadWorkerCall = &params
+	if m.uploadWorkerFn != nil {
+		return m.uploadWorkerFn(ctx, rc, params)
+	}
 	return cf.WorkerScriptResponse{}, nil
 }
 func (*mockCFAPI) UpdateWorkerCronTriggers(_ context.Context, _ *cf.ResourceContainer, _ cf.UpdateWorkerCronTriggersParams) ([]cf.WorkerCronTrigger, error) {
@@ -193,6 +200,7 @@ func (*mockCFAPI) UpdateWorkerCronTriggers(_ context.Context, _ *cf.ResourceCont
 func (*mockCFAPI) WriteWorkersKVEntries(_ context.Context, _ *cf.ResourceContainer, _ cf.WriteWorkersKVEntriesParams) (cf.Response, error) {
 	return cf.Response{}, nil
 }
+
 // ============================================================
 // Group 1: queryAnalyticsEngine
 // ============================================================
@@ -962,5 +970,80 @@ func TestEnableObservability_ExplicitlyDisabled(t *testing.T) {
 	obs := obsFromBody(t, captured.Body)
 	if enabled, ok := obs["enabled"].(bool); !ok || enabled {
 		t.Errorf("enabled = %v, want false", obs["enabled"])
+	}
+}
+
+// ============================================================
+// Group: DeployDecisionsSyncWorker
+// ============================================================
+
+func plainTextBinding(t *testing.T, params *cf.CreateWorkerParams, name string) string {
+	t.Helper()
+	binding, ok := params.Bindings[name]
+	if !ok {
+		t.Fatalf("binding %q missing from CreateWorkerParams", name)
+	}
+	ptBinding, ok := binding.(cf.WorkerPlainTextBinding)
+	if !ok {
+		t.Fatalf("binding %q is %T, want WorkerPlainTextBinding", name, binding)
+	}
+	return ptBinding.Text
+}
+
+func TestDeployDecisionsSyncWorker_DefaultsToKV(t *testing.T) {
+	m := newTestManager()
+	mock := &mockCFAPI{}
+	m.api = mock
+
+	// SyncToListNotKV left at its zero value (false), as happens for any
+	// config that doesn't explicitly opt into IP-list mode.
+	syncCfg := cfg.DecisionsSyncWorkerConfig{Cron: "*/5 * * * *"}
+
+	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if mock.uploadWorkerCall == nil {
+		t.Fatal("UploadWorker was not called")
+	}
+
+	if _, ok := mock.uploadWorkerCall.Bindings["IP_LIST_PREFIX"]; ok {
+		t.Error("IP_LIST_PREFIX binding should be absent when SyncToListNotKV is false")
+	}
+	if _, ok := mock.uploadWorkerCall.Bindings["CF_KV_NAMESPACE_ID"]; !ok {
+		t.Error("CF_KV_NAMESPACE_ID binding should be present when SyncToListNotKV is false")
+	}
+	if mock.uploadWorkerCall.Script != kvSyncWorkerScript {
+		t.Error("expected the KV-target compiled worker script to be deployed")
+	}
+}
+
+func TestDeployDecisionsSyncWorker_IPListsEnabled(t *testing.T) {
+	m := newTestManager()
+	mock := &mockCFAPI{}
+	m.api = mock
+
+	syncCfg := cfg.DecisionsSyncWorkerConfig{
+		Cron:            "*/5 * * * *",
+		SyncToListNotKV: true,
+		IPListPrefix:    "crowdsec_",
+	}
+
+	if err := m.DeployDecisionsSyncWorker(cfg.CrowdSecConfig{}, syncCfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if mock.uploadWorkerCall == nil {
+		t.Fatal("UploadWorker was not called")
+	}
+
+	if got := plainTextBinding(t, mock.uploadWorkerCall, "IP_LIST_PREFIX"); got != "crowdsec_" {
+		t.Errorf("IP_LIST_PREFIX = %q, want %q", got, "crowdsec_")
+	}
+	if _, ok := mock.uploadWorkerCall.Bindings["CF_KV_NAMESPACE_ID"]; ok {
+		t.Error("CF_KV_NAMESPACE_ID binding should be absent when SyncToListNotKV is true")
+	}
+	if mock.uploadWorkerCall.Script != ipListsSyncWorkerScript {
+		t.Error("expected the IP-lists-target compiled worker script to be deployed")
 	}
 }

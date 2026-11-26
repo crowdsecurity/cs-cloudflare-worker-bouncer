@@ -79,6 +79,7 @@ function error(message, context = {}) {
 
 const USER_AGENT = 'cloudflare-worker-bouncer/v1.0.0';
 const WARMED_UP_KEY = 'WARMED_UP';
+const decision_fetcher_RESET_KEY = 'RESET';
 const SYNC_LOCK_KEY = 'SYNC_IN_PROGRESS';
 // TTL backstop in case a sync crashes before releaseSyncLock runs; without
 // this, a stuck lock would block every subsequent cron run.
@@ -86,13 +87,13 @@ const SYNC_LOCK_TTL_SECONDS = 300;
 const SUPPORTED_SCOPES = ['ip', 'range', 'as', 'country'];
 
 /**
- * Check if this is the first fetch by looking for the WARMED_UP flag in KV
+ * Check if the cache needs to be warmed up by looking for the WARMED_UP flag in KV
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- * @returns {Promise<boolean>} True if this is the first fetch
+ * @returns {Promise<boolean>} True if the cache needs to be warmed up (WARMED_UP is not exactly 'true')
  */
-async function isFirstFetch(kvNamespace) {
+async function needWarmUp(kvNamespace) {
 	const warmedUpFlag = await kvNamespace.get(WARMED_UP_KEY);
-	return !warmedUpFlag;
+	return warmedUpFlag !== 'true';
 }
 
 /**
@@ -136,6 +137,29 @@ async function tryAcquireSyncLock(kvNamespace) {
  */
 async function releaseSyncLock(kvNamespace) {
 	await kvNamespace.delete(SYNC_LOCK_KEY);
+}
+
+/**
+ * Check if reset is requested
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ * @returns {Promise<boolean>} True if RESET key exists and is set to 'true'
+ */
+async function shouldReset(kvNamespace) {
+	try {
+		const resetValue = await kvNamespace.get(decision_fetcher_RESET_KEY);
+		return resetValue === 'true';
+	} catch (error) {
+		logger.error('Failed to check RESET key', { error: error.message });
+		return false;
+	}
+}
+
+/**
+ * Clear the RESET state in KV
+ * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
+ */
+async function clearResetFlag(kvNamespace) {
+	await kvNamespace.put(decision_fetcher_RESET_KEY, 'false');
 }
 
 /**
@@ -260,13 +284,13 @@ async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 		throw new Error(`LAPI request failed with status ${response.status}: ${errorText}`);
 	}
 
-	// Handle HTTP 204 No Content (LAPI has no decisions - need to delete all from KV)
+	// Handle eventual HTTP 204 No Content 
+	// it used to delete all, but we don't want that anymore
 	if (response.status === 204) {
-		logger.info('LAPI returned 204 No Content: LAPI has no decisions, will clear KV');
+		logger.warn('LAPI returned 204 No Content: not doing anything');
 		return {
 			new: [],
 			deleted: [],
-			deleteAll: true, // Signal to main sync logic to reset KV and exit
 		};
 	}
 
@@ -297,6 +321,140 @@ async function fetchDecisionsStream(lapiUrl, apiKey, options = {}) {
 		new: filteredNew,
 		deleted: filteredDeleted,
 	};
+}
+
+;// ./src/core/sync-runner.js
+/**
+ * Shared scheduled-tick skeleton for both decisions-sync workers (KV and IP
+ * Lists). Each worker is a separate compiled script with exactly one sync
+ * target, chosen at deploy time rather than by a runtime flag — this module
+ * holds everything that's identical either way: env validation, the sync
+ * lock, the LAPI pull, and RESET/WARMED_UP handling. The target-specific sync
+ * itself is supplied by the caller as `runSync`.
+ */
+
+
+
+
+/**
+ * @param {import('../types.js').CrowdSecEnv} env
+ * @returns {string | null} an error message if validation fails, else null
+ */
+function validateCommonEnv(env) {
+	if (!env.LAPI_URL) return 'LAPI_URL environment variable is not set';
+	if (!env.LAPI_KEY) return 'LAPI_KEY secret is not set';
+	if (!env.CROWDSECCFBOUNCERNS) return 'CROWDSECCFBOUNCERNS KV namespace is not bound';
+	if (!env.CF_ACCOUNT_ID) return 'CF_ACCOUNT_ID environment variable is not set';
+	if (!env.CF_API_TOKEN) return 'CF_API_TOKEN secret is not set (required for bulk KV/IP list operations)';
+	return null;
+}
+
+/**
+ * @typedef {Object} SyncHooks
+ * @property {(env: import('../types.js').CrowdSecEnv) => string | null} [validateEnv] - extra env validation beyond validateCommonEnv
+ * @property {(env: import('../types.js').CrowdSecEnv) => Promise<boolean>} [shouldSkip] - checked right after the lock is acquired, before any LAPI pull; returning true no-ops the entire tick (e.g. waiting out a backoff)
+ * @property {(env: import('../types.js').CrowdSecEnv) => Promise<boolean>} needStartUpFetch - whether this tick must be a full LAPI pull
+ * @property {(env: import('../types.js').CrowdSecEnv, resetRequested: boolean) => Promise<void>} [onResetRequested] - called once, before the LAPI pull, when RESET was requested
+ * @property {(env: import('../types.js').CrowdSecEnv, decisions: import('../types.js').DecisionStreamResponse, needStartUpFetch: boolean) => Promise<boolean>} runSync - performs the actual sync, returns whether it succeeded
+ */
+
+/**
+ * Run one scheduled tick: validate env, acquire the sync lock, pull decisions
+ * from LAPI, run the target-specific sync, release the lock. Swallows all
+ * errors (logged, not rethrown) so a failed tick never surfaces as an
+ * unhandled Worker exception.
+ * @param {ScheduledEvent} event
+ * @param {import('../types.js').CrowdSecEnv} env
+ * @param {SyncHooks} hooks
+ */
+async function runScheduledSync(event, env, hooks) {
+	const startTime = Date.now();
+
+	logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
+
+	try {
+		const commonError = validateCommonEnv(env);
+		if (commonError) {
+			logger.error(commonError);
+			return;
+		}
+		if (hooks.validateEnv) {
+			const specificError = hooks.validateEnv(env);
+			if (specificError) {
+				logger.error(specificError);
+				return;
+			}
+		}
+
+		const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
+
+		// Lock to avoid overlapping syncs from multiple cron ticks or manual runs.
+		const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
+		if (!lockAcquired) {
+			logger.info('Sync already in progress, skipping this run');
+			return;
+		}
+
+		try {
+			if (hooks.shouldSkip && (await hooks.shouldSkip(env))) {
+				return;
+			}
+
+			const needStartUpFetch = await hooks.needStartUpFetch(env);
+			logger.info('Determined fetch mode', { startup: needStartUpFetch });
+
+			const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
+			if (resetRequested && hooks.onResetRequested) {
+				await hooks.onResetRequested(env, resetRequested);
+			}
+			if (resetRequested) {
+				await clearResetFlag(env.CROWDSECCFBOUNCERNS);
+			}
+
+			// Parse optional filter configuration
+			const scenariosContaining = env.INCLUDE_SCENARIOS ? env.INCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
+			const scenariosNotContaining = env.EXCLUDE_SCENARIOS ? env.EXCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
+			const origins = env.ONLY_INCLUDE_ORIGINS ? env.ONLY_INCLUDE_ORIGINS.split(',').map((s) => s.trim()) : [];
+
+			const decisions = await fetchDecisionsStream(lapiUrl, env.LAPI_KEY, {
+				startup: needStartUpFetch,
+				scenariosContaining,
+				scenariosNotContaining,
+				origins,
+			});
+
+			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+			logger.info('Decision stream completed successfully', {
+				duration: `${duration}s`,
+				newDecisions: decisions.new.length,
+				deletedDecisions: decisions.deleted.length,
+			});
+
+			const syncSucceeded = await hooks.runSync(env, decisions, needStartUpFetch);
+
+			const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+			if (syncSucceeded) {
+				logger.info('Decision sync tick finished', { totalDuration: `${finalDuration}s`, syncSucceeded });
+			} else {
+				logger.warn('Decision sync tick finished without syncing (see warnings above for why)', {
+					totalDuration: `${finalDuration}s`,
+					syncSucceeded,
+				});
+			}
+		} finally {
+			await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
+		}
+	} catch (error) {
+		const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+		logger.error('Decision sync failed', {
+			duration: `${duration}s`,
+			error: error.message,
+			stack: error.stack,
+		});
+
+		// Swallow the error rather than rethrow
+		// No advantage throwing + we have enough logs to find out what happened
+	}
 }
 
 ;// ./src/core/decision-processor.js
@@ -481,7 +639,6 @@ function hasRangesChanged(oldRanges, newRanges) {
 const BATCH_SIZE = 10000; // Cloudflare KV limit for bulk write/delete operations
 const BATCH_SIZE_GET = 100; // Cloudflare KV limit for bulk get operations
 const IP_RANGES_KEY = 'IP_RANGES';
-const RESET_KEY = 'RESET';
 // Keys to preserve during reset
 const PRESERVED_KEYS = ['BAN_TEMPLATE', 'TURNSTILE_CONFIG'];
 
@@ -696,21 +853,6 @@ async function batchGetStringBasedDecisions(accountId, namespaceId, apiToken, ke
 }
 
 /**
- * Check if reset is requested
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- * @returns {Promise<boolean>} True if RESET key exists and is set to 'true'
- */
-async function shouldReset(kvNamespace) {
-	try {
-		const resetValue = await kvNamespace.get(RESET_KEY);
-		return resetValue === 'true';
-	} catch (error) {
-		logger.error('Failed to check RESET key', { error: error.message });
-		return false;
-	}
-}
-
-/**
  * List all keys in KV namespace using Cloudflare API
  * @param {string} accountId - Cloudflare account ID
  * @param {string} namespaceId - KV namespace ID
@@ -761,7 +903,7 @@ async function listAllKeys(accountId, namespaceId, apiToken) {
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace (for direct operations)
  * @returns {Promise<void>}
  */
-async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) {
+async function resetAllDecisionsInKV(accountId, namespaceId, apiToken, kvNamespace) {
 	logger.info('Starting KV reset: deleting all decision keys...');
 
 	// Step 1: List all keys in KV
@@ -779,17 +921,14 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 		await batchDeleteStringBasedDecisions(accountId, namespaceId, apiToken, keysToDelete);
 	}
 
-	// Step 4: Set RESET to false
-	await kvNamespace.put(RESET_KEY, 'false');
-	logger.info('RESET key set to false');
-
 	logger.info('KV reset completed successfully');
 }
 
-;// ./src/index.js
+;// ./src/index-kv.js
 /**
- * CrowdSec Autonomous Decisions Sync Worker
- * Periodically fetches security decisions from CrowdSec LAPI and updates Cloudflare KV (CROWDSECCFBOUNCERNS) storage
+ * CrowdSec Decisions Sync Worker — KV target
+ * Periodically fetches security decisions from CrowdSec LAPI and writes them
+ * to Cloudflare KV (consumed by the L7 bouncer worker).
  */
 
 
@@ -797,226 +936,122 @@ async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) 
 
 
 
-/* harmony default export */ const src = ({
-	/**
-	 * Scheduled handler
-	 * @param {ScheduledEvent} event - The scheduled event
-	 * @param {import('./types.js').CrowdSecEnv} env - Environment bindings (secrets, KV namespaces, etc.)
-	 * @param {ExecutionContext} _ctx - Execution context
-	 */
-	async scheduled(event, env, _ctx) {
-		const startTime = Date.now();
 
-		logger.info('Decision sync started', { cron: event.cron, scheduledTime: event.scheduledTime });
+/**
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @returns {string | null}
+ */
+function validateEnv(env) {
+	if (!env.CF_KV_NAMESPACE_ID) return 'CF_KV_NAMESPACE_ID environment variable is not set (required when syncing to KV)';
+	return null;
+}
 
-		try {
-			// Validate required environment variables
-			if (!env.LAPI_URL) {
-				logger.error('LAPI_URL environment variable is not set');
-				return;
-			}
+/**
+ * Sync decisions to the Worker's KV store (used by the L7 bouncer worker).
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @param {import('./types.js').DecisionStreamResponse} decisions
+ * @param {boolean} needStartUpFetch
+ * @returns {Promise<boolean>}
+ */
+async function syncToKv(env, decisions, needStartUpFetch) {
+	logger.info('Starting KV sync...');
 
-			if (!env.LAPI_KEY) {
-				logger.error('LAPI_KEY secret is not set');
-				return;
-			}
+	// Mark warmed as soon as the LAPI pull itself succeeded to avoid pulling
+	// the full list every time. KV is not a durable queue, so this is a
+	// deliberate, accepted risk (see memory on this).
+	if (needStartUpFetch) {
+		await markAsWarmed(env.CROWDSECCFBOUNCERNS);
+		logger.info('LAPI startup pull complete');
+	}
 
-			if (!env.CROWDSECCFBOUNCERNS) {
-				logger.error('CROWDSECCFBOUNCERNS KV namespace is not bound');
-				return;
-			}
+	// Step 1: Get existing IP_RANGES from KV
+	const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
 
-			if (!env.CF_ACCOUNT_ID) {
-				logger.error('CF_ACCOUNT_ID environment variable is not set');
-				return;
-			}
+	// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
+	let existingStringDecisions = new Map();
 
-			if (!env.CF_KV_NAMESPACE_ID) {
-				logger.error('CF_KV_NAMESPACE_ID environment variable is not set');
-				return;
-			}
+	if (!needStartUpFetch) {
+		// On incremental updates, check existing values to avoid redundant writes
+		logger.debug('Incremental update: checking existing decisions in KV');
+		const allStringKeys = [
+			...decisions.new
+				.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+				.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+			...decisions.deleted
+				.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
+				.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
+		];
 
-			if (!env.CF_API_TOKEN) {
-				logger.error('CF_API_TOKEN secret is not set (required for bulk KV operations)');
-				return;
-			}
+		// Remove duplicates
+		const uniqueStringKeys = [...new Set(allStringKeys)];
 
-			const lapiUrl = env.LAPI_URL.replace(/\/$/, ''); // Remove trailing slash if present
+		// Fetch existing string decisions from KV using bulk API
+		existingStringDecisions = await batchGetStringBasedDecisions(
+			env.CF_ACCOUNT_ID,
+			env.CF_KV_NAMESPACE_ID,
+			env.CF_API_TOKEN,
+			uniqueStringKeys
+		);
+	} else {
+		logger.debug('Startup fetch: skipping existence check (KV is empty)');
+	}
 
-			// Acquire the sync lock so an overlapping cron tick (or a manual run
-			// while a previous one is still in flight) doesn't fan out into a
-			// full-sync storm against LAPI. Released in finally below; TTL is
-			// only a backstop for a hard crash.
-			const lockAcquired = await tryAcquireSyncLock(env.CROWDSECCFBOUNCERNS);
-			if (!lockAcquired) {
-				logger.info('Sync already in progress, skipping this run');
-				return;
-			}
+	// Step 3: Process new decisions
+	const newProcessed = processNewDecisions(decisions.new, existingStringDecisions, existingRanges);
+	// Step 4: Process deleted decisions
+	const deletedProcessed = processDeletedDecisions(decisions.deleted, existingStringDecisions, existingRanges);
+	// Step 5: Merge ranges (deletions already applied in step 4, now adding new ranges)
+	const finalRanges = mergeRanges(deletedProcessed.updatedRanges, newProcessed.jsonEntries);
+	// Step 6: Write new/updated string decisions (IP, AS, Country) to KV using bulk API
+	if (newProcessed.stringEntries.length > 0) {
+		logger.info('Writing string-based decisions to KV...', { count: newProcessed.stringEntries.length });
+		await batchWriteStringBasedDecisions(env.CF_ACCOUNT_ID, env.CF_KV_NAMESPACE_ID, env.CF_API_TOKEN, newProcessed.stringEntries);
+	}
+	// Step 7: Delete string decisions from KV using bulk API
+	if (deletedProcessed.stringKeysToDelete.length > 0) {
+		logger.info('Deleting string decisions from KV...', { count: deletedProcessed.stringKeysToDelete.length });
+		await batchDeleteStringBasedDecisions(
+			env.CF_ACCOUNT_ID,
+			env.CF_KV_NAMESPACE_ID,
+			env.CF_API_TOKEN,
+			deletedProcessed.stringKeysToDelete
+		);
+	}
+	// Step 8: Update IP_RANGES if changed
+	if (hasRangesChanged(existingRanges, finalRanges)) {
+		logger.info('IP_RANGES changed, updating KV...');
+		await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
+	}
 
-			try {
-				// Check if reset is requested
-				const resetRequested = await shouldReset(env.CROWDSECCFBOUNCERNS);
-				if (resetRequested) {
-					logger.info('RESET requested: clearing all decision keys from KV...');
-					await resetAllDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						env.CROWDSECCFBOUNCERNS
-					);
-					logger.info('KV reset completed, proceeding with fresh decision sync');
-				}
+	logger.info('KV sync completed successfully', {
+		stringWritten: newProcessed.stringEntries.length,
+		stringDeleted: deletedProcessed.stringKeysToDelete.length,
+		rangesCount: Object.keys(finalRanges).length,
+	});
 
-				// Determine if this is the first fetch
-				const isFirst = await isFirstFetch(env.CROWDSECCFBOUNCERNS);
-				logger.info('Fetch type determined', { isFirstFetch: isFirst });
+	// Nothing above throws on a partial failure path (bulk helpers throw on
+	// HTTP failure, which propagates up to runScheduledSync's catch), so
+	// reaching here means the sync succeeded.
+	return true;
+}
 
-				// Parse optional filter configuration
-				const scenariosContaining = env.INCLUDE_SCENARIOS ? env.INCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
-				const scenariosNotContaining = env.EXCLUDE_SCENARIOS ? env.EXCLUDE_SCENARIOS.split(',').map((s) => s.trim()) : [];
-				const origins = env.ONLY_INCLUDE_ORIGINS ? env.ONLY_INCLUDE_ORIGINS.split(',').map((s) => s.trim()) : [];
+/**
+ * @param {ScheduledEvent} event
+ * @param {import('./types.js').CrowdSecEnv} env
+ * @param {ExecutionContext} _ctx
+ */
+async function scheduled(event, env, _ctx) {
+	await runScheduledSync(event, env, {
+		validateEnv,
+		needStartUpFetch: (env) => needWarmUp(env.CROWDSECCFBOUNCERNS),
+		onResetRequested: async (env) => {
+			logger.info('Clearing all decision keys from KV before fresh sync...');
+			await resetAllDecisionsInKV(env.CF_ACCOUNT_ID, env.CF_KV_NAMESPACE_ID, env.CF_API_TOKEN, env.CROWDSECCFBOUNCERNS);
+		},
+		runSync: syncToKv,
+	});
+}
 
-				// Fetch decisions from LAPI
-				const decisions = await fetchDecisionsStream(lapiUrl, env.LAPI_KEY, {
-					startup: isFirst,
-					scenariosContaining,
-					scenariosNotContaining,
-					origins,
-				});
+/* harmony default export */ const index_kv = ({ scheduled });
 
-				// Log summary
-				const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-				logger.info('Decision stream completed successfully', {
-					duration: `${duration}s`,
-					newDecisions: decisions.new.length,
-					deletedDecisions: decisions.deleted.length,
-				});
-
-				// Handle HTTP 204 (LAPI has no decisions - delete all from KV)
-				if (decisions.deleteAll) {
-					logger.info('LAPI has no decisions (204): clearing all decision keys from KV...');
-					await resetAllDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						env.CROWDSECCFBOUNCERNS
-					);
-					// Safe to mark warmed here: KV is now in its intended empty state,
-					// so a crash at this point doesn't leave decisions unwritten.
-					if (isFirst) {
-						await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-						logger.info('Cache marked as warmed (LAPI has no decisions)');
-					}
-					const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-					logger.info('KV cleared successfully (LAPI has no decisions)', {
-						totalDuration: `${finalDuration}s`,
-					});
-					return; // Exit early - no further sync needed
-				}
-
-				// ====================
-				// SYNC TO KV STORE
-				// ====================
-
-				logger.info('Starting KV sync...');
-
-				// Step 1: Get existing IP_RANGES from KV
-				const existingRanges = await getIpRanges(env.CROWDSECCFBOUNCERNS);
-
-				// Step 2: Check existing string decisions in KV (only on incremental updates, not first run)
-				let existingStringDecisions = new Map();
-
-				if (!isFirst) {
-					// On incremental updates, check existing values to avoid redundant writes
-					logger.debug('Incremental update: checking existing decisions in KV');
-					const allStringKeys = [
-						...decisions.new
-							.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-							.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-						...decisions.deleted
-							.filter((d) => ['ip', 'as', 'country'].includes(d.scope))
-							.map((d) => (d.scope === 'country' ? d.value.toLowerCase() : d.value)),
-					];
-
-					// Remove duplicates
-					const uniqueStringKeys = [...new Set(allStringKeys)];
-
-					// Fetch existing string decisions from KV using bulk API
-					existingStringDecisions = await batchGetStringBasedDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						uniqueStringKeys
-					);
-				} else {
-					logger.debug('First run: skipping existence check (KV is empty)');
-				}
-
-				// Step 3: Process new decisions
-				const newProcessed = processNewDecisions(decisions.new, existingStringDecisions, existingRanges);
-				// Step 4: Process deleted decisions
-				const deletedProcessed = processDeletedDecisions(decisions.deleted, existingStringDecisions, existingRanges);
-				// Step 5: Merge ranges (deletions already applied in step 4, now adding new ranges)
-				const finalRanges = mergeRanges(deletedProcessed.updatedRanges, newProcessed.jsonEntries);
-				// Step 6: Write new/updated string decisions (IP, AS, Country) to KV using bulk API
-				if (newProcessed.stringEntries.length > 0) {
-					logger.info('Writing string-based decisions to KV...', { count: newProcessed.stringEntries.length });
-					await batchWriteStringBasedDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						newProcessed.stringEntries
-					);
-				}
-				// Step 7: Delete string decisions from KV using bulk API
-				if (deletedProcessed.stringKeysToDelete.length > 0) {
-					logger.info('Deleting string decisions from KV...', { count: deletedProcessed.stringKeysToDelete.length });
-					await batchDeleteStringBasedDecisions(
-						env.CF_ACCOUNT_ID,
-						env.CF_KV_NAMESPACE_ID,
-						env.CF_API_TOKEN,
-						deletedProcessed.stringKeysToDelete
-					);
-				}
-				// Step 8: Update IP_RANGES if changed
-				if (hasRangesChanged(existingRanges, finalRanges)) {
-					logger.info('IP_RANGES changed, updating KV...');
-					await writeIpRanges(env.CROWDSECCFBOUNCERNS, finalRanges);
-				}
-
-				// Step 9: Mark cache as warmed ONLY after all KV writes have succeeded.
-				// If this runs before the writes, a mid-sync crash leaves WARMED_UP=true
-				// with an empty KV, and the next run does an incremental fetch that
-				// never backfills the missed decisions — a silent enforcement gap.
-				if (isFirst) {
-					await markAsWarmed(env.CROWDSECCFBOUNCERNS);
-					logger.info('Cache marked as warmed (first sync complete)');
-				}
-
-				// Final summary
-				const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
-
-				logger.info('KV sync completed successfully', {
-					totalDuration: `${finalDuration}s`,
-					stringWritten: newProcessed.stringEntries.length,
-					stringDeleted: deletedProcessed.stringKeysToDelete.length,
-					rangesCount: Object.keys(finalRanges).length,
-				});
-			} finally {
-				await releaseSyncLock(env.CROWDSECCFBOUNCERNS);
-			}
-		} catch (error) {
-			const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-			logger.error('Decision sync failed', {
-				duration: `${duration}s`,
-				error: error.message,
-				stack: error.stack,
-			});
-
-			// Don't throw - we want to continue running on the next cron trigger
-			// The existing decisions in KV (if any) will remain valid
-		}
-	},
-});
-
-export { src as default };
+export { index_kv as default };

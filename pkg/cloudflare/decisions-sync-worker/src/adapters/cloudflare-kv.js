@@ -9,7 +9,6 @@ import logger from '../utils/logger.js';
 const BATCH_SIZE = 10000; // Cloudflare KV limit for bulk write/delete operations
 const BATCH_SIZE_GET = 100; // Cloudflare KV limit for bulk get operations
 const IP_RANGES_KEY = 'IP_RANGES';
-const RESET_KEY = 'RESET';
 // Keys to preserve during reset
 const PRESERVED_KEYS = ['BAN_TEMPLATE', 'TURNSTILE_CONFIG'];
 
@@ -224,21 +223,6 @@ export async function batchGetStringBasedDecisions(accountId, namespaceId, apiTo
 }
 
 /**
- * Check if reset is requested
- * @param {KVNamespace} kvNamespace - Cloudflare KV namespace
- * @returns {Promise<boolean>} True if RESET key exists and is set to 'true'
- */
-export async function shouldReset(kvNamespace) {
-	try {
-		const resetValue = await kvNamespace.get(RESET_KEY);
-		return resetValue === 'true';
-	} catch (error) {
-		logger.error('Failed to check RESET key', { error: error.message });
-		return false;
-	}
-}
-
-/**
  * List all keys in KV namespace using Cloudflare API
  * @param {string} accountId - Cloudflare account ID
  * @param {string} namespaceId - KV namespace ID
@@ -289,7 +273,7 @@ export async function listAllKeys(accountId, namespaceId, apiToken) {
  * @param {KVNamespace} kvNamespace - Cloudflare KV namespace (for direct operations)
  * @returns {Promise<void>}
  */
-export async function resetAllDecisions(accountId, namespaceId, apiToken, kvNamespace) {
+export async function resetAllDecisionsInKV(accountId, namespaceId, apiToken, kvNamespace) {
 	logger.info('Starting KV reset: deleting all decision keys...');
 
 	// Step 1: List all keys in KV
@@ -306,10 +290,6 @@ export async function resetAllDecisions(accountId, namespaceId, apiToken, kvName
 	if (keysToDelete.length > 0) {
 		await batchDeleteStringBasedDecisions(accountId, namespaceId, apiToken, keysToDelete);
 	}
-
-	// Step 4: Set RESET to false
-	await kvNamespace.put(RESET_KEY, 'false');
-	logger.info('RESET key set to false');
 
 	logger.info('KV reset completed successfully');
 }

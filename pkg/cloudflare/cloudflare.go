@@ -27,8 +27,16 @@ import (
 //go:embed worker/dist/main.js
 var workerScript string
 
-//go:embed decisions-sync-worker/dist/main.js
-var decisionsSyncWorkerScript string
+// Two independent compiled workers, each with exactly one sync target
+// (Cloudflare KV or a Cloudflare IP List). Which one gets deployed is chosen
+// by DeployDecisionsSyncWorker per syncCfg.SyncToListNotKV — never both, and
+// never a runtime flag inside the worker itself.
+//
+//go:embed decisions-sync-worker/dist/kv-sync-worker.js
+var kvSyncWorkerScript string
+
+//go:embed decisions-sync-worker/dist/ip-lists-sync-worker.js
+var ipListsSyncWorkerScript string
 
 const (
 	WidgetName            = "crowdsec-cloudflare-worker-bouncer-widget"
@@ -330,9 +338,11 @@ func (m *CloudflareAccountManager) DeployInfra() error {
 }
 
 // DeployDecisionsSyncWorker deploys the autonomous decisions sync worker.
-// This worker runs on a cron schedule and syncs decisions from CrowdSec LAPI to Cloudflare KV.
-func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.CrowdSecConfig, cronSchedule string) error {
-	m.logger.Infof("Deploying decisions sync worker %s with cron schedule: %s", m.Worker.DecisionsSyncScriptName, cronSchedule)
+// This worker runs on a cron schedule and syncs decisions from CrowdSec LAPI
+// to exactly one target — Cloudflare KV or a Cloudflare IP List — per
+// syncCfg.SyncToListNotKV.
+func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.CrowdSecConfig, syncCfg cfg.DecisionsSyncWorkerConfig) error {
+	m.logger.Infof("Deploying decisions sync worker %s with cron schedule: %s", m.Worker.DecisionsSyncScriptName, syncCfg.Cron)
 
 	// Build scenario filters
 	includeScenarios := strings.Join(crowdSecConfig.IncludeScenariosContaining, ",")
@@ -348,16 +358,21 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 		"LAPI_KEY": cf.WorkerSecretTextBinding{
 			Text: crowdSecConfig.CrowdSecLAPIKey,
 		},
-		// Cloudflare API credentials for bulk KV operations
+		// Cloudflare API credentials for bulk KV/IP list operations
 		"CF_ACCOUNT_ID": cf.WorkerPlainTextBinding{
 			Text: m.AccountCfg.ID,
-		},
-		"CF_KV_NAMESPACE_ID": cf.WorkerPlainTextBinding{
-			Text: m.NamespaceID,
 		},
 		"CF_API_TOKEN": cf.WorkerSecretTextBinding{
 			Text: m.AccountCfg.Token,
 		},
+	}
+
+	// CF_KV_NAMESPACE_ID is only used by the KV-target worker for its bulk KV
+	// REST calls; the IP-lists-target worker never touches KV decision data.
+	if !syncCfg.SyncToListNotKV {
+		bindings["CF_KV_NAMESPACE_ID"] = cf.WorkerPlainTextBinding{
+			Text: m.NamespaceID,
+		}
 	}
 
 	// Only add filter bindings if they have values (Cloudflare doesn't allow empty text bindings)
@@ -375,6 +390,16 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 		bindings["ONLY_INCLUDE_ORIGINS"] = cf.WorkerPlainTextBinding{
 			Text: origins,
 		}
+	}
+	if syncCfg.SyncToListNotKV {
+		bindings["IP_LIST_PREFIX"] = cf.WorkerPlainTextBinding{
+			Text: syncCfg.IPListPrefix,
+		}
+	}
+
+	decisionsSyncWorkerScript := kvSyncWorkerScript
+	if syncCfg.SyncToListNotKV {
+		decisionsSyncWorkerScript = ipListsSyncWorkerScript
 	}
 
 	// Upload the decisions sync worker
@@ -402,16 +427,16 @@ func (m *CloudflareAccountManager) DeployDecisionsSyncWorker(crowdSecConfig cfg.
 	}
 
 	// Deploy cron trigger for the decisions sync worker
-	m.logger.Infof("Deploying cron trigger for decisions sync worker: %s", cronSchedule)
+	m.logger.Infof("Deploying cron trigger for decisions sync worker: %s", syncCfg.Cron)
 	cronTriggers, err := m.api.UpdateWorkerCronTriggers(m.Ctx, cf.AccountIdentifier(m.AccountCfg.ID), cf.UpdateWorkerCronTriggersParams{
 		ScriptName: m.Worker.DecisionsSyncScriptName,
-		Crons:      []cf.WorkerCronTrigger{{Cron: cronSchedule}},
+		Crons:      []cf.WorkerCronTrigger{{Cron: syncCfg.Cron}},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to deploy cron trigger for decisions sync worker: %w", err)
 	}
 	m.logger.Tracef("Cron triggers: %+v", cronTriggers)
-	m.logger.Infof("Successfully deployed decisions sync worker %s with cron: %s", m.Worker.DecisionsSyncScriptName, cronSchedule)
+	m.logger.Infof("Successfully deployed decisions sync worker %s with cron: %s", m.Worker.DecisionsSyncScriptName, syncCfg.Cron)
 
 	return nil
 }

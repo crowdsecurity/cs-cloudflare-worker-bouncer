@@ -135,6 +135,28 @@ func (w *CloudflareWorkerCreateParams) CreateWorkerParams(workerScript string, i
 
 type DecisionsSyncWorkerConfig struct {
 	Cron string `yaml:"cron"` // Cron schedule for autonomous decisions sync (e.g., "*/5 * * * *" for every 5 minutes)
+
+	// SyncToListNotKV selects which single sync target the worker uses: false
+	// (default) syncs decisions to the Worker's KV store (the L7 bouncer
+	// worker's data source); true syncs 'ip'/'range' scoped decisions to
+	// Cloudflare IP Lists instead (used for L3/4 firewall-rule bouncing). The
+	// two modes are mutually exclusive — the worker always does exactly one,
+	// never both — which keeps the warmup/WARMED_UP handling simple: there is
+	// only ever one sync target's completion to wait on. The IP Lists
+	// themselves and the firewall rules referencing them must be provisioned
+	// externally; this only manages list membership.
+	SyncToListNotKV bool `yaml:"sync_to_list_not_kv,omitempty"`
+
+	// IPListPrefix is the name prefix used to discover which Cloudflare IP
+	// List this worker is allowed to manage. Only used when SyncToListNotKV
+	// is true.
+	IPListPrefix string `yaml:"ip_list_prefix,omitempty"`
+}
+
+func (d *DecisionsSyncWorkerConfig) setDefaults() {
+	if d.IPListPrefix == "" {
+		d.IPListPrefix = "crowdsec_"
+	}
 }
 
 type CloudflareConfig struct {
@@ -248,7 +270,8 @@ func NewConfig(reader io.Reader) (*BouncerConfig, error) {
 			zoneIDSet[zone.ID] = true
 		}
 	}
-	config.CloudflareConfig.Worker.setDefaults() // set defaults for worker
+	config.CloudflareConfig.Worker.setDefaults()              // set defaults for worker
+	config.CloudflareConfig.DecisionsSyncWorker.setDefaults() // set defaults for decisions sync worker
 
 	if !validAnalyticsDataset.MatchString(config.CloudflareConfig.Worker.AnalyticsDataset) {
 		return nil, fmt.Errorf("invalid analytics_dataset %q: must match %s", config.CloudflareConfig.Worker.AnalyticsDataset, validAnalyticsDataset.String())
@@ -464,4 +487,5 @@ func setDefaults(cfg *BouncerConfig) {
 	}
 	cfg.CloudflareConfig.Worker.setDefaults()
 	cfg.CloudflareConfig.DecisionsSyncWorker.Cron = "*/5 * * * *" // Default: every 5 minutes
+	cfg.CloudflareConfig.DecisionsSyncWorker.setDefaults()
 }
