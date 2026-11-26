@@ -644,12 +644,15 @@ async function fetchAllListItems(accountId, apiToken, listId) {
 
 	do {
 		const url = new URL(`https://api.cloudflare.com/client/v4/accounts/${accountId}/rules/lists/${listId}/items`);
-		url.searchParams.set('per_page', '1000');
+		// Cloudflare's documented max per_page for this endpoint is 500;
+		// asking for more risks an inconsistent/invalid cursor rather than a
+		// clean clamp or rejection.
+		url.searchParams.set('per_page', '500');
 		if (cursor) url.searchParams.set('cursor', cursor);
 
 		const response = await trackedFetch('getListItems', url, { method: 'GET', headers: buildApiHeaders(apiToken) });
 		if (!response.ok) {
-			if (cursor && (await isExpiredCursorError(response))) {
+			if (await isExpiredCursorError(response)) {
 				throw new ExpiredCursorError();
 			}
 			await throwApiError(`Failed to read items for list ${listId}`, response);
@@ -660,7 +663,11 @@ async function fetchAllListItems(accountId, apiToken, listId) {
 			items.set(item.ip, item.id);
 		}
 
-		cursor = data.result_info?.cursor || null;
+		// Cloudflare documents this as result_info.cursors.after; keep
+		// checking the older/undocumented result_info.cursor shape too in
+		// case it's ever returned instead, since reading the wrong field
+		// would silently stop pagination after page 1 without any error.
+		cursor = data.result_info?.cursors?.after || data.result_info?.cursor || null;
 	} while (cursor);
 
 	return items;
@@ -668,23 +675,36 @@ async function fetchAllListItems(accountId, apiToken, listId) {
 
 class ExpiredCursorError extends Error {}
 
+// How many full from-scratch attempts to make when the cursor keeps coming
+// back invalid/expired. A single retry only covers a one-off timeout; if
+// something else is mutating the list concurrently (a manual script, an
+// overlapping worker run, ...) the cursor can be invalidated repeatedly, so
+// this gives a few tries before actually giving up.
+const MAX_LIST_ITEMS_ATTEMPTS = 3;
+
 /**
  * Page through a list's full current membership. The pagination cursor is
- * short-lived and can expire mid-walk on a large list (Cloudflare error
- * 10027); if that happens, restart the walk from the beginning once before
- * giving up, rather than failing the whole tick over a stale cursor.
+ * short-lived and can expire — on the very first page as well as mid-walk
+ * (Cloudflare error 10027) — either from simple timeout or because another
+ * process (a manual script, an overlapping run, ...) is writing to the same
+ * list concurrently and invalidating it. Retries the whole walk from the
+ * beginning a few times before giving up, rather than failing the whole
+ * tick over a single stale cursor.
  * @param {string} accountId
  * @param {string} apiToken
  * @param {string} listId
  * @returns {Promise<Map<string, string>>} ip -> Cloudflare item id
  */
 async function getListItems(accountId, apiToken, listId) {
-	try {
-		return await fetchAllListItems(accountId, apiToken, listId);
-	} catch (e) {
-		if (!(e instanceof ExpiredCursorError)) throw e;
-		logger.warn(`List-items cursor expired mid-walk for list ${listId}; restarting pagination from the beginning`);
-		return await fetchAllListItems(accountId, apiToken, listId);
+	for (let attempt = 1; attempt <= MAX_LIST_ITEMS_ATTEMPTS; attempt++) {
+		try {
+			return await fetchAllListItems(accountId, apiToken, listId);
+		} catch (e) {
+			if (!(e instanceof ExpiredCursorError) || attempt === MAX_LIST_ITEMS_ATTEMPTS) throw e;
+			logger.warn(
+				`List-items cursor expired for list ${listId} (attempt ${attempt}/${MAX_LIST_ITEMS_ATTEMPTS}); this can happen from a plain timeout or because another process is writing to the list concurrently — restarting pagination from the beginning`
+			);
+		}
 	}
 }
 
