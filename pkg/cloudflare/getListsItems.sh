@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fetch all items from Cloudflare IP lists that start with "crowdsec_"
+# Fetch all items from Cloudflare IP lists that start with "cs_"
 # and save them to a CSV 'currentListMap.csv' file with columns: IP, item ID, list ID.
 
 # copy and chmod +x before running
@@ -12,13 +12,13 @@ BASE_URL="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/rules/lists"
 
 > "$OUTPUT"
 
-# Get all crowdsec_* lists
+# Get all cs_* lists
 LISTS=$(curl -sS \
   "$BASE_URL" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
 
 echo "$LISTS" \
-  | jq -r '.result[] | select(.name | startswith("crowdsec_")) | [.id, .name] | @tsv' \
+  | jq -r '.result[] | select(.name | startswith("cs_")) | [.id, .name] | @tsv' \
   | while IFS=$'\t' read -r LIST_ID LIST_NAME; do
 
     echo "Fetching $LIST_NAME ($LIST_ID)..." >&2
